@@ -22,7 +22,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: lane-scheduler
-  namespace: dsmlp-system
+  namespace: lane-scheduler
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -52,7 +52,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: lane-scheduler
-    namespace: dsmlp-system
+    namespace: lane-scheduler
 
 ---
 # ============================================================
@@ -61,8 +61,8 @@ subjects:
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: dsmlp-courses
-  namespace: dsmlp-system
+  name: lane-courses
+  namespace: lane-scheduler
 data:
   courses.csv: |
     course_id,level,seats
@@ -78,7 +78,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: lane-scheduler
-  namespace: dsmlp-system
+  namespace: lane-scheduler
   labels:
     app: lane-scheduler
 spec:
@@ -99,25 +99,25 @@ spec:
           effect: NoSchedule
       containers:
         - name: scheduler
-          image: ghcr.io/ucsd-dsmlp/scheduler:latest
+          image: ghcr.io/agt/lane-scheduler:latest
           args:
             - --log-level=INFO
           env:
-            - name: DSMLP_CYCLE_INTERVAL
+            - name: LANE_CYCLE_INTERVAL
               value: "10"
-            - name: DSMLP_DISPATCH_K
+            - name: LANE_DISPATCH_K
               value: "8"
-            - name: DSMLP_T_HALF_INTERACTIVE
+            - name: LANE_T_HALF_INTERACTIVE
               value: "600"
-            - name: DSMLP_T_HALF_BATCH
+            - name: LANE_T_HALF_BATCH
               value: "7200"
-            - name: DSMLP_COURSE_CSV
-              value: /etc/dsmlp/courses.csv
-            - name: DSMLP_RELOAD_INTERVAL
+            - name: LANE_COURSE_CSV
+              value: /etc/lane-scheduler/courses.csv
+            - name: LANE_RELOAD_INTERVAL
               value: "86400"
           volumeMounts:
             - name: courses
-              mountPath: /etc/dsmlp
+              mountPath: /etc/lane-scheduler
               readOnly: true
           resources:
             requests:
@@ -129,7 +129,7 @@ spec:
       volumes:
         - name: courses
           configMap:
-            name: dsmlp-courses
+            name: lane-courses
 
 ---
 # ============================================================
@@ -140,8 +140,8 @@ spec:
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: dsmlp-course-reload
-  namespace: dsmlp-system
+  name: lane-course-reload
+  namespace: lane-scheduler
 spec:
   schedule: "0 6 * * *"   # 06:00 daily
   jobTemplate:
@@ -158,11 +158,11 @@ spec:
                 - -c
                 - |
                   # Replace with your actual fetch command, e.g.:
-                  # curl -sf https://registrar.ucsd.edu/export/dsmlp-courses.csv \
+                  # curl -sf https://registrar.ucsd.edu/export/lane-courses.csv \
                   #   -o /tmp/courses.csv
                   #
                   # Then update the ConfigMap:
-                  kubectl create configmap dsmlp-courses \
+                  kubectl create configmap lane-courses \
                     --from-file=courses.csv=/tmp/courses.csv \
                     --dry-run=client -o yaml \
                     | kubectl apply -f -

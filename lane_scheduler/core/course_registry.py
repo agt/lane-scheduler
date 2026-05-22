@@ -94,7 +94,7 @@ class CourseRegistry:
 
     Usage:
         registry = CourseRegistry()
-        registry.load_csv(Path("/etc/dsmlp/courses.csv"))
+        registry.load_csv(Path("/etc/lane-scheduler/courses.csv"))
         course = registry.get("CSE234_SP26_A00")   # always returns something
     """
 

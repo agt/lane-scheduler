@@ -1,6 +1,6 @@
 """
-DSMLP Priority Scheduler Controller
--------------------------------------
+Lane-based Priority Scheduler Controller
+-----------------------------------------
 Watches all pod and node events cluster-wide.  Pending pods that carry the
 dsmlp/course label are held by the inhibitory node taint until our scheduler
 selects them, at which point we patch in the matching toleration and let the
@@ -108,30 +108,30 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
-CYCLE_INTERVAL      = _env_float("DSMLP_CYCLE_INTERVAL",   10.0)   # seconds
-DISPATCH_K          = _env_int(  "DSMLP_DISPATCH_K",         8)
-ALPHA               = _env_float("DSMLP_ALPHA",              1.0)
-T_HALF_INTERACTIVE  = _env_float("DSMLP_T_HALF_INTERACTIVE", 600.0)
-T_HALF_BATCH        = _env_float("DSMLP_T_HALF_BATCH",      7200.0)
-EPSILON             = _env_float("DSMLP_EPSILON",            0.01)
-UTIL_WINDOW         = _env_float("DSMLP_UTIL_WINDOW",        300.0)
-COURSE_CSV          = os.environ.get("DSMLP_COURSE_CSV", "/etc/dsmlp/courses.csv")
-RELOAD_INTERVAL     = _env_float("DSMLP_RELOAD_INTERVAL",  86400.0) # daily
+CYCLE_INTERVAL      = _env_float("LANE_CYCLE_INTERVAL",   10.0)   # seconds
+DISPATCH_K          = _env_int(  "LANE_DISPATCH_K",         8)
+ALPHA               = _env_float("LANE_ALPHA",              1.0)
+T_HALF_INTERACTIVE  = _env_float("LANE_T_HALF_INTERACTIVE", 600.0)
+T_HALF_BATCH        = _env_float("LANE_T_HALF_BATCH",      7200.0)
+EPSILON             = _env_float("LANE_EPSILON",            0.01)
+UTIL_WINDOW         = _env_float("LANE_UTIL_WINDOW",        300.0)
+COURSE_CSV          = os.environ.get("LANE_COURSE_CSV", "/etc/lane-scheduler/courses.csv")
+RELOAD_INTERVAL     = _env_float("LANE_RELOAD_INTERVAL",  86400.0) # daily
 
 # Residency distribution parameters (fraction of activeDeadlineSeconds)
-INTERACTIVE_MEAN_PCT = _env_float("DSMLP_INTERACTIVE_MEAN_PCT", 0.4)
-INTERACTIVE_STD_PCT  = _env_float("DSMLP_INTERACTIVE_STD_PCT",  0.2)
-BATCH_MEAN_PCT       = _env_float("DSMLP_BATCH_MEAN_PCT",       0.7)
-BATCH_STD_PCT        = _env_float("DSMLP_BATCH_STD_PCT",        0.15)
-WAIT_CACHE_INTERVAL  = _env_float("DSMLP_WAIT_CACHE_INTERVAL",  60.0)  # seconds
-PRIOR_WEIGHT         = _env_float("DSMLP_PRIOR_WEIGHT",          10.0)  # pseudo-count
+INTERACTIVE_MEAN_PCT = _env_float("LANE_INTERACTIVE_MEAN_PCT", 0.4)
+INTERACTIVE_STD_PCT  = _env_float("LANE_INTERACTIVE_STD_PCT",  0.2)
+BATCH_MEAN_PCT       = _env_float("LANE_BATCH_MEAN_PCT",       0.7)
+BATCH_STD_PCT        = _env_float("LANE_BATCH_STD_PCT",        0.15)
+WAIT_CACHE_INTERVAL  = _env_float("LANE_WAIT_CACHE_INTERVAL",  60.0)  # seconds
+PRIOR_WEIGHT         = _env_float("LANE_PRIOR_WEIGHT",          10.0)  # pseudo-count
 
 
 # ---------------------------------------------------------------------------
 # Controller
 # ---------------------------------------------------------------------------
 
-class DSMLPController:
+class LaneSchedulerController:
     """
     Orchestrates the pod/node watch loops and the scheduling cycle.
 
@@ -208,7 +208,7 @@ class DSMLPController:
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        logger.info("DSMLP controller starting")
+        logger.info("Lane Scheduler starting")
 
         self.wait_cache.start()
 
@@ -229,7 +229,7 @@ class DSMLPController:
         finally:
             self._stop.set()
             self.wait_cache.stop()
-            logger.info("DSMLP controller stopped")
+            logger.info("Lane Scheduler stopped")
 
     def stop(self) -> None:
         self._stop.set()
@@ -677,7 +677,7 @@ class DSMLPController:
 # ---------------------------------------------------------------------------
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="DSMLP Priority Scheduler Controller")
+    p = argparse.ArgumentParser(description="Lane-based Priority Scheduler")
     p.add_argument("--kubeconfig", default=None,
                    help="Path to kubeconfig (omit to use in-cluster config)")
     p.add_argument("--course-csv", default=COURSE_CSV,
@@ -757,7 +757,7 @@ def main() -> None:
         BATCH_MEAN_PCT * 100,       BATCH_STD_PCT * 100,
     )
 
-    controller = DSMLPController(
+    controller = LaneSchedulerController(
         core_v1             = core_v1,
         registry            = registry,
         sched_config        = sched_config,
