@@ -52,16 +52,16 @@ The scheduler is implemented as a Kubernetes controller. It does not replace the
 
 | Module | Responsibility |
 |---|---|
-| `scheduler.py` | Core scheduling logic: priority scoring, deficit round-robin, utilization tracking |
-| `course_registry.py` | Course metadata (tier, enrollment) from registrar CSV with inference fallback |
-| `pod_translator.py` | Translates Kubernetes pod dicts into scheduler domain objects |
-| `node_capacity.py` | Tracks allocatable capacity per GPU class lane from node watch events |
-| `controller.py` | Orchestrates all threads; Kubernetes API interactions |
-| `wait_estimator.py` | Truncated-normal wait-time estimation; background cache |
-| `residency_stats.py` | Per-course Bayesian residency distribution tracking |
-| `event_publisher.py` | Kubernetes Event creation with per-pod emission schedules |
-| `simulate.py` | Synthetic workload simulation for offline testing |
-| `manifests.yaml` | RBAC, Deployment, ConfigMap, and CronJob manifests |
+| `lane_scheduler/core/scheduler.py` | Core scheduling logic: priority scoring, deficit round-robin, utilization tracking |
+| `lane_scheduler/core/course_registry.py` | Course metadata (tier, enrollment) from registrar CSV with inference fallback |
+| `lane_scheduler/core/node_capacity.py` | Tracks allocatable capacity per GPU class lane from node watch events |
+| `lane_scheduler/k8s/controller.py` | Orchestrates all threads; Kubernetes API interactions |
+| `lane_scheduler/k8s/pod_translator.py` | Translates Kubernetes pod dicts into scheduler domain objects |
+| `lane_scheduler/k8s/event_publisher.py` | Kubernetes Event creation with per-pod emission schedules |
+| `lane_scheduler/estimation/wait_estimator.py` | Truncated-normal wait-time estimation; background cache |
+| `lane_scheduler/estimation/residency_stats.py` | Per-course Bayesian residency distribution tracking |
+| `tools/simulate.py` | Synthetic workload simulation for offline testing |
+| `deploy/manifests.yaml` | RBAC, Deployment, ConfigMap, and CronJob manifests |
 
 ---
 
@@ -285,7 +285,7 @@ kubectl taint nodes <gpu-node> gpu-class=medium:NoSchedule
 
 ```bash
 kubectl create namespace dsmlp-system
-kubectl apply -f manifests.yaml
+kubectl apply -f deploy/manifests.yaml
 ```
 
 The `manifests.yaml` includes RBAC (ServiceAccount, ClusterRole, ClusterRoleBinding), a ConfigMap for the course CSV, the controller Deployment, and a daily CronJob that refreshes the course ConfigMap from the registrar.
@@ -329,10 +329,14 @@ metadata:
 ## Testing
 
 ```bash
-python -m unittest test_scheduler test_integration test_wait_estimator \
-                   test_event_publisher test_residency_stats
+pip install -e .
+python -m pytest tests/
 ```
 
-158 tests, all passing. No external dependencies beyond the `kubernetes` Python client (used only in `controller.py`). All scheduling logic, wait estimation, residency statistics, and event scheduling are tested with stdlib only.
+158 tests, all passing. No external dependencies beyond the `kubernetes` Python client (used only in `lane_scheduler/k8s/controller.py`). All scheduling logic, wait estimation, residency statistics, and event scheduling are tested with stdlib only.
 
-The `simulate.py` harness runs a synthetic workload against the scheduler for offline validation of fairness properties without a live cluster.
+The `tools/simulate.py` harness runs a synthetic workload against the scheduler for offline validation of fairness properties without a live cluster:
+
+```bash
+python tools/simulate.py
+```
