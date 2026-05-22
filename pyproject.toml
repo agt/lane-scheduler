@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lane-scheduler"
+version = "0.1.0"
+description = "DSMLP priority scheduler — weighted fair-share across heterogeneous resource lanes"
+requires-python = ">=3.10"
+dependencies = [
+    "kubernetes>=28.1.0",
+]
+
+[project.scripts]
+dsmlp-scheduler = "lane_scheduler.k8s.controller:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lane_scheduler*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

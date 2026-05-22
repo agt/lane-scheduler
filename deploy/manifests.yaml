@@ -1,0 +1,209 @@
+# ============================================================
+# DSMLP Priority Scheduler — Kubernetes manifests
+# ============================================================
+#
+# Apply with:
+#   kubectl apply -f rbac.yaml
+#   kubectl apply -f controller-deployment.yaml
+#
+# Node setup:
+#   Taint ALL managed nodes before deploying:
+#     kubectl taint nodes <node> dsmlp/scheduling-gate=controller:NoSchedule
+#
+#   Label GPU nodes with their pool type:
+#     kubectl label nodes <gpu-node-interactive> dsmlp/gpu-pool=interactive
+#     kubectl label nodes <gpu-node-batch>       dsmlp/gpu-pool=batch
+
+---
+# ============================================================
+# RBAC
+# ============================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dsmlp-scheduler
+  namespace: dsmlp-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dsmlp-scheduler
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dsmlp-scheduler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dsmlp-scheduler
+subjects:
+  - kind: ServiceAccount
+    name: dsmlp-scheduler
+    namespace: dsmlp-system
+
+---
+# ============================================================
+# Course CSV — mounted as a ConfigMap (replaced daily by a CronJob)
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dsmlp-courses
+  namespace: dsmlp-system
+data:
+  courses.csv: |
+    course_id,level,seats
+    CSE101_SP26_A00,lower,210
+    CSE150_SP26_A00,upper,55
+    CSE234_SP26_A00,graduate,18
+
+---
+# ============================================================
+# Controller Deployment
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsmlp-scheduler
+  namespace: dsmlp-system
+  labels:
+    app: dsmlp-scheduler
+spec:
+  replicas: 1   # Must be 1 — scheduler holds in-memory state
+  selector:
+    matchLabels:
+      app: dsmlp-scheduler
+  template:
+    metadata:
+      labels:
+        app: dsmlp-scheduler
+    spec:
+      serviceAccountName: dsmlp-scheduler
+      # Run on a control-plane node or an untainted management node
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: scheduler
+          image: ghcr.io/ucsd-dsmlp/scheduler:latest
+          args:
+            - --log-level=INFO
+          env:
+            - name: DSMLP_CYCLE_INTERVAL
+              value: "10"
+            - name: DSMLP_DISPATCH_K
+              value: "8"
+            - name: DSMLP_T_HALF_INTERACTIVE
+              value: "600"
+            - name: DSMLP_T_HALF_BATCH
+              value: "7200"
+            - name: DSMLP_COURSE_CSV
+              value: /etc/dsmlp/courses.csv
+            - name: DSMLP_RELOAD_INTERVAL
+              value: "86400"
+          volumeMounts:
+            - name: courses
+              mountPath: /etc/dsmlp
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: courses
+          configMap:
+            name: dsmlp-courses
+
+---
+# ============================================================
+# Daily CSV reload CronJob
+# Replaces the ConfigMap data from an external registrar export.
+# Adjust the command to pull from your actual source.
+# ============================================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: dsmlp-course-reload
+  namespace: dsmlp-system
+spec:
+  schedule: "0 6 * * *"   # 06:00 daily
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: dsmlp-scheduler
+          restartPolicy: OnFailure
+          containers:
+            - name: reload
+              image: bitnami/kubectl:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  # Replace with your actual fetch command, e.g.:
+                  # curl -sf https://registrar.ucsd.edu/export/dsmlp-courses.csv \
+                  #   -o /tmp/courses.csv
+                  #
+                  # Then update the ConfigMap:
+                  kubectl create configmap dsmlp-courses \
+                    --from-file=courses.csv=/tmp/courses.csv \
+                    --dry-run=client -o yaml \
+                    | kubectl apply -f -
+
+---
+# ============================================================
+# Example: student pod (CPU, interactive)
+# ============================================================
+# apiVersion: v1
+# kind: Pod
+# metadata:
+#   name: my-notebook
+#   namespace: jsmith         # student's namespace
+#   labels:
+#     dsmlp/course: CSE101_SP26_A00
+# spec:
+#   containers:
+#     - name: notebook
+#       image: ucsdets/datascience-notebook:latest
+#       resources:
+#         requests:
+#           cpu: "2"
+#           memory: 4Gi
+#
+# ============================================================
+# Example: student pod (GPU, batch)
+# ============================================================
+# apiVersion: v1
+# kind: Pod
+# metadata:
+#   name: training-run
+#   namespace: jsmith
+#   labels:
+#     dsmlp/course: CSE234_SP26_A00
+#     dsmlp/batch: "true"
+# spec:
+#   containers:
+#     - name: trainer
+#       image: ucsdets/pytorch:latest
+#       resources:
+#         requests:
+#           cpu: "4"
+#           memory: 16Gi
+#           nvidia.com/gpu: "2"
