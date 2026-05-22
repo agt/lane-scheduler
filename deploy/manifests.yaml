@@ -1,5 +1,5 @@
 # ============================================================
-# DSMLP Priority Scheduler — Kubernetes manifests
+# Lane Scheduler — Kubernetes manifests
 # ============================================================
 #
 # Apply with:
@@ -21,14 +21,14 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: dsmlp-scheduler
+  name: lane-scheduler
   namespace: dsmlp-system
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: dsmlp-scheduler
+  name: lane-scheduler
 rules:
   - apiGroups: [""]
     resources: ["pods"]
@@ -44,14 +44,14 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: dsmlp-scheduler
+  name: lane-scheduler
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: dsmlp-scheduler
+  name: lane-scheduler
 subjects:
   - kind: ServiceAccount
-    name: dsmlp-scheduler
+    name: lane-scheduler
     namespace: dsmlp-system
 
 ---
@@ -77,21 +77,21 @@ data:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: dsmlp-scheduler
+  name: lane-scheduler
   namespace: dsmlp-system
   labels:
-    app: dsmlp-scheduler
+    app: lane-scheduler
 spec:
   replicas: 1   # Must be 1 — scheduler holds in-memory state
   selector:
     matchLabels:
-      app: dsmlp-scheduler
+      app: lane-scheduler
   template:
     metadata:
       labels:
-        app: dsmlp-scheduler
+        app: lane-scheduler
     spec:
-      serviceAccountName: dsmlp-scheduler
+      serviceAccountName: lane-scheduler
       # Run on a control-plane node or an untainted management node
       tolerations:
         - key: node-role.kubernetes.io/control-plane
@@ -148,7 +148,7 @@ spec:
     spec:
       template:
         spec:
-          serviceAccountName: dsmlp-scheduler
+          serviceAccountName: lane-scheduler
           restartPolicy: OnFailure
           containers:
             - name: reload

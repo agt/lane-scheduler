@@ -52,7 +52,7 @@ _BATCH_MAX_EMITS = 1 + len(_BATCH_FRACTIONS)   # emit 0 (immediate) + 3 mileston
 # ---- Event field constants -------------------------------------------------
 _EVENT_REASON    = "SchedulingQueued"
 _EVENT_TYPE      = "Normal"
-_EVENT_COMPONENT = "dsmlp-scheduler"
+_EVENT_COMPONENT = "lane-scheduler"
 _API_VERSION     = "v1"
 _POD_KIND        = "Pod"
 
