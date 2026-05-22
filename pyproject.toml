@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-dsmlp-scheduler = "lane_scheduler.k8s.controller:main"
+lane-scheduler = "lane_scheduler.k8s.controller:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

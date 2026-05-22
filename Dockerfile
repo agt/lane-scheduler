@@ -10,4 +10,4 @@ RUN pip install --no-cache-dir --no-deps -e .
 
 USER nobody
 
-CMD ["dsmlp-scheduler"]
+CMD ["lane-scheduler"]
