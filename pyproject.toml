@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "lane-scheduler"
 version = "0.1.0"
-description = "DSMLP priority scheduler — weighted fair-share across heterogeneous resource lanes"
+description = "Lane-based Priority Scheduler — weighted fair-share across heterogeneous resource lanes"
 requires-python = ">=3.10"
 dependencies = [
     "kubernetes>=28.1.0",

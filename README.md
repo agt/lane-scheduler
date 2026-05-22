@@ -1,4 +1,4 @@
-# DSMLP Priority Scheduler
+# Lane-based Priority Scheduler
 
 A Kubernetes controller that fairly allocates cluster resources across university courses, preventing large introductory classes from crowding out smaller graduate seminars while respecting heterogeneous GPU hardware classes.
 
@@ -24,7 +24,7 @@ The scheduler is implemented as a Kubernetes controller. It does not replace the
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    DSMLPController                           │
+│                    LaneSchedulerController                           │
 │                                                             │
 │  pod-watch thread ──► _handle_pod_event                     │
 │     • enqueue pending pods                                   │
@@ -244,21 +244,21 @@ All tuning parameters are configurable via environment variables or CLI flags.
 
 | Environment Variable | Default | Description |
 |---|---|---|
-| `DSMLP_COURSE_CSV` | `/etc/dsmlp/courses.csv` | Path to registrar CSV |
-| `DSMLP_CYCLE_INTERVAL` | `10` | Scheduling cycle interval (seconds) |
-| `DSMLP_DISPATCH_K` | `8` | Max jobs dispatched per lane per cycle |
-| `DSMLP_ALPHA` | `1.0` | Wait-time aging scaling factor |
-| `DSMLP_T_HALF_INTERACTIVE` | `600` | Interactive job aging half-life (seconds) |
-| `DSMLP_T_HALF_BATCH` | `7200` | Batch job aging half-life (seconds) |
-| `DSMLP_EPSILON` | `0.01` | Utilization floor (prevents division by zero) |
-| `DSMLP_UTIL_WINDOW` | `300` | Rolling utilization window (seconds) |
-| `DSMLP_RELOAD_INTERVAL` | `86400` | Course CSV reload interval (seconds) |
-| `DSMLP_INTERACTIVE_MEAN_PCT` | `0.4` | Prior: interactive mean residency fraction |
-| `DSMLP_INTERACTIVE_STD_PCT` | `0.2` | Prior: interactive residency std fraction |
-| `DSMLP_BATCH_MEAN_PCT` | `0.7` | Prior: batch mean residency fraction |
-| `DSMLP_BATCH_STD_PCT` | `0.15` | Prior: batch residency std fraction |
-| `DSMLP_PRIOR_WEIGHT` | `10.0` | Bayesian prior pseudo-count |
-| `DSMLP_WAIT_CACHE_INTERVAL` | `60` | Wait estimate refresh interval (seconds) |
+| `LANE_COURSE_CSV` | `/etc/lane-scheduler/courses.csv` | Path to registrar CSV |
+| `LANE_CYCLE_INTERVAL` | `10` | Scheduling cycle interval (seconds) |
+| `LANE_DISPATCH_K` | `8` | Max jobs dispatched per lane per cycle |
+| `LANE_ALPHA` | `1.0` | Wait-time aging scaling factor |
+| `LANE_T_HALF_INTERACTIVE` | `600` | Interactive job aging half-life (seconds) |
+| `LANE_T_HALF_BATCH` | `7200` | Batch job aging half-life (seconds) |
+| `LANE_EPSILON` | `0.01` | Utilization floor (prevents division by zero) |
+| `LANE_UTIL_WINDOW` | `300` | Rolling utilization window (seconds) |
+| `LANE_RELOAD_INTERVAL` | `86400` | Course CSV reload interval (seconds) |
+| `LANE_INTERACTIVE_MEAN_PCT` | `0.4` | Prior: interactive mean residency fraction |
+| `LANE_INTERACTIVE_STD_PCT` | `0.2` | Prior: interactive residency std fraction |
+| `LANE_BATCH_MEAN_PCT` | `0.7` | Prior: batch mean residency fraction |
+| `LANE_BATCH_STD_PCT` | `0.15` | Prior: batch residency std fraction |
+| `LANE_PRIOR_WEIGHT` | `10.0` | Bayesian prior pseudo-count |
+| `LANE_WAIT_CACHE_INTERVAL` | `60` | Wait estimate refresh interval (seconds) |
 
 ---
 
@@ -284,7 +284,7 @@ kubectl taint nodes <gpu-node> gpu-class=medium:NoSchedule
 ### Apply Manifests
 
 ```bash
-kubectl create namespace dsmlp-system
+kubectl create namespace lane-scheduler
 kubectl apply -f deploy/manifests.yaml
 ```
 
