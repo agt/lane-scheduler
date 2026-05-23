@@ -333,7 +333,7 @@ pip install -e .
 python -m pytest tests/
 ```
 
-158 tests, all passing. No external dependencies beyond the `kubernetes` Python client (used only in `lane_scheduler/k8s/controller.py`). All scheduling logic, wait estimation, residency statistics, and event scheduling are tested with stdlib only.
+200+ tests, all passing. No external dependencies beyond the `kubernetes` Python client (used only in `lane_scheduler/k8s/controller.py`). All scheduling logic, wait estimation, residency statistics, and event scheduling are tested with stdlib only.
 
 The `tools/simulate.py` harness runs a synthetic workload against the scheduler for offline validation of fairness properties without a live cluster:
 

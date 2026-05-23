@@ -358,8 +358,8 @@ class TestBatchSchedule(unittest.TestCase):
         s   = self._batch_schedule(enqueued_at=0.0)
         now = 0.0
         s.advance(now, median_wait=4000.0)   # emit 0→1, anchor=4000
-        s.advance(now, median_wait=9999.0)   # emit 1→2, median ignored
-        # 50% milestone should still use the original 4000s anchor
+        # Subsequent median below 2x anchor → no re-anchor; original anchor used.
+        s.advance(now, median_wait=4500.0)
         self.assertAlmostEqual(s.next_emit_at, 0.0 + 0.50 * 4000.0)
 
     def test_milestones_are_25_50_75_percent(self):
@@ -388,6 +388,31 @@ class TestBatchSchedule(unittest.TestCase):
         s.advance(now, median_wait=100.0)   # 25% of 100 = 25s from enqueue = past
         self.assertLessEqual(s.next_emit_at, now)
         self.assertTrue(s.due(now=now))
+
+    def test_reanchor_on_double_growth(self):
+        """If a later median is >2x the original anchor, re-anchor."""
+        s   = self._batch_schedule(enqueued_at=0.0)
+        s.advance(now=0.0, median_wait=600.0)     # anchor=600
+        # Next median is 1500 > 2*600 → re-anchor to 1500
+        s.advance(now=0.0, median_wait=1500.0)
+        self.assertAlmostEqual(s._anchor_wait, 1500.0)
+        # The 50% milestone is now relative to the new anchor
+        self.assertAlmostEqual(s.next_emit_at, 0.0 + 0.50 * 1500.0)
+
+    def test_no_reanchor_on_shrink(self):
+        """A smaller median must never shrink the anchor."""
+        s   = self._batch_schedule(enqueued_at=0.0)
+        s.advance(now=0.0, median_wait=600.0)     # anchor=600
+        s.advance(now=0.0, median_wait=300.0)     # smaller → ignored
+        self.assertAlmostEqual(s._anchor_wait, 600.0)
+        self.assertAlmostEqual(s.next_emit_at, 0.0 + 0.50 * 600.0)
+
+    def test_no_reanchor_below_2x(self):
+        """Median between 1x and 2x of anchor must not trigger re-anchor."""
+        s   = self._batch_schedule(enqueued_at=0.0)
+        s.advance(now=0.0, median_wait=600.0)     # anchor=600
+        s.advance(now=0.0, median_wait=1100.0)    # < 2*600 → no re-anchor
+        self.assertAlmostEqual(s._anchor_wait, 600.0)
 
     def test_interactive_schedule_unchanged(self):
         """Interactive pod advance behaviour must not regress."""

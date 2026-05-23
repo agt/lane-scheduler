@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Lane-based Priority Scheduler — weighted fair-share across heterogeneous resource lanes"
 requires-python = ">=3.10"
 dependencies = [
-    "kubernetes>=28.1.0",
+    "kubernetes~=36.0",
 ]
 
 [project.scripts]

@@ -10,8 +10,15 @@ import statistics
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from lane_scheduler.core.scheduler import (
-    CourseClass, Job, Lane, Scheduler, SchedulerConfig, Tier, LANE_NAMES
+# Lanes are built dynamically by initialise_lanes(); we pick a representative
+# set for the simulator and rebind module-level Lane after initialisation.
+from lane_scheduler.core.scheduler import initialise_lanes
+
+_GPU_CLASSES = ["small", "medium", "large"]
+initialise_lanes(_GPU_CLASSES)
+
+from lane_scheduler.core.scheduler import (  # noqa: E402 — after initialise_lanes
+    CourseClass, Job, Lane, LANE_NAMES, Scheduler, SchedulerConfig, Tier,
 )
 
 
@@ -28,9 +35,10 @@ class SimConfig:
 
     # Lane capacities (arbitrary resource units)
     lane_capacity: dict = field(default_factory=lambda: {
-        Lane.CPU:             200.0,
-        Lane.GPU_INTERACTIVE:  20.0,
-        Lane.GPU_BATCH:        10.0,
+        Lane.CPU:        200.0,
+        Lane.GPU_SMALL:   20.0,
+        Lane.GPU_MEDIUM:  10.0,
+        Lane.GPU_LARGE:    5.0,
     })
 
 
@@ -48,27 +56,33 @@ CLASSES = [
     ("GRAD-302",     Tier.GRAD,       10),
 ]
 
-# Submission rates: (jobs/student/hour, lane_probabilities, resource_units_range)
-TIER_PROFILES = {
-    Tier.INTRO: dict(
-        rate=2.0,
-        lane_probs={Lane.CPU: 0.90, Lane.GPU_INTERACTIVE: 0.10, Lane.GPU_BATCH: 0.00},
-        resource_range=(0.5, 2.0),
-    ),
-    Tier.UPPER_DIV: dict(
-        rate=3.0,
-        lane_probs={Lane.CPU: 0.70, Lane.GPU_INTERACTIVE: 0.20, Lane.GPU_BATCH: 0.10},
-        resource_range=(1.0, 4.0),
-    ),
-    Tier.GRAD: dict(
-        rate=4.0,
-        lane_probs={Lane.CPU: 0.50, Lane.GPU_INTERACTIVE: 0.15, Lane.GPU_BATCH: 0.35},
-        resource_range=(2.0, 8.0),
-    ),
-}
+
+def _tier_profiles() -> dict:
+    """Build per-tier submission profiles after Lane is initialised."""
+    return {
+        Tier.INTRO: dict(
+            rate=2.0,
+            lane_probs={Lane.CPU: 0.90, Lane.GPU_SMALL: 0.10},
+            resource_range=(0.5, 2.0),
+            batch_prob=0.0,
+        ),
+        Tier.UPPER_DIV: dict(
+            rate=3.0,
+            lane_probs={Lane.CPU: 0.70, Lane.GPU_SMALL: 0.20, Lane.GPU_MEDIUM: 0.10},
+            resource_range=(1.0, 4.0),
+            batch_prob=0.1,
+        ),
+        Tier.GRAD: dict(
+            rate=4.0,
+            lane_probs={Lane.CPU: 0.50, Lane.GPU_SMALL: 0.15,
+                        Lane.GPU_MEDIUM: 0.20, Lane.GPU_LARGE: 0.15},
+            resource_range=(2.0, 8.0),
+            batch_prob=0.35,
+        ),
+    }
 
 
-def pick_lane(probs: dict[Lane, float], rng: random.Random) -> Lane:
+def pick_lane(probs: dict, rng: random.Random):
     r = rng.random()
     cumulative = 0.0
     for lane, p in probs.items():
@@ -141,7 +155,8 @@ def print_report(stats: Stats, classes: dict[str, CourseClass],
 # Main simulation loop
 # ---------------------------------------------------------------------------
 
-def run(sim_cfg: SimConfig = SimConfig()) -> None:
+def run(sim_cfg: SimConfig | None = None) -> None:
+    sim_cfg = sim_cfg if sim_cfg is not None else SimConfig()
     rng = random.Random(sim_cfg.seed)
 
     sched_cfg = SchedulerConfig(dispatch_k=sim_cfg.dispatch_k)
@@ -153,13 +168,15 @@ def run(sim_cfg: SimConfig = SimConfig()) -> None:
         courses[class_id] = c
         scheduler.register_class(c)
 
+    profiles = _tier_profiles()
+
     # Pre-generate job submission events
     # Each student submits jobs at a Poisson rate based on their tier profile
     events: list[tuple[float, Job]] = []
     job_counter = 0
 
     for class_id, tier, enrollment in CLASSES:
-        profile = TIER_PROFILES[tier]
+        profile = profiles[tier]
         rate_per_second = profile["rate"] / 3600.0
 
         for student_idx in range(enrollment):
@@ -168,11 +185,13 @@ def run(sim_cfg: SimConfig = SimConfig()) -> None:
             while t < sim_cfg.duration:
                 lane = pick_lane(profile["lane_probs"], rng)
                 units = rng.uniform(*profile["resource_range"])
+                batch = rng.random() < profile["batch_prob"]
                 job = Job(
                     job_id=f"J{job_counter:06d}",
                     class_id=class_id,
                     student_id=student_id,
                     lane=lane,
+                    batch=batch,
                     submit_time=t,
                     resource_units=units,
                 )
@@ -181,8 +200,9 @@ def run(sim_cfg: SimConfig = SimConfig()) -> None:
                 t += rng.expovariate(rate_per_second)
 
     events.sort(key=lambda x: x[0])
+    total_students = sum(e for _, _, e in CLASSES)
     print(f"Generated {len(events)} job submissions across "
-          f"{sum(e for _, _, e in CLASSES)} students.")
+          f"{total_students} students.")
 
     # Count submissions per class for reporting
     total_submitted: dict[str, int] = defaultdict(int)

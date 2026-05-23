@@ -316,6 +316,70 @@ class TestNodeCapacityTracker(unittest.TestCase):
         self.assertAlmostEqual(t.lane_capacity()[_cpu()], 0.0)
         self.assertAlmostEqual(t.lane_capacity()[_gpu("medium")], 4.0)
 
+    def test_node_with_unmanaged_gpu_class_excluded(self):
+        """A node labelled with a gpu-class the controller doesn't manage
+        must be excluded from the pool entirely — not misclassified as CPU."""
+        t = NodeCapacityTracker()
+        t.upsert(_make_node(name="unknown-gpu", cpu="32", gpu="4",
+                            gpu_class="h200"))
+        caps = t.lane_capacity()
+        self.assertAlmostEqual(caps[_cpu()], 0.0)
+        # No GPU lane should pick up its GPUs either.
+        for cls in ("xsmall", "small", "medium", "large", "xlarge"):
+            self.assertAlmostEqual(caps[_gpu(cls)], 0.0, msg=f"leaked into {cls}")
+
+
+# ---------------------------------------------------------------------------
+# Controller-level integration: pod DELETE clears the scheduler queue
+# ---------------------------------------------------------------------------
+
+class TestDeleteClearsSchedulerQueue(unittest.TestCase):
+    """A DELETED pod event must clear the Job from scheduler._queues too,
+    not just from controller _pending."""
+
+    def _build_controller(self):
+        # Build a minimal controller without K8s API.  We exercise only
+        # _enqueue / _handle_pod_event / _dequeue paths.
+        from lane_scheduler.k8s.controller import LaneSchedulerController
+        from lane_scheduler.core.scheduler import SchedulerConfig
+        from lane_scheduler.estimation.wait_estimator import ResidencyProfile
+        from lane_scheduler.core.course_registry import CourseRegistry
+
+        # Stub core_v1 — never called by these tests
+        class _StubCore:
+            def create_namespaced_event(self, **kw): pass
+            def patch_namespaced_pod(self, **kw):    pass
+
+        registry = CourseRegistry()
+        return LaneSchedulerController(
+            core_v1            = _StubCore(),
+            registry           = registry,
+            sched_config       = SchedulerConfig(),
+            residency_profiles = {
+                "interactive": ResidencyProfile(mean_pct=0.4, std_pct=0.2),
+                "batch":       ResidencyProfile(mean_pct=0.7, std_pct=0.15),
+            },
+            dry_run            = True,
+        )
+
+    def test_delete_event_removes_job_from_scheduler(self):
+        ctrl = self._build_controller()
+        pod = _make_pod(
+            uid="uid-DEL", labels={"dsmlp/course": "CSE101"},
+            phase="Pending",
+        )
+        ctrl._handle_pod_event({"type": "ADDED", "object": pod})
+        # Pod is enqueued in scheduler
+        self.assertGreater(
+            sum(sum(cm.values())
+                for cm in ctrl.scheduler.queue_depths().values()),
+            0,
+        )
+        # DELETED should clear both controller _pending AND scheduler queue
+        ctrl._handle_pod_event({"type": "DELETED", "object": pod})
+        self.assertNotIn("uid-DEL", ctrl._pending)
+        self.assertEqual(ctrl.scheduler.queue_depths(), {})
+
 
 # ---------------------------------------------------------------------------
 # Batch mode penalty (scoring)

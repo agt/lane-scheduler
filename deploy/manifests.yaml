@@ -10,9 +10,11 @@
 #   Taint ALL managed nodes before deploying:
 #     kubectl taint nodes <node> dsmlp/scheduling-gate=controller:NoSchedule
 #
-#   Label GPU nodes with their pool type:
-#     kubectl label nodes <gpu-node-interactive> dsmlp/gpu-pool=interactive
-#     kubectl label nodes <gpu-node-batch>       dsmlp/gpu-pool=batch
+#   Label GPU nodes with their GPU class (xsmall|small|medium|large|xlarge),
+#   and taint them so only pods carrying the matching gpu-class toleration
+#   land there:
+#     kubectl label nodes <gpu-node> gpu-class=medium
+#     kubectl taint nodes <gpu-node> gpu-class=medium:NoSchedule
 
 ---
 # ============================================================
