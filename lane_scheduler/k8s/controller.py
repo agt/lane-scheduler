@@ -37,6 +37,7 @@ from lane_scheduler.core.course_registry import CourseRegistry
 from lane_scheduler.core.node_capacity import NodeCapacityTracker
 from lane_scheduler.k8s.pod_translator import (
     NO_COURSE_LABEL,
+    LABEL_COURSE,
     LABEL_BATCH,
     admission_patch,
     needs_scheduling,
@@ -350,7 +351,7 @@ class LaneSchedulerController:
         lane_name = LANE_NAMES.get(lane, str(lane))
         course_id = (
             (pod.get("metadata") or {}).get("labels") or {}
-        ).get("dsmlp/course", NO_COURSE_LABEL) or NO_COURSE_LABEL
+        ).get(LABEL_COURSE, NO_COURSE_LABEL) or NO_COURSE_LABEL
         batch     = _is_batch(pod)
         deadline  = float((pod.get("spec") or {}).get("activeDeadlineSeconds") or 0)
 
@@ -444,7 +445,7 @@ class LaneSchedulerController:
                 return   # already queued
 
             course_id  = (pod.get("metadata", {}).get("labels") or {}).get(
-                "dsmlp/course", NO_COURSE_LABEL
+                LABEL_COURSE, NO_COURSE_LABEL
             ).strip() or NO_COURSE_LABEL
             course     = self.registry.get(course_id)
 

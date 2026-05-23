@@ -47,7 +47,7 @@ from lane_scheduler.core.node_capacity import (
 logger = logging.getLogger(__name__)
 
 # Labels we read
-LABEL_COURSE     = "dsmlp/course"
+LABEL_COURSE     = os.environ.get("LANE_COURSE_LABEL", "dsmlp/course")
 LABEL_BATCH      = "dsmlp/batch"
 # Label key on pods that identifies the requested GPU class / lane.
 # Override with LANE_POD_GPU_CLASS_LABEL if your cluster uses a different key.

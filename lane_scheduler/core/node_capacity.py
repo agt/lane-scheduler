@@ -36,8 +36,8 @@ from lane_scheduler.core.scheduler import Lane, GPU_LANES, lane_for_gpu_class
 logger = logging.getLogger(__name__)
 
 # Taint applied to all cluster nodes to inhibit default scheduling
-INHIBIT_TAINT_KEY    = "dsmlp/scheduling-gate"
-INHIBIT_TAINT_VALUE  = "controller"
+INHIBIT_TAINT_KEY    = os.environ.get("LANE_INHIBIT_TAINT_KEY",   "dsmlp/scheduling-gate")
+INHIBIT_TAINT_VALUE  = os.environ.get("LANE_INHIBIT_TAINT_VALUE", "controller")
 INHIBIT_TAINT_EFFECT = "NoSchedule"
 
 # Label key on nodes that identifies the GPU class / lane.
