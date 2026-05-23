@@ -37,6 +37,7 @@ from lane_scheduler.core.course_registry import CourseRegistry
 from lane_scheduler.core.node_capacity import NodeCapacityTracker
 from lane_scheduler.k8s.pod_translator import (
     NO_COURSE_LABEL,
+    LABEL_COURSE,
     LABEL_BATCH,
     admission_patch,
     needs_scheduling,
@@ -58,7 +59,7 @@ logger = logging.getLogger(__name__)
 
 def discover_gpu_classes(core_v1: "client.CoreV1Api") -> list[str]:
     """
-    List all nodes and collect distinct gpu-class taint values.
+    List all nodes and collect distinct gpu-class label values.
 
     Called once at startup, before initialise_lanes(), so that the Lane enum
     reflects the actual hardware inventory.  A controller restart is required
@@ -66,7 +67,7 @@ def discover_gpu_classes(core_v1: "client.CoreV1Api") -> list[str]:
 
     Returns a (possibly empty) sorted list of gpu-class strings.
     """
-    from lane_scheduler.core.node_capacity import GPU_CLASS_TAINT_KEY
+    from lane_scheduler.core.node_capacity import GPU_CLASS_LABEL_KEY
 
     found: set[str] = set()
     try:
@@ -76,17 +77,19 @@ def discover_gpu_classes(core_v1: "client.CoreV1Api") -> list[str]:
         return []
 
     for node in nodes:
-        for taint in (node.spec.taints or []):
-            if taint.key == GPU_CLASS_TAINT_KEY and taint.value:
-                found.add(taint.value.strip().lower())
+        labels = node.metadata.labels or {}
+        gpu_class = labels.get(GPU_CLASS_LABEL_KEY, "")
+        if gpu_class:
+            found.add(gpu_class.strip().lower())
 
     classes = sorted(found)
     if classes:
-        logger.info("Discovered GPU classes from node taints: %s", classes)
+        logger.info("Discovered GPU classes from node labels: %s", classes)
     else:
         logger.warning(
-            "No gpu-class taints found on any node — "
-            "only the CPU lane will be available until a controller restart."
+            "No %r labels found on any node — "
+            "only the CPU lane will be available until a controller restart.",
+            GPU_CLASS_LABEL_KEY,
         )
     return classes
 
@@ -348,7 +351,7 @@ class LaneSchedulerController:
         lane_name = LANE_NAMES.get(lane, str(lane))
         course_id = (
             (pod.get("metadata") or {}).get("labels") or {}
-        ).get("dsmlp/course", NO_COURSE_LABEL) or NO_COURSE_LABEL
+        ).get(LABEL_COURSE, NO_COURSE_LABEL) or NO_COURSE_LABEL
         batch     = _is_batch(pod)
         deadline  = float((pod.get("spec") or {}).get("activeDeadlineSeconds") or 0)
 
@@ -442,7 +445,7 @@ class LaneSchedulerController:
                 return   # already queued
 
             course_id  = (pod.get("metadata", {}).get("labels") or {}).get(
-                "dsmlp/course", NO_COURSE_LABEL
+                LABEL_COURSE, NO_COURSE_LABEL
             ).strip() or NO_COURSE_LABEL
             course     = self.registry.get(course_id)
 

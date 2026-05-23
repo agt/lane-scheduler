@@ -10,11 +10,11 @@ Lane capacity units match pod_translator:
 
 Node → Lane classification
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
-    Nodes are classified by the gpu-class taint the existing admission
-    controller already applies, e.g.:
-        gpu-class=xlarge:NoSchedule  →  Lane.GPU_XLARGE
+    Nodes are classified by a node label whose key is GPU_CLASS_LABEL_KEY
+    (default "gpu-class", overridable via LANE_NODE_GPU_CLASS_LABEL), e.g.:
+        gpu-class=xlarge  →  Lane.GPU_XLARGE
 
-    A node with no gpu-class taint but with the inhibitory scheduling-gate
+    A node with no gpu-class label but with the inhibitory scheduling-gate
     taint is treated as a CPU node.
 
     Nodes without the inhibitory scheduling-gate taint are ignored entirely —
@@ -26,6 +26,7 @@ Node → Lane classification
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from typing import Optional
@@ -35,12 +36,13 @@ from lane_scheduler.core.scheduler import Lane, GPU_LANES, lane_for_gpu_class
 logger = logging.getLogger(__name__)
 
 # Taint applied to all cluster nodes to inhibit default scheduling
-INHIBIT_TAINT_KEY    = "dsmlp/scheduling-gate"
-INHIBIT_TAINT_VALUE  = "controller"
+INHIBIT_TAINT_KEY    = os.environ.get("LANE_INHIBIT_TAINT_KEY",   "dsmlp/scheduling-gate")
+INHIBIT_TAINT_VALUE  = os.environ.get("LANE_INHIBIT_TAINT_VALUE", "controller")
 INHIBIT_TAINT_EFFECT = "NoSchedule"
 
-# Taint key set by the existing GPU admission controller
-GPU_CLASS_TAINT_KEY = "gpu-class"
+# Label key on nodes that identifies the GPU class / lane.
+# Override with LANE_NODE_GPU_CLASS_LABEL if your cluster uses a different key.
+GPU_CLASS_LABEL_KEY = os.environ.get("LANE_NODE_GPU_CLASS_LABEL", "gpu-class")
 
 _GPU_RESOURCE = "nvidia.com/gpu"
 
@@ -76,12 +78,11 @@ def _has_inhibit_taint(node: dict) -> bool:
 
 
 def _gpu_class_lane(node: dict) -> Optional[object]:
-    """Return the GPU Lane member from the node's gpu-class taint, or None."""
-    for t in _taints(node):
-        if t.get("key") == GPU_CLASS_TAINT_KEY:
-            gpu_class = (t.get("value") or "").strip()
-            if gpu_class:
-                return lane_for_gpu_class(gpu_class)
+    """Return the GPU Lane member from the node's gpu-class label, or None."""
+    labels = (node.get("metadata", {}) or {}).get("labels", {}) or {}
+    gpu_class = labels.get(GPU_CLASS_LABEL_KEY, "").strip()
+    if gpu_class:
+        return lane_for_gpu_class(gpu_class)
     return None
 
 
@@ -172,7 +173,7 @@ class NodeCapacityTracker:
         if gpu_lane is not None and gpu_count > 0:
             lane = gpu_lane
         elif gpu_lane is not None and gpu_count == 0:
-            logger.warning("Node %s has gpu-class taint but zero GPU allocatable", name)
+            logger.warning("Node %s has gpu-class label but zero GPU allocatable", name)
             from lane_scheduler.core.scheduler import Lane as _Lane
             lane = _Lane.CPU
         else:

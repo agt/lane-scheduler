@@ -17,7 +17,7 @@ from lane_scheduler.k8s.pod_translator import (
     admission_patch, needs_scheduling, pod_to_job, NO_COURSE_LABEL,
 )
 from lane_scheduler.core.node_capacity import (
-    NodeCapacityTracker, GPU_CLASS_TAINT_KEY,
+    NodeCapacityTracker, GPU_CLASS_LABEL_KEY,
     INHIBIT_TAINT_KEY, INHIBIT_TAINT_VALUE,
 )
 
@@ -71,10 +71,6 @@ def _inhibit_taint():
             "effect": "NoSchedule"}
 
 
-def _gpu_class_taint(gpu_class):
-    return {"key": GPU_CLASS_TAINT_KEY, "value": gpu_class, "effect": "NoSchedule"}
-
-
 def _make_node(
     name="node-1", ready=True, unschedulable=False,
     cpu="32", gpu=None, gpu_class=None, has_inhibit_taint=True,
@@ -82,13 +78,14 @@ def _make_node(
     taints = []
     if has_inhibit_taint:
         taints.append(_inhibit_taint())
+    labels = {}
     if gpu_class:
-        taints.append(_gpu_class_taint(gpu_class))
+        labels[GPU_CLASS_LABEL_KEY] = gpu_class
     allocatable = {"cpu": cpu}
     if gpu:
         allocatable["nvidia.com/gpu"] = gpu
     return {
-        "metadata": {"name": name, "labels": {}},
+        "metadata": {"name": name, "labels": labels},
         "spec":     {"unschedulable": unschedulable, "taints": taints},
         "status":   {"allocatable": allocatable,
                      "conditions": [{"type": "Ready",

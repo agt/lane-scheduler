@@ -51,7 +51,7 @@ Every managed node carries an inhibitory taint (`dsmlp/scheduling-gate=controlle
 
 ### Lane model
 
-`Lane` is a dynamic enum built at controller startup by reading node taints. It always includes a CPU lane plus one entry per GPU class discovered (xsmall, small, medium, large, xlarge). No code changes are needed when new GPU classes are added — only a controller restart.
+`Lane` is a dynamic enum built at controller startup by reading node **labels**. It always includes a CPU lane plus one entry per GPU class discovered (xsmall, small, medium, large, xlarge). No code changes are needed when new GPU classes are added — only a controller restart.
 
 ### Priority scoring formula
 
@@ -83,6 +83,11 @@ All defaults live in `controller.py` lines ~98–127. The most operationally rel
 | `LANE_T_HALF_BATCH` | 7200 s | Batch aging half-life |
 | `LANE_PRIOR_WEIGHT` | 10.0 | Bayesian pseudo-count for residency convergence |
 | `LANE_COURSE_CSV` | `/etc/lane-scheduler/courses.csv` | Registrar CSV path |
+| `LANE_NODE_GPU_CLASS_LABEL` | `gpu-class` | Node label key used to identify GPU class/lane |
+| `LANE_POD_GPU_CLASS_LABEL` | `gpu-class` | Pod label key used to identify requested GPU class/lane |
+| `LANE_COURSE_LABEL` | `dsmlp/course` | Pod label key used to identify the course |
+| `LANE_INHIBIT_TAINT_KEY` | `dsmlp/scheduling-gate` | Taint key on managed nodes (inhibitory gate) |
+| `LANE_INHIBIT_TAINT_VALUE` | `controller` | Taint value paired with the inhibitory gate key |
 
 ### Package layout
 
@@ -91,7 +96,7 @@ lane_scheduler/
   core/
     scheduler.py        # Priority scoring, Lane enum, Scheduler, DeficitTracker
     course_registry.py  # Loads/parses registrar CSV; tier inference
-    node_capacity.py    # Watches node taints; aggregates per-lane capacity
+    node_capacity.py    # Watches node labels; aggregates per-lane capacity
   k8s/
     controller.py       # Thread orchestration; Kubernetes API calls
     pod_translator.py   # K8s pod dicts ↔ Job domain objects
