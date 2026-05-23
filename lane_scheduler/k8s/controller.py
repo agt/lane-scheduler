@@ -108,6 +108,7 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+WEB_PORT            = _env_int(  "LANE_WEB_PORT",           8080)   # 0 = disabled
 CYCLE_INTERVAL      = _env_float("LANE_CYCLE_INTERVAL",   10.0)   # seconds
 DISPATCH_K          = _env_int(  "LANE_DISPATCH_K",         8)
 ALPHA               = _env_float("LANE_ALPHA",              1.0)
@@ -153,6 +154,7 @@ class LaneSchedulerController:
         cycle_interval:      float = CYCLE_INTERVAL,
         reload_interval:     float = RELOAD_INTERVAL,
         wait_cache_interval: float = WAIT_CACHE_INTERVAL,
+        web_port:            int   = 0,
     ):
         self.core_v1            = core_v1
         self.registry           = registry
@@ -160,6 +162,7 @@ class LaneSchedulerController:
         self.course_csv         = course_csv
         self.cycle_interval     = cycle_interval
         self.reload_interval    = reload_interval
+        self.web_port           = web_port
 
         self.node_tracker = NodeCapacityTracker()
 
@@ -220,6 +223,10 @@ class LaneSchedulerController:
         ]
         for t in threads:
             t.start()
+
+        if self.web_port > 0:
+            from lane_scheduler.web.server import start_server
+            start_server(self, port=self.web_port)
 
         try:
             while not self._stop.is_set():
@@ -690,6 +697,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Wait-time cache refresh interval in seconds (default: %(default)s)")
     p.add_argument("--prior-weight", type=float, default=PRIOR_WEIGHT,
                    help="Bayesian prior pseudo-count for per-course residency (default: %(default)s)")
+    p.add_argument("--web-port", type=int, default=WEB_PORT,
+                   help="Port for the queue-snapshot dashboard (0 = disabled, default: %(default)s)")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
@@ -767,6 +776,7 @@ def main() -> None:
         cycle_interval      = args.cycle_interval,
         reload_interval     = args.reload_interval,
         wait_cache_interval = args.wait_cache_interval,
+        web_port            = args.web_port,
     )
 
     # Graceful shutdown on SIGTERM (standard in Kubernetes)
