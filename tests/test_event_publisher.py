@@ -492,3 +492,78 @@ class TestBatchPublishDue(unittest.TestCase):
 
         self.assertAlmostEqual(milestone_1,
                                enqueued_at + 0.25 * original_median, places=1)
+
+
+# ---------------------------------------------------------------------------
+# Dry-run mode
+# ---------------------------------------------------------------------------
+
+class TestDryRun(unittest.TestCase):
+    """EventPublisher in dry_run=True must not call the Kubernetes API."""
+
+    def _setup_dry(self):
+        core_v1 = MagicMock()
+        pub = EventPublisher(core_v1, dry_run=True)
+        uid = "dry-uid-1"
+        pod = {
+            "metadata": {
+                "name": "dry-pod", "namespace": "ns",
+                "uid": uid, "resourceVersion": "1",
+                "labels": {},
+            },
+            "spec": {"containers": []},
+        }
+        pub.register(uid, pod)
+        lane = MagicMock()
+        job = _mock_job(uid, "CSE101")
+        est = WaitEstimate(120.0, 60.0, 240.0, 1, "cpu")
+        now = pub._schedules[uid].next_emit_at  # already due
+        return pub, core_v1, uid, est, now, job, lane
+
+    def test_no_api_call_in_dry_run(self):
+        pub, core_v1, uid, est, now, job, lane = self._setup_dry()
+        pub.publish_due(
+            estimates        = {uid: est},
+            lane_candidates  = {lane: [(1.0, job)]},
+            pending_snapshot = {uid: {}},
+            now              = now,
+        )
+        core_v1.create_namespaced_event.assert_not_called()
+
+    def test_emit_count_still_advances_in_dry_run(self):
+        """Schedule must advance so dry-run behaves like live for timing."""
+        pub, core_v1, uid, est, now, job, lane = self._setup_dry()
+        pub.publish_due(
+            estimates        = {uid: est},
+            lane_candidates  = {lane: [(1.0, job)]},
+            pending_snapshot = {uid: {}},
+            now              = now,
+        )
+        with pub._lock:
+            self.assertEqual(pub._schedules[uid].emit_count, 1)
+
+    def test_dry_run_false_calls_api(self):
+        """Sanity-check: dry_run=False still calls the API as normal."""
+        core_v1 = MagicMock()
+        pub = EventPublisher(core_v1, dry_run=False)
+        uid = "live-uid"
+        pod = {
+            "metadata": {
+                "name": "live-pod", "namespace": "ns",
+                "uid": uid, "resourceVersion": "1",
+                "labels": {},
+            },
+            "spec": {"containers": []},
+        }
+        pub.register(uid, pod)
+        lane = MagicMock()
+        job  = _mock_job(uid, "CSE101")
+        est  = WaitEstimate(60.0, 30.0, 120.0, 1, "cpu")
+        now  = pub._schedules[uid].next_emit_at
+        pub.publish_due(
+            estimates        = {uid: est},
+            lane_candidates  = {lane: [(1.0, job)]},
+            pending_snapshot = {uid: {}},
+            now              = now,
+        )
+        core_v1.create_namespaced_event.assert_called_once()

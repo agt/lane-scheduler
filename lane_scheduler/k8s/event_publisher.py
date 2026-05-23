@@ -176,8 +176,9 @@ class EventPublisher:
         )
     """
 
-    def __init__(self, core_v1: object) -> None:
+    def __init__(self, core_v1: object, dry_run: bool = False) -> None:
         self._core_v1 = core_v1
+        self._dry_run = dry_run
         self._schedules: dict[str, PodEventSchedule] = {}
         self._lock = threading.Lock()
 
@@ -314,6 +315,13 @@ class EventPublisher:
             },
             "count": 1,
         }
+
+        if self._dry_run:
+            logger.info(
+                "DRY RUN: would create event for pod %s/%s (emit #%d): %s",
+                sched.namespace, sched.pod_name, sched.emit_count + 1, message,
+            )
+            return True
 
         try:
             self._core_v1.create_namespaced_event(

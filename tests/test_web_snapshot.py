@@ -274,5 +274,84 @@ class TestWaitCacheAllEstimates(unittest.TestCase):
         self.assertEqual(r2, {})
 
 
+class TestControllerDryRun(unittest.TestCase):
+    """_admit_pod in dry_run=True must not call patch_namespaced_pod."""
+
+    def _make_dry_controller(self):
+        from lane_scheduler.k8s.controller import LaneSchedulerController
+        from lane_scheduler.estimation.wait_estimator import ResidencyProfile
+        core_v1 = MagicMock()
+        registry = CourseRegistry()
+        sched_config = SchedulerConfig()
+        residency_profiles = {
+            "interactive": ResidencyProfile(mean_pct=0.4, std_pct=0.2),
+            "batch":       ResidencyProfile(mean_pct=0.7, std_pct=0.15),
+        }
+        return LaneSchedulerController(
+            core_v1=core_v1,
+            registry=registry,
+            sched_config=sched_config,
+            residency_profiles=residency_profiles,
+            dry_run=True,
+            web_port=0,
+        ), core_v1
+
+    def _make_pod_and_job(self, ctrl):
+        _register(ctrl, "CSE101")
+        job = _submit(ctrl, "CSE101", _cpu(), job_id="uid-dry", student_id="s1")
+        pod = {
+            "metadata": {
+                "name": "dry-pod", "namespace": "ns",
+                "uid": "uid-dry", "labels": {"dsmlp/course": "CSE101"},
+            },
+            "spec": {"tolerations": [], "containers": []},
+            "status": {},
+        }
+        return pod, job
+
+    def test_patch_not_called_in_dry_run(self):
+        ctrl, core_v1 = self._make_dry_controller()
+        pod, job = self._make_pod_and_job(ctrl)
+        ctrl._admit_pod(pod, job)
+        core_v1.patch_namespaced_pod.assert_not_called()
+
+    def test_pod_still_marked_admitted_in_dry_run(self):
+        """Internal state must advance so the pod isn't re-tried next cycle."""
+        ctrl, _ = self._make_dry_controller()
+        pod, job = self._make_pod_and_job(ctrl)
+        ctrl._admit_pod(pod, job)
+        with ctrl._admitted_lock:
+            self.assertIn("uid-dry", ctrl._admitted)
+
+    def test_patch_called_when_not_dry_run(self):
+        from lane_scheduler.k8s.controller import LaneSchedulerController
+        from lane_scheduler.estimation.wait_estimator import ResidencyProfile
+        core_v1 = MagicMock()
+        registry = CourseRegistry()
+        ctrl = LaneSchedulerController(
+            core_v1=core_v1,
+            registry=registry,
+            sched_config=SchedulerConfig(),
+            residency_profiles={
+                "interactive": ResidencyProfile(mean_pct=0.4, std_pct=0.2),
+                "batch":       ResidencyProfile(mean_pct=0.7, std_pct=0.15),
+            },
+            dry_run=False,
+            web_port=0,
+        )
+        _register(ctrl, "CSE101")
+        job = _submit(ctrl, "CSE101", _cpu(), job_id="uid-live", student_id="s1")
+        pod = {
+            "metadata": {
+                "name": "live-pod", "namespace": "ns",
+                "uid": "uid-live", "labels": {"dsmlp/course": "CSE101"},
+            },
+            "spec": {"tolerations": [], "containers": []},
+            "status": {},
+        }
+        ctrl._admit_pod(pod, job)
+        core_v1.patch_namespaced_pod.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -158,6 +158,7 @@ class LaneSchedulerController:
         reload_interval:     float = RELOAD_INTERVAL,
         wait_cache_interval: float = WAIT_CACHE_INTERVAL,
         web_port:            int   = 0,
+        dry_run:             bool  = False,
     ):
         self.core_v1            = core_v1
         self.registry           = registry
@@ -166,6 +167,10 @@ class LaneSchedulerController:
         self.cycle_interval     = cycle_interval
         self.reload_interval    = reload_interval
         self.web_port           = web_port
+        self.dry_run            = dry_run
+
+        if dry_run:
+            logger.warning("DRY RUN mode enabled — pods will not be patched and events will not be created")
 
         self.node_tracker = NodeCapacityTracker()
 
@@ -205,7 +210,7 @@ class LaneSchedulerController:
         )
 
         # Kubernetes Event publisher (best-effort, non-blocking on errors)
-        self.event_publisher = EventPublisher(core_v1)
+        self.event_publisher = EventPublisher(core_v1, dry_run=dry_run)
 
         self._stop = threading.Event()
 
@@ -569,6 +574,17 @@ class LaneSchedulerController:
                 self._admitted.add(uid)
             return
 
+        if self.dry_run:
+            logger.info(
+                "DRY RUN: would patch pod %s/%s to add scheduling-gate toleration "
+                "[course=%s lane=%s wait=%.1fs]",
+                namespace, name, job.class_id, job.lane.name,
+                job.wait_seconds(now=time.monotonic()),
+            )
+            with self._admitted_lock:
+                self._admitted.add(uid)
+            return
+
         try:
             self.core_v1.patch_namespaced_pod(
                 name      = name,
@@ -702,6 +718,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Bayesian prior pseudo-count for per-course residency (default: %(default)s)")
     p.add_argument("--web-port", type=int, default=WEB_PORT,
                    help="Port for the queue-snapshot dashboard (0 = disabled, default: %(default)s)")
+    p.add_argument("--dry-run", action="store_true", default=False,
+                   help="Log what would be done without patching pods or creating events")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
@@ -780,6 +798,7 @@ def main() -> None:
         reload_interval     = args.reload_interval,
         wait_cache_interval = args.wait_cache_interval,
         web_port            = args.web_port,
+        dry_run             = args.dry_run,
     )
 
     # Graceful shutdown on SIGTERM (standard in Kubernetes)
