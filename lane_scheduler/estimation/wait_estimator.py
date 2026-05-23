@@ -384,6 +384,11 @@ class WaitTimeCache:
         """Wall-clock seconds the most recent snapshot computation took."""
         return self._last_duration
 
+    def all_estimates(self) -> dict[str, "WaitEstimate"]:
+        """Return a snapshot copy of all current estimates (pod_uid → WaitEstimate)."""
+        with self._lock:
+            return {uid: e.estimate for uid, e in self._cache.items()}
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._cache)
