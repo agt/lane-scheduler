@@ -135,6 +135,11 @@ def lane_for_gpu_class(gpu_class: str, fallback_name: str = "small") -> "IntEnum
     return fallback
 
 
+def is_known_gpu_class(gpu_class: str) -> bool:
+    """Return True if gpu_class maps to a lane in the current enum."""
+    return gpu_class.strip().lower() in _GPU_CLASS_TO_LANE
+
+
 # ---------------------------------------------------------------------------
 # Tier
 # ---------------------------------------------------------------------------

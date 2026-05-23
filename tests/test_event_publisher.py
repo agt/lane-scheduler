@@ -542,6 +542,74 @@ class TestDryRun(unittest.TestCase):
         with pub._lock:
             self.assertEqual(pub._schedules[uid].emit_count, 1)
 
+
+# ---------------------------------------------------------------------------
+# warn_unknown_gpu_class
+# ---------------------------------------------------------------------------
+
+def _gpu_pod(name="my-pod", namespace="ns", uid="uid-x", gpu_class="xyz") -> dict:
+    return {"metadata": {
+        "name": name, "namespace": namespace,
+        "uid": uid, "resourceVersion": "99",
+        "labels": {"gpu-class": gpu_class},
+    }}
+
+
+class TestWarnUnknownGpuClass(unittest.TestCase):
+
+    def test_emits_warning_event(self):
+        core_v1 = MagicMock()
+        pub = EventPublisher(core_v1)
+        pod = _gpu_pod()
+        pub.warn_unknown_gpu_class("uid-x", pod)
+        core_v1.create_namespaced_event.assert_called_once()
+        body = core_v1.create_namespaced_event.call_args.kwargs["body"]
+        self.assertEqual(body["type"], "Warning")
+        self.assertEqual(body["reason"], "UnknownGpuClass")
+        self.assertIn("xyz", body["message"])
+
+    def test_idempotent_per_uid(self):
+        core_v1 = MagicMock()
+        pub = EventPublisher(core_v1)
+        pod = _gpu_pod()
+        pub.warn_unknown_gpu_class("uid-x", pod)
+        pub.warn_unknown_gpu_class("uid-x", pod)
+        core_v1.create_namespaced_event.assert_called_once()
+
+    def test_distinct_uids_each_emit(self):
+        core_v1 = MagicMock()
+        pub = EventPublisher(core_v1)
+        pub.warn_unknown_gpu_class("uid-1", _gpu_pod(uid="uid-1"))
+        pub.warn_unknown_gpu_class("uid-2", _gpu_pod(uid="uid-2"))
+        self.assertEqual(core_v1.create_namespaced_event.call_count, 2)
+
+    def test_suppressed_when_no_unknown_gpu_class_events(self):
+        core_v1 = MagicMock()
+        pub = EventPublisher(core_v1, no_unknown_gpu_class_events=True)
+        pub.warn_unknown_gpu_class("uid-x", _gpu_pod())
+        core_v1.create_namespaced_event.assert_not_called()
+
+    def test_clear_unknown_gpu_warning_allows_reemit(self):
+        core_v1 = MagicMock()
+        pub = EventPublisher(core_v1)
+        pod = _gpu_pod()
+        pub.warn_unknown_gpu_class("uid-x", pod)
+        pub.clear_unknown_gpu_warning("uid-x")
+        pub.warn_unknown_gpu_class("uid-x", pod)
+        self.assertEqual(core_v1.create_namespaced_event.call_count, 2)
+
+    def test_api_error_does_not_raise(self):
+        core_v1 = MagicMock()
+        core_v1.create_namespaced_event.side_effect = Exception("boom")
+        pub = EventPublisher(core_v1)
+        pub.warn_unknown_gpu_class("uid-x", _gpu_pod())  # must not raise
+
+    def test_dry_run_does_not_call_api(self):
+        core_v1 = MagicMock()
+        pub = EventPublisher(core_v1, dry_run=True)
+        pub.warn_unknown_gpu_class("uid-x", _gpu_pod())
+        core_v1.create_namespaced_event.assert_not_called()
+
     def test_dry_run_false_calls_api(self):
         """Sanity-check: dry_run=False still calls the API as normal."""
         core_v1 = MagicMock()
