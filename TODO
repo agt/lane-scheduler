@@ -1,67 +1,108 @@
 Lane Scheduler — Code Review
 I read the source files and ran the test suite + sim harness. Findings below; line refs verified.
 Critical — fix first
-C1. Scheduler has no internal locks; pod-watch and cycle thread race on shared dicts
-scheduler.py:344-352 — _queues, _classes, plus UtilizationTracker._events and DeficitTracker._deficit are mutated without any lock. The controller carefully locks _pending/_admitted/_running/_running_ctx (controller.py:190-206), but then calls self.scheduler.submit(job) from pod-watch (controller.py:477) while the cycle thread runs self.scheduler.cycle() (controller.py:592). submit appends into _queues[lane][class_id][student_id]; cycle pops from it. UtilizationTracker.utilization() even rewrites self._events[key] via list-comprehension on every read (scheduler.py:253) — concurrent reads from the snapshot thread (snapshot.py:99-100 calls _scored_candidates) will corrupt this. Web snapshot.py:101-115 reads scheduler._queues directly with no lock.
-Fix: add a single Scheduler._lock = threading.RLock() and acquire it in submit, cycle, _scored_candidates, register_class, and the snapshot-side reads.
-C2. Watches do not preserve resourceVersion across reconnect — silent event loss
-controller.py:269-283, 516-531 — both watch loops do w.stream(list_pod_for_all_namespaces, timeout_seconds=60) and re-enter on Exception. There’s no stored resource_version, and no relist-then-watch on reconnect. After the 60 s timeout or any transient error, every event that happened during the gap is lost — including pod completions, which means _record_completion never fires and ResidencyStats quietly stops learning.
-Fix: store the last observed resourceVersion, pass it on reconnect, and re-LIST + reconcile in-memory state if the server returns 410 Gone.
-C3. simulate.py is broken
-tools/simulate.py:14-15, 30-34, 55-65, 154 — imports Lane.GPU_INTERACTIVE, Lane.GPU_BATCH, LANE_NAMES, Tier, CourseClass, and calls scheduler.register_class(...). After the dynamic-lane refactor, Lane is None until initialise_lanes() is called, and the GPU_INTERACTIVE/GPU_BATCH members don’t exist. python tools/simulate.py crashes at import-time with AttributeError: 'NoneType' object has no attribute 'CPU'. CLAUDE.md still advertises this as the offline test path.
-Fix: call initialise_lanes(["xsmall","small","medium","large","xlarge"]) first; replace GPU_INTERACTIVE/GPU_BATCH with real lane members; or delete the file if obsolete.
+C1. [DONE] Scheduler has no internal locks; pod-watch and cycle thread race on shared dicts
+	Fixed in "Harden scheduler concurrency, watch resumption, and admission retries":
+	Scheduler._lock = threading.RLock() added; cycle, submit, register_class,
+	_scored_candidates, queue_rank, queue_depths, and class_scores all acquire it.
+	UtilizationTracker keys pruned on read. Snapshot reads pending_count under
+	_pending_lock. _dispatched accumulator removed (callers use cycle()'s return value).
+C2. [DONE] Watches do not preserve resourceVersion across reconnect — silent event loss
+	Fixed in same commit: watch loops store and forward resourceVersion, handle 410 Gone
+	by re-listing, accept Bookmark events, and seed initial state from list_pod /
+	list_node so no events are lost on first iteration.
+C3. [DONE] simulate.py is broken
+	Fixed in same commit: tools/simulate.py rewritten for the dynamic Lane enum;
+	initialise_lanes() called before any Lane access. `python tools/simulate.py`
+	runs end-to-end again.
 C4. Unbounded growth in DeficitTracker._deficit and UtilizationTracker._events
-scheduler.py:273, 246 — both keyed by (student_id, lane) / (class_id, lane) and never pruned. UtilizationTracker re-lists events on every read but never deletes keys, and DeficitTracker never forgets a student. Across a multi-term deployment with thousands of students, both grow without bound. There is no per-term reset hook anywhere.
-Fix: GC keys with no recent activity on CSV reload, or prune entries whose deficit/last-event timestamp is older than the utilization window.
-C5. _handle_pod_event ignores DELETED
-controller.py:296-305 — only ADDED/MODIFIED are handled. If a Pending or Running pod is deleted while in the queue or running set, the controller learns nothing: the job stays in _queues, in _pending, in _running, and in _running_ctx forever. (Deletion is partially handled via the next MODIFIED to phase=Failed, but force-delete with grace-period=0 skips that.)
-Fix: on DELETED, dequeue from the scheduler queue, drop from _pending/_admitted/_running/_running_ctx.
+	scheduler.py:273, 246 — UtilizationTracker keys are now pruned on read (done).
+	DeficitTracker._deficit is still keyed by (student_id, lane) and never pruned.
+	Across a multi-term deployment with thousands of students, _deficit grows without
+	bound. No per-term reset hook exists.
+	Remaining fix: GC DeficitTracker keys with no recent activity on CSV reload, or
+	prune entries whose last-event timestamp is older than the utilization window.
+C5. [DONE] _handle_pod_event ignores DELETED
+	Fixed in same commit: DELETED events now call Scheduler.remove_job, clearing the
+	job from _queues so orphan Jobs no longer linger after force-delete.
 High
-H1. Documentation drift — test counts and lane labels
-	•	README.md:336 claims “158 tests”; CLAUDE.md says 188; actual is 194 (pytest --collect-only).
-	•	manifests.yaml:14-15 header comments tell operators to label nodes dsmlp/gpu-pool=interactive / =batch, but the code reads gpu-class=<xsmall|small|...> (CLAUDE.md, README §GPU Class Routing). Operators following the manifest comments would never get any GPU lanes registered.
+H1. [DONE] Documentation drift — test counts and lane labels
+	Fixed in same commit: README.md and CLAUDE.md test counts updated to 219;
+	manifests.yaml header comments corrected to reference gpu-class labels
+	(not the stale dsmlp/gpu-pool=interactive/batch).
 H2. Manifest image: <ghcr.io/agt/lane-scheduler:latest>, no probes, no securityContext
-manifests.yaml:102, 122-128 — :latest defeats rollback and pinning. No livenessProbe/readinessProbe, so a hung watch thread or wedged scheduler is invisible to Kubernetes. No securityContext (runAsNonRoot, readOnlyRootFilesystem, allowPrivilegeEscalation: false, seccompProfile) — the Dockerfile’s USER nobody is the only defense and is easily overridden by a manifest edit. replicas: 1 with no leader election is acknowledged in a comment but there’s no PDB and no rollback story.
+	manifests.yaml:104 still uses :latest. No livenessProbe/readinessProbe added.
+	No securityContext (runAsNonRoot, readOnlyRootFilesystem, allowPrivilegeEscalation:
+	false, seccompProfile). replicas: 1 with no PDB, no leader election.
+	Still needs: pinned image digest or semver tag; liveness/readiness probes;
+	securityContext block; PodDisruptionBudget.
 H3. CronJob template is non-functional as written
-manifests.yaml:160-168 — the script body only contains commented-out curl and a kubectl create configmap --from-file=courses.csv=/tmp/courses.csv that references a file no one populates. Deploying this as-is silently does nothing every morning. Either make the placeholder fail loudly (exit 1) or remove the body.
-H4. cycle() and _admit_pod retry semantics
-controller.py:608-640 — _admit_pod patches each admitted pod inline inside the cycle thread; on a non-404 exception (line 638) it re-enqueues the job object, but _pending still contains the pod and the next cycle will pick it up again immediately. No backoff, no per-pod failure counter. A flapping kube-apiserver turns the cycle thread into a hot loop logging every cycle.
-Fix: record (pod_uid → next_retry_at, attempts); skip pods whose backoff hasn’t elapsed; give up after N attempts and emit a Warning event.
+	manifests.yaml:162-170 — the curl fetch is still commented out; the kubectl
+	create configmap line references /tmp/courses.csv which no one populates.
+	Deploying as-is silently does nothing every morning.
+	Still needs: either a real fetch command (uncommented curl) or an explicit
+	`exit 1` so the job fails loudly instead of silently succeeding.
+H4. [DONE] cycle() and _admit_pod retry semantics
+	Fixed in same commit: per-pod exponential backoff capped at 5 min,
+	_MAX_ADMIT_ATTEMPTS=5. Pods in backoff are skipped by the cycle thread.
+	On give-up, the Job and _pending entry are dropped and a Warning Event is emitted.
 H5. Patch payload is a JSON-merge patch but called via patch_namespaced_pod without content-type
-Not verified in this review but worth checking — patch_namespaced_pod defaults to strategic-merge for core/v1 Pod. Appending to spec.tolerations via strategic merge needs patchMergeKey: "key" semantics, which Pod tolerations don’t have (they merge by full element). Confirm the path actually adds rather than replaces the tolerations array, and add a test that asserts pre-existing tolerations survive.
+	Not re-verified post-refactor. Confirm that strategic-merge on spec.tolerations
+	correctly appends rather than replaces the array, and add a test asserting that
+	pre-existing tolerations survive admission.
 H6. Web server: no auth, binds 0.0.0.0
-web/server.py + manifests — the snapshot exposes queue contents and student namespace counts. No Service, no auth, no TLS. Either bind to 127.0.0.1 and require port-forward, or front it with auth.
-H7. epsilon, t_half, mean_pct/std_pct not validated
-scheduler.py:312 divides by max(utilization, epsilon) — if a misconfigured operator sets LANE_EPSILON=0, every idle course produces inf scores. t_half is used as a divisor in math.log1p(wait / t_half) (scheduler.py:304); zero or negative crashes. Same for ResidencyProfile (wait_estimator.py).
-Fix: validate in SchedulerConfig.__post_init__ / ResidencyProfile.__post_init__.
-H8. Snapshot reads aren’t atomic across _pending / _running / scheduler queues
-web/snapshot.py:59-115 — three separate with blocks, plus an unlocked read of scheduler._queues. A pod transitioning Pending→Running between blocks shows up in both halves or neither. Acquire all locks in a fixed order, or build the snapshot inside the cycle thread and publish atomically.
+	web/server.py still exposes queue contents and student namespace counts with
+	no auth and no TLS. Either bind to 127.0.0.1 and require port-forward, or
+	front with auth middleware.
+H7. [DONE] epsilon, t_half, mean_pct/std_pct not validated
+	Fixed in same commit: SchedulerConfig.__post_init__ validates alpha >= 0
+	and all other config fields > 0, preventing inf scores and zero-division crashes.
+H8. Snapshot reads aren't atomic across _pending / _running / scheduler queues
+	web/snapshot.py — pending_count now read under _pending_lock (done). Full
+	atomicity across _pending / _running / scheduler queues still not guaranteed;
+	a pod transitioning between states across the three separate lock acquisitions
+	can appear in both halves or neither.
+	Remaining fix: acquire all locks in a fixed order for the full snapshot, or
+	build it inside the cycle thread and publish atomically.
 Medium
-M1. _running_ctx leaks on missed completion
-controller.py:381-405 — _record_completion deletes from _running_ctx only if the pod was found in _running. After C5 (missed DELETE) or watch reconnection gaps (C2), entries pile up indefinitely. Add a TTL keyed on start_time.
+M1. [DONE] _running_ctx leaks on missed completion
+	Fixed in same commit: _running_ctx tuples carry a ctx_created timestamp; the
+	cycle thread sweeps entries older than 24 h whose uid is no longer in _running.
 M2. Pod-UID as job id, but jobs survive in _queues across pod recreation
-pod_translator.py:139-169 — UIDs are unique in practice, but the scheduler also keys by (class_id, student_id) in its nested-dict queue (scheduler.py:349). If _dequeue misses a deletion, a recreated pod with a new UID will sit alongside the dead Job in the same student bucket. The deficit accounting won’t notice and will keep accruing.
-M3. Batch milestone math freezes after first estimate
-event_publisher.py:110-123 — milestones are anchored to the first median estimate. If that first estimate is wildly wrong (e.g., empty residency stats early in the term), all four milestones are scheduled badly and never re-anchored. Either recompute on first dispatch or re-anchor if the estimate doubles.
+	pod_translator.py:139-169 — if _dequeue misses a deletion, a recreated pod
+	with a new UID sits alongside the dead Job in the same student bucket. Deficit
+	accounting won't notice and keeps accruing. No change made yet.
+M3. [DONE] Batch milestone math freezes after first estimate
+	Fixed in same commit: event_publisher re-anchors milestones when the median
+	wait estimate grows more than 2x the original anchor (never shrinks).
 M4. CSV reload is all-or-nothing but silently accepts a shrunken file
-course_registry.py:109-144 — if the registrar export is truncated, the swap succeeds with fewer courses; everything not present falls through to _infer_tier defaults of 200/50 (course_registry.py:62-90), and there is no log line saying “registry shrank from 412 to 7.” Add a sanity check (e.g., “refuse to replace if new size < 50% of old”).
-M5. lane_for_gpu_class silently falls back
-scheduler.py:111-135 — unknown gpu-class values get mapped to the small lane with a one-time warning. Pods labelled gpu-class=h100 (typo or new hardware) silently land in the wrong lane and consume small-GPU capacity. Recent commit message (“Ignore pods with unknown gpu-class”) suggests intent to reject, but the node side still falls back — verify both sides.
-M6. Graceful shutdown doesn’t stop in-flight watches
-controller.py:252-263 — stop() sets _stop, but watch threads are blocked inside w.stream(...) for up to 60 s. The main loop also doesn’t .join() any threads. Call w.stop() on each watch handle on SIGTERM; join with a timeout.
-M7. No SIGINT handler
-controller.py:844-845 (per agent’s read) — only SIGTERM. Local Ctrl-C falls through to KeyboardInterrupt and leaves residency stats unsynced.
+	course_registry.py — no sanity check on registry size after reload. A truncated
+	export silently replaces the full registry. Still needs a guard (e.g., refuse
+	to replace if new size < 50% of old) and a log line when the count changes.
+M5. [DONE] lane_for_gpu_class silently falls back
+	Fixed across two commits: lane_for_gpu_class gains strict=True returning None
+	for unknown classes; pods with unknown gpu-class are ignored (not enqueued) and
+	receive a Warning Kubernetes event (reason: UnknownGpuClass). NodeCapacityTracker
+	also uses strict lookup and excludes nodes with unmanaged gpu-class labels.
+M6. [DONE] Graceful shutdown doesn't stop in-flight watches
+	Fixed in same commit: watch handles stored on the controller; stop() calls
+	w.stop() on each handle to interrupt blocking streams; threads joined with a
+	timeout on SIGTERM.
+M7. [DONE] No SIGINT handler
+	Fixed in same commit: SIGINT handler registered alongside SIGTERM so Ctrl-C
+	also triggers graceful shutdown and syncs residency stats.
 Low
-	•	Dockerfile pins neither Python patch (python:3.11-slim) nor kubernetes client version. pyproject.toml says kubernetes>=28.1.0 and the install just resolved to 36.0.0 — that’s the version difference range you’d allow in prod.
-	•	Dockerfile has two pip installs (kubernetes then --no-deps -e .); a single pip install -e . would respect pyproject.toml and avoid drift.
+	•	[DONE] Dockerfile pins python:3.11.10-slim and uses a single editable install
+	  (pyproject.toml drives all dependencies; kubernetes~=36.0 pinned).
+	•	[DONE] _dispatched accumulator removed — no longer a slow leak.
 	•	No HEALTHCHECK in Dockerfile, no /healthz in the web server.
-	•	No tests for: concurrent submit/cycle, watch reconnection, malformed pods, DELETE events, CSV truncation, NaN in residency profile, LANE_EPSILON=0.
-	•	Logging: pod names logged unsanitized; long namespaces produce noisy lines.
-	•	Dispatched list scheduler._dispatched (scheduler.py:354) is appended-to but never trimmed — another slow leak in long-running processes.
-Top-5 to act on
-	1.	Add Scheduler._lock and protect _queues/_classes/util/deficit/snapshot reads (C1, H8).
-	2.	Preserve resourceVersion across watch reconnects and reconcile on 410 (C2).
-	3.	Handle pod DELETED events in _handle_pod_event (C5) — also closes the _running_ctx leak (M1).
-	4.	Fix or delete tools/simulate.py (C3); reconcile the README/CLAUDE.md/manifest comments drift (H1).
-	5.	Harden the Deployment: pinned image tag, liveness/readiness probes, securityContext, and either remove or implement the CronJob body (H2, H3).
-Nothing committed — this is review output only. Want me to push fixes for any of these on claude/codebase-review-mwtX9?
+	•	Tests still missing for: malformed pods, watch reconnection, CSV truncation,
+	  NaN in residency profile. (Concurrent submit/cycle, config validation,
+	  remove_job, DELETE→queue, admission backoff now covered — 219 passing.)
+	•	Logging: pod names still logged unsanitized; long namespaces produce noisy lines.
+Top-5 remaining
+	1.	Finish C4: prune DeficitTracker._deficit on CSV reload to prevent multi-term unbounded growth.
+	2.	Fix H2: pin image to a semver/digest tag; add liveness/readiness probes and securityContext to the Deployment.
+	3.	Fix H3: uncomment or replace the CronJob fetch command so it fails loudly when /tmp/courses.csv is absent.
+	4.	Fix H8 + M2: make snapshot reads fully atomic; handle pod-UID reuse so dead Jobs don't survive in student buckets.
+	5.	Fix M4: add CSV-size sanity check to course_registry.py to reject suspiciously shrunken registrar exports.
