@@ -82,6 +82,7 @@ All defaults live in `controller.py` lines ~98–127. The most operationally rel
 | `LANE_T_HALF_INTERACTIVE` | 600 s | Interactive aging half-life |
 | `LANE_T_HALF_BATCH` | 7200 s | Batch aging half-life |
 | `LANE_PRIOR_WEIGHT` | 10.0 | Bayesian pseudo-count for residency convergence |
+| `LANE_EWMA_ALPHA` | 0.1 | EWMA smoothing factor for per-class residency; higher = faster adaptation to recent data |
 | `LANE_COURSE_CSV` | `/etc/lane-scheduler/courses.csv` | Registrar CSV path |
 | `LANE_NODE_GPU_CLASS_LABEL` | `gpu-class` | Node label key used to identify GPU class/lane |
 | `LANE_POD_GPU_CLASS_LABEL` | `gpu-class` | Pod label key used to identify requested GPU class/lane |

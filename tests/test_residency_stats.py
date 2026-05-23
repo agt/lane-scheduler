@@ -6,7 +6,9 @@ import math
 import unittest
 
 from lane_scheduler.estimation.wait_estimator import ResidencyProfile
-from lane_scheduler.estimation.residency_stats import ResidencyStats, _Welford, DEFAULT_PRIOR_WEIGHT
+from lane_scheduler.estimation.residency_stats import (
+    ResidencyStats, _EWMA, DEFAULT_PRIOR_WEIGHT, DEFAULT_EWMA_ALPHA,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -17,51 +19,74 @@ INTERACTIVE = ResidencyProfile(mean_pct=0.4, std_pct=0.2)
 BATCH       = ResidencyProfile(mean_pct=0.7, std_pct=0.15)
 
 
-def _stats(prior_weight=10.0) -> ResidencyStats:
+def _stats(prior_weight=10.0, ewma_alpha=DEFAULT_EWMA_ALPHA) -> ResidencyStats:
     return ResidencyStats(
         interactive_prior = INTERACTIVE,
         batch_prior       = BATCH,
         prior_weight      = prior_weight,
+        ewma_alpha        = ewma_alpha,
     )
 
 
 # ---------------------------------------------------------------------------
-# Welford accumulator
+# EWMA accumulator
 # ---------------------------------------------------------------------------
 
-class TestWelford(unittest.TestCase):
+class TestEWMA(unittest.TestCase):
 
     def test_single_observation(self):
-        w = _Welford()
-        w.update(0.5)
-        self.assertEqual(w.n, 1)
-        self.assertAlmostEqual(w.mean, 0.5)
-        self.assertAlmostEqual(w.variance, 0.0)
+        e = _EWMA(alpha=0.1)
+        e.update(0.5)
+        self.assertEqual(e.n, 1)
+        self.assertAlmostEqual(e.mean, 0.5)
+        self.assertAlmostEqual(e.variance, 0.0)
 
-    def test_two_observations_mean(self):
-        w = _Welford()
-        w.update(0.2)
-        w.update(0.8)
-        self.assertAlmostEqual(w.mean, 0.5)
+    def test_mean_tracks_recent_shift(self):
+        # Seed with 0.0, then switch to 1.0 — EWMA mean should rise.
+        e = _EWMA(alpha=0.3)
+        for _ in range(20):
+            e.update(0.0)
+        mean_before = e.mean
+        for _ in range(10):
+            e.update(1.0)
+        self.assertGreater(e.mean, mean_before)
+        self.assertLess(e.mean, 1.0)
 
-    def test_variance_matches_known(self):
-        # Observations: 0.2, 0.4, 0.6, 0.8 → population var = 0.05
-        w = _Welford()
-        for v in (0.2, 0.4, 0.6, 0.8):
-            w.update(v)
-        self.assertAlmostEqual(w.variance, 0.05, places=10)
+    def test_constant_stream_converges_to_value(self):
+        e = _EWMA(alpha=0.2)
+        for _ in range(200):
+            e.update(0.7)
+        self.assertAlmostEqual(e.mean, 0.7, places=5)
+
+    def test_variance_positive_with_variation(self):
+        e = _EWMA(alpha=0.2)
+        for v in (0.2, 0.8, 0.2, 0.8):
+            e.update(v)
+        self.assertGreater(e.variance, 0.0)
 
     def test_std_is_sqrt_variance(self):
-        w = _Welford()
+        e = _EWMA(alpha=0.1)
         for v in (0.1, 0.5, 0.9):
-            w.update(v)
-        self.assertAlmostEqual(w.std, math.sqrt(w.variance), places=10)
+            e.update(v)
+        self.assertAlmostEqual(e.std, math.sqrt(e.variance), places=10)
 
     def test_monotone_count(self):
-        w = _Welford()
+        e = _EWMA(alpha=0.1)
         for i in range(20):
-            w.update(float(i) / 20)
-            self.assertEqual(w.n, i + 1)
+            e.update(float(i) / 20)
+            self.assertEqual(e.n, i + 1)
+
+    def test_higher_alpha_adapts_faster(self):
+        # Both start at 0.0, then see only 1.0 observations.
+        e_slow = _EWMA(alpha=0.05)
+        e_fast = _EWMA(alpha=0.5)
+        for _ in range(5):
+            e_slow.update(0.0)
+            e_fast.update(0.0)
+        for _ in range(5):
+            e_slow.update(1.0)
+            e_fast.update(1.0)
+        self.assertGreater(e_fast.mean, e_slow.mean)
 
 
 # ---------------------------------------------------------------------------
@@ -134,12 +159,13 @@ class TestShrinkage(unittest.TestCase):
         # High prior weight → posterior mean stays closer to 0.4
         self.assertGreater(p_low.mean_pct, p_high.mean_pct)
 
-    def test_posterior_mean_always_between_prior_and_sample(self):
+    def test_posterior_mean_always_between_prior_and_ewma(self):
         stats = _stats(prior_weight=5.0)
         for pct in (0.1, 0.3, 0.8, 1.0):
             stats.record("CSE150", "cpu", batch=False, residency_pct=pct)
         profile   = stats.profile_for("CSE150", "cpu", batch=False)
         acc       = stats._strata[list(stats._strata.keys())[0]]
+        # Posterior is a weighted blend of prior_mean and EWMA mean.
         lo = min(INTERACTIVE.mean_pct, acc.mean)
         hi = max(INTERACTIVE.mean_pct, acc.mean)
         self.assertGreaterEqual(profile.mean_pct, lo - 1e-9)
