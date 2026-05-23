@@ -6,7 +6,7 @@ A Kubernetes controller that fairly allocates cluster resources across universit
 
 ## Goals
 
-University teaching clusters face a structural fairness problem: a 200-student introductory course will naturally generate far more queued jobs than a 12-student graduate seminar, causing smaller classes to starve during peak periods even when those smaller classes have higher pedagogical priority.
+University teaching clusters face a structural fairness problem: a 200-student introductory course will naturally generate far more queued jobs than a 12-student graduate seminar, causing smaller classes to starve during peak periods even when those smaller classes have equivalent pedagogical priority.
 
 This scheduler addresses that by:
 
@@ -14,7 +14,7 @@ This scheduler addresses that by:
 - Distributing a course's share fairly among its individual students, so no single active student within a course monopolizes its allocation
 - Preferring interactive jobs over batch jobs within any resource lane, while ensuring batch jobs eventually drain overnight
 - Providing students with real-time queue position and estimated wait time via Kubernetes Events visible in `kubectl describe pod`
-- Adapting wait-time estimates over time using course-specific completion data, so estimates improve as the semester progresses
+- Adapting wait-time estimates over time using course-specific completion data, so estimates improve as the term progresses
 
 The scheduler is implemented as a Kubernetes controller. It does not replace the default Kubernetes scheduler; instead it acts as a gating layer, holding pods in a Pending state via node taints until they reach the top of the priority queue, then patching in a toleration that allows the default scheduler to place them normally.
 
@@ -96,7 +96,7 @@ P(j, l) = W(c) × Mode(j) × Age(j) / U(c, l)
 W(c) = tier_weight(c) / √enrollment(c)
 ```
 
-Tier weights are 1 (introductory), 2 (upper-division), and 3 (graduate). The square-root enrollment denominator softens but does not eliminate the size difference — a 200-student intro class gets less weight than a 12-student grad seminar, but is not ignored entirely.
+Tier weights are 1 (lower-division undergraduate), 2 (upper-division), and 3 (graduate). The square-root enrollment denominator softens but does not eliminate the size difference — a 200-student intro class gets less weight than a 12-student grad seminar, but is not ignored entirely.
 
 **`Mode(j)` — Batch Penalty**
 
@@ -130,7 +130,7 @@ Course metadata is loaded from a CSV file exported daily from the university reg
 ```
 course_id,level,seats
 CSE234_SP26_A00,graduate,18
-CSE101_SP26_A00,lower,210
+CSE10_SP26_A00,lower,210
 CSE150_SP26_A00,upper,55
 ```
 
