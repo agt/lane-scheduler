@@ -7,15 +7,26 @@ converges toward course-specific observations via Bayesian shrinkage.
 
 Math
 ~~~~
-We track a running mean and variance using Welford's online algorithm, which
-is numerically stable and O(1) per update.
+We track a running mean and variance using an exponentially weighted moving
+average (EWMA), so that recent pod residencies carry more weight than older
+ones.  Given smoothing factor α ∈ (0, 1):
 
-The posterior mean and variance blend the prior with observed data:
+    mean_new = (1 − α) × mean_old + α × x
+             = mean_old + α × (x − mean_old)
+
+    var_new  = (1 − α) × (var_old + α × (x − mean_old)²)
+
+Higher α means faster adaptation to recent data (α = 1 reduces to always
+using the latest observation; α → 0 gives equal weight to all history).
+The actual observation count n is still tracked so Bayesian shrinkage can
+be applied correctly.
+
+The posterior mean and variance blend the prior with observed EWMA data:
 
     n_eff  = prior_weight + n_obs
-    mean   = (prior_weight × prior_mean  + n_obs × sample_mean)  / n_eff
-    var    = (prior_weight × prior_var   + n_obs × sample_var
-              + prior_weight × n_obs × (prior_mean - sample_mean)² / n_eff)
+    mean   = (prior_weight × prior_mean  + n_obs × ewma_mean)  / n_eff
+    var    = (prior_weight × prior_var   + n_obs × ewma_var
+              + prior_weight × n_obs × (prior_mean - ewma_mean)² / n_eff)
              / n_eff
 
 prior_weight acts as a pseudo-count: with prior_weight=10, the prior counts
@@ -52,32 +63,42 @@ logger = logging.getLogger(__name__)
 # them adapt faster.
 DEFAULT_PRIOR_WEIGHT = 10.0
 
+# Default EWMA smoothing factor.  Each new observation contributes α of the
+# update; lower values retain history longer.  Raise to react faster to
+# shifts in course behaviour.
+DEFAULT_EWMA_ALPHA = 0.1
+
 
 # ---------------------------------------------------------------------------
-# Welford accumulator
+# EWMA accumulator
 # ---------------------------------------------------------------------------
 
 @dataclass
-class _Welford:
+class _EWMA:
     """
-    Online mean and variance estimator (Welford's algorithm).
-    Stores count, mean, and M2 (sum of squared deviations).
+    Exponentially weighted mean and variance estimator.
+
+    alpha: smoothing factor in (0, 1).  Higher = faster adaptation to recent
+           observations (α=0.1 means ~10 % weight on the newest point).
     """
-    n:    int   = 0
-    mean: float = 0.0
-    M2:   float = 0.0   # sum of (x - mean)²
+    alpha: float
+    n:     int   = 0
+    mean:  float = 0.0
+    var:   float = 0.0  # exponentially weighted variance
 
     def update(self, x: float) -> None:
-        self.n    += 1
-        delta      = x - self.mean
-        self.mean += delta / self.n
-        delta2     = x - self.mean
-        self.M2   += delta * delta2
+        self.n += 1
+        if self.n == 1:
+            self.mean = x
+        else:
+            diff      = x - self.mean
+            self.mean += self.alpha * diff
+            self.var   = (1.0 - self.alpha) * (self.var + self.alpha * diff ** 2)
 
     @property
     def variance(self) -> float:
-        """Population variance (n ≥ 1); returns 0 for n < 2."""
-        return self.M2 / self.n if self.n >= 2 else 0.0
+        """Exponentially weighted variance; 0 until at least two observations."""
+        return self.var if self.n >= 2 else 0.0
 
     @property
     def std(self) -> float:
@@ -110,6 +131,7 @@ class ResidencyStats:
             interactive_prior = ResidencyProfile(mean_pct=0.4, std_pct=0.2),
             batch_prior       = ResidencyProfile(mean_pct=0.7, std_pct=0.15),
             prior_weight      = 10.0,
+            ewma_alpha        = 0.1,
         )
 
         # On pod completion (from controller._handle_pod_event):
@@ -134,11 +156,13 @@ class ResidencyStats:
         interactive_prior: ResidencyProfile,
         batch_prior:       ResidencyProfile,
         prior_weight:      float = DEFAULT_PRIOR_WEIGHT,
+        ewma_alpha:        float = DEFAULT_EWMA_ALPHA,
     ) -> None:
         self._interactive_prior = interactive_prior
         self._batch_prior       = batch_prior
         self._prior_weight      = prior_weight
-        self._strata: dict[_StratumKey, _Welford] = {}
+        self._ewma_alpha        = ewma_alpha
+        self._strata: dict[_StratumKey, _EWMA] = {}
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
@@ -162,7 +186,7 @@ class ResidencyStats:
         key = _StratumKey(course_id=course_id, lane_name=lane_name, batch=batch)
         with self._lock:
             if key not in self._strata:
-                self._strata[key] = _Welford()
+                self._strata[key] = _EWMA(alpha=self._ewma_alpha)
             self._strata[key].update(pct)
 
         logger.debug(
@@ -229,7 +253,7 @@ class ResidencyStats:
     # Internal
     # ------------------------------------------------------------------
 
-    def _posterior(self, prior: ResidencyProfile, acc: _Welford) -> ResidencyProfile:
+    def _posterior(self, prior: ResidencyProfile, acc: _EWMA) -> ResidencyProfile:
         """
         Compute the Bayesian posterior ResidencyProfile.
 

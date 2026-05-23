@@ -130,6 +130,7 @@ BATCH_MEAN_PCT       = _env_float("LANE_BATCH_MEAN_PCT",       0.7)
 BATCH_STD_PCT        = _env_float("LANE_BATCH_STD_PCT",        0.15)
 WAIT_CACHE_INTERVAL  = _env_float("LANE_WAIT_CACHE_INTERVAL",  60.0)  # seconds
 PRIOR_WEIGHT         = _env_float("LANE_PRIOR_WEIGHT",          10.0)  # pseudo-count
+EWMA_ALPHA           = _env_float("LANE_EWMA_ALPHA",             0.1)  # residency EWMA smoothing factor
 NO_UNKNOWN_GPU_CLASS_EVENTS = os.environ.get(
     "LANE_NO_UNKNOWN_GPU_CLASS_EVENTS", ""
 ).lower() in ("1", "true", "yes")
@@ -165,6 +166,7 @@ class LaneSchedulerController:
         sched_config:        SchedulerConfig,
         residency_profiles:  dict[str, ResidencyProfile],
         prior_weight:        float = PRIOR_WEIGHT,
+        ewma_alpha:          float = EWMA_ALPHA,
         course_csv:          Optional[Path] = None,
         cycle_interval:      float = CYCLE_INTERVAL,
         reload_interval:     float = RELOAD_INTERVAL,
@@ -238,6 +240,7 @@ class LaneSchedulerController:
             interactive_prior = residency_profiles["interactive"],
             batch_prior       = residency_profiles["batch"],
             prior_weight      = prior_weight,
+            ewma_alpha        = ewma_alpha,
         )
 
         # Background wait-time cache
@@ -988,6 +991,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Wait-time cache refresh interval in seconds (default: %(default)s)")
     p.add_argument("--prior-weight", type=float, default=PRIOR_WEIGHT,
                    help="Bayesian prior pseudo-count for per-course residency (default: %(default)s)")
+    p.add_argument("--ewma-alpha", type=float, default=EWMA_ALPHA,
+                   help="EWMA smoothing factor for per-course residency (0,1); higher = faster adaptation (default: %(default)s)")
     p.add_argument("--web-port", type=int, default=WEB_PORT,
                    help="Port for the queue-snapshot dashboard (0 = disabled, default: %(default)s)")
     p.add_argument("--dry-run", action="store_true", default=False,
@@ -1073,6 +1078,7 @@ def main() -> None:
         sched_config                 = sched_config,
         residency_profiles           = residency_profiles,
         prior_weight                 = args.prior_weight,
+        ewma_alpha                   = args.ewma_alpha,
         course_csv                   = csv_path,
         cycle_interval               = args.cycle_interval,
         reload_interval              = args.reload_interval,
