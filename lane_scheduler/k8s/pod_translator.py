@@ -35,6 +35,7 @@ Resource units
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Optional
 
@@ -47,8 +48,10 @@ logger = logging.getLogger(__name__)
 
 # Labels we read
 LABEL_COURSE     = "dsmlp/course"
-LABEL_GPU_CLASS  = "gpu-class"
 LABEL_BATCH      = "dsmlp/batch"
+# Label key on pods that identifies the requested GPU class / lane.
+# Override with LANE_POD_GPU_CLASS_LABEL if your cluster uses a different key.
+LABEL_GPU_CLASS  = os.environ.get("LANE_POD_GPU_CLASS_LABEL", "gpu-class")
 
 # Fallback course label when pod carries none
 _NO_COURSE_LABEL = "__unlabelled__"
