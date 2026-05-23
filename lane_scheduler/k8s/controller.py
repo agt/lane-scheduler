@@ -32,13 +32,14 @@ try:
 except ImportError:
     sys.exit("kubernetes package not found.  Run: pip install kubernetes")
 
-from lane_scheduler.core.scheduler import Job, Lane, SchedulerConfig, Scheduler, initialise_lanes, lane_for_gpu_class
+from lane_scheduler.core.scheduler import Job, Lane, SchedulerConfig, Scheduler, initialise_lanes, lane_for_gpu_class, is_known_gpu_class
 from lane_scheduler.core.course_registry import CourseRegistry
 from lane_scheduler.core.node_capacity import NodeCapacityTracker
 from lane_scheduler.k8s.pod_translator import (
     NO_COURSE_LABEL,
     LABEL_COURSE,
     LABEL_BATCH,
+    LABEL_GPU_CLASS,
     admission_patch,
     needs_scheduling,
     pod_to_job,
@@ -129,6 +130,9 @@ BATCH_MEAN_PCT       = _env_float("LANE_BATCH_MEAN_PCT",       0.7)
 BATCH_STD_PCT        = _env_float("LANE_BATCH_STD_PCT",        0.15)
 WAIT_CACHE_INTERVAL  = _env_float("LANE_WAIT_CACHE_INTERVAL",  60.0)  # seconds
 PRIOR_WEIGHT         = _env_float("LANE_PRIOR_WEIGHT",          10.0)  # pseudo-count
+NO_UNKNOWN_GPU_CLASS_EVENTS = os.environ.get(
+    "LANE_NO_UNKNOWN_GPU_CLASS_EVENTS", ""
+).lower() in ("1", "true", "yes")
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +161,9 @@ class LaneSchedulerController:
         cycle_interval:      float = CYCLE_INTERVAL,
         reload_interval:     float = RELOAD_INTERVAL,
         wait_cache_interval: float = WAIT_CACHE_INTERVAL,
-        web_port:            int   = 0,
-        dry_run:             bool  = False,
+        web_port:                     int   = 0,
+        dry_run:                      bool  = False,
+        no_unknown_gpu_class_events:  bool  = False,
     ):
         self.core_v1            = core_v1
         self.registry           = registry
@@ -168,6 +173,7 @@ class LaneSchedulerController:
         self.reload_interval    = reload_interval
         self.web_port           = web_port
         self.dry_run            = dry_run
+        self.no_unknown_gpu_class_events = no_unknown_gpu_class_events
 
         if dry_run:
             logger.warning("DRY RUN mode enabled — pods will not be patched and events will not be created")
@@ -182,6 +188,9 @@ class LaneSchedulerController:
         # Pods currently in our queue: uid → pod dict snapshot
         self._pending: dict[str, dict] = {}
         self._pending_lock = threading.Lock()
+
+        # Pods with an unrecognised gpu-class that we are ignoring
+        self._ignored_gpu_class: set[str] = set()
 
         # Pods we have already patched (avoid double-patching)
         self._admitted: set[str] = set()
@@ -210,7 +219,11 @@ class LaneSchedulerController:
         )
 
         # Kubernetes Event publisher (best-effort, non-blocking on errors)
-        self.event_publisher = EventPublisher(core_v1, dry_run=dry_run)
+        self.event_publisher = EventPublisher(
+            core_v1,
+            dry_run=dry_run,
+            no_unknown_gpu_class_events=no_unknown_gpu_class_events,
+        )
 
         self._stop = threading.Event()
 
@@ -441,6 +454,22 @@ class LaneSchedulerController:
             return list((self._running.get(lane) or {}).values())
 
     def _enqueue(self, uid: str, pod: dict) -> None:
+        # Reject pods whose gpu-class label is not managed by this controller.
+        gpu_class = ((pod.get("metadata") or {}).get("labels") or {}).get(
+            LABEL_GPU_CLASS, ""
+        ).strip()
+        if gpu_class and not is_known_gpu_class(gpu_class):
+            if uid not in self._ignored_gpu_class:
+                self._ignored_gpu_class.add(uid)
+                logger.info(
+                    "Ignoring pod %s/%s — gpu-class '%s' is not managed by this controller",
+                    (pod.get("metadata") or {}).get("namespace", "?"),
+                    (pod.get("metadata") or {}).get("name", "?"),
+                    gpu_class,
+                )
+                self.event_publisher.warn_unknown_gpu_class(uid, pod)
+            return
+
         with self._admitted_lock:
             if uid in self._admitted:
                 return   # already handled
@@ -476,7 +505,9 @@ class LaneSchedulerController:
             self._pending.pop(uid, None)
         with self._admitted_lock:
             self._admitted.discard(uid)
+        self._ignored_gpu_class.discard(uid)
         self.event_publisher.deregister(uid)
+        self.event_publisher.clear_unknown_gpu_warning(uid)
 
     # ------------------------------------------------------------------
     # Node watch
@@ -720,6 +751,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Port for the queue-snapshot dashboard (0 = disabled, default: %(default)s)")
     p.add_argument("--dry-run", action="store_true", default=False,
                    help="Log what would be done without patching pods or creating events")
+    p.add_argument("--no-unknown-gpu-class-events", action="store_true",
+                   default=NO_UNKNOWN_GPU_CLASS_EVENTS,
+                   help=(
+                       "Suppress Warning events for pods whose gpu-class label is not "
+                       "managed by this controller (useful when multiple schedulers or "
+                       "ungated GPU classes coexist in the same cluster). "
+                       "Also set via LANE_NO_UNKNOWN_GPU_CLASS_EVENTS=true."
+                   ))
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
@@ -788,17 +827,18 @@ def main() -> None:
     )
 
     controller = LaneSchedulerController(
-        core_v1             = core_v1,
-        registry            = registry,
-        sched_config        = sched_config,
-        residency_profiles  = residency_profiles,
-        prior_weight        = args.prior_weight,
-        course_csv          = csv_path,
-        cycle_interval      = args.cycle_interval,
-        reload_interval     = args.reload_interval,
-        wait_cache_interval = args.wait_cache_interval,
-        web_port            = args.web_port,
-        dry_run             = args.dry_run,
+        core_v1                      = core_v1,
+        registry                     = registry,
+        sched_config                 = sched_config,
+        residency_profiles           = residency_profiles,
+        prior_weight                 = args.prior_weight,
+        course_csv                   = csv_path,
+        cycle_interval               = args.cycle_interval,
+        reload_interval              = args.reload_interval,
+        wait_cache_interval          = args.wait_cache_interval,
+        web_port                     = args.web_port,
+        dry_run                      = args.dry_run,
+        no_unknown_gpu_class_events  = args.no_unknown_gpu_class_events,
     )
 
     # Graceful shutdown on SIGTERM (standard in Kubernetes)

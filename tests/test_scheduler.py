@@ -8,7 +8,7 @@ import unittest
 from lane_scheduler.core.scheduler import (
     CourseClass, DeficitTracker, Job, PriorityScorer,
     Scheduler, SchedulerConfig, Tier, UtilizationTracker,
-    initialise_lanes, lane_for_gpu_class,
+    initialise_lanes, lane_for_gpu_class, is_known_gpu_class,
 )
 
 # ---------------------------------------------------------------------------
@@ -278,6 +278,24 @@ class TestDynamicLane(unittest.TestCase):
         extended = build_lanes(["small", "medium", "large", "xlarge"])
         for member in base:
             self.assertEqual(member.value, extended[member.name].value)
+
+
+class TestIsKnownGpuClass(unittest.TestCase):
+    def test_known_classes_return_true(self):
+        for cls in ("xsmall", "small", "medium", "large", "xlarge"):
+            self.assertTrue(is_known_gpu_class(cls))
+
+    def test_case_insensitive(self):
+        self.assertTrue(is_known_gpu_class("Small"))
+        self.assertTrue(is_known_gpu_class("LARGE"))
+
+    def test_unknown_class_returns_false(self):
+        self.assertFalse(is_known_gpu_class("xyz"))
+        self.assertFalse(is_known_gpu_class("supergpu"))
+
+    def test_empty_string_returns_false(self):
+        self.assertFalse(is_known_gpu_class(""))
+        self.assertFalse(is_known_gpu_class("  "))
 
 
 if __name__ == "__main__":

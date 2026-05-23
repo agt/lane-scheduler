@@ -50,9 +50,11 @@ _BATCH_FRACTIONS = (0.25, 0.50, 0.75)   # milestones as fractions of median wait
 _BATCH_MAX_EMITS = 1 + len(_BATCH_FRACTIONS)   # emit 0 (immediate) + 3 milestones
 
 # ---- Event field constants -------------------------------------------------
-_EVENT_REASON    = "SchedulingQueued"
-_EVENT_TYPE      = "Normal"
-_EVENT_COMPONENT = "lane-scheduler"
+_EVENT_REASON         = "SchedulingQueued"
+_EVENT_REASON_IGNORED = "UnknownGpuClass"
+_EVENT_TYPE           = "Normal"
+_EVENT_TYPE_WARNING   = "Warning"
+_EVENT_COMPONENT      = "lane-scheduler"
 _API_VERSION     = "v1"
 _POD_KIND        = "Pod"
 
@@ -176,10 +178,17 @@ class EventPublisher:
         )
     """
 
-    def __init__(self, core_v1: object, dry_run: bool = False) -> None:
+    def __init__(
+        self,
+        core_v1:                      object,
+        dry_run:                      bool = False,
+        no_unknown_gpu_class_events:  bool = False,
+    ) -> None:
         self._core_v1 = core_v1
         self._dry_run = dry_run
+        self._no_unknown_gpu_class_events = no_unknown_gpu_class_events
         self._schedules: dict[str, PodEventSchedule] = {}
+        self._unknown_gpu_warned: set[str] = set()
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -264,6 +273,90 @@ class EventPublisher:
                 published += 1
 
         return published
+
+    # ------------------------------------------------------------------
+    # One-shot warning events
+    # ------------------------------------------------------------------
+
+    def warn_unknown_gpu_class(self, uid: str, pod: dict) -> None:
+        """
+        Emit a single Warning event for a pod whose gpu-class label is not
+        managed by this controller.  Idempotent: only one event per pod UID.
+        Does nothing when no_unknown_gpu_class_events=True.
+        """
+        if self._no_unknown_gpu_class_events:
+            return
+        with self._lock:
+            if uid in self._unknown_gpu_warned:
+                return
+            self._unknown_gpu_warned.add(uid)
+
+        meta      = pod.get("metadata") or {}
+        labels    = meta.get("labels") or {}
+        gpu_class = labels.get("gpu-class", "?")
+        namespace = meta.get("namespace", "")
+        pod_name  = meta.get("name", "")
+        res_ver   = meta.get("resourceVersion", "")
+
+        message = (
+            f"gpu-class '{gpu_class}' is not managed by this lane scheduler "
+            f"and will be ignored. If this class should be gated, restart the "
+            f"controller after adding the node label."
+        )
+
+        import datetime as dt
+        timestamp  = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        event_name = (
+            f"{pod_name}.unknown-gpu"
+            .lower()
+            .replace("_", "-")[:253]
+        )
+        body = {
+            "apiVersion": _API_VERSION,
+            "kind": "Event",
+            "metadata": {"name": event_name, "namespace": namespace},
+            "involvedObject": {
+                "apiVersion":      _API_VERSION,
+                "kind":            _POD_KIND,
+                "name":            pod_name,
+                "namespace":       namespace,
+                "uid":             uid,
+                "resourceVersion": res_ver,
+            },
+            "reason":             _EVENT_REASON_IGNORED,
+            "message":            message,
+            "type":               _EVENT_TYPE_WARNING,
+            "eventTime":          timestamp,
+            "firstTimestamp":     timestamp,
+            "lastTimestamp":      timestamp,
+            "reportingComponent": _EVENT_COMPONENT,
+            "reportingInstance":  _EVENT_COMPONENT,
+            "source": {"component": _EVENT_COMPONENT},
+            "count": 1,
+        }
+
+        if self._dry_run:
+            logger.info(
+                "DRY RUN: would create UnknownGpuClass event for pod %s/%s: %s",
+                namespace, pod_name, message,
+            )
+            return
+
+        try:
+            self._core_v1.create_namespaced_event(namespace=namespace, body=body)
+            logger.debug(
+                "UnknownGpuClass event created for pod %s/%s", namespace, pod_name,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to create UnknownGpuClass event for pod %s/%s: %s",
+                namespace, pod_name, exc,
+            )
+
+    def clear_unknown_gpu_warning(self, uid: str) -> None:
+        """Remove uid from the warned set (called when pod is deleted)."""
+        with self._lock:
+            self._unknown_gpu_warned.discard(uid)
 
     # ------------------------------------------------------------------
     # Internal
