@@ -106,7 +106,7 @@ lane_scheduler/
     residency_stats.py  # Welford online stats; Bayesian shrinkage
 tools/
   simulate.py           # Offline fairness simulator
-tests/                  # 188 tests; mirrors core/ + estimation/ + k8s/ structure
+tests/                  # 200+ tests; mirrors core/ + estimation/ + k8s/ structure
 deploy/
   manifests.yaml        # RBAC, Deployment, ConfigMap, CronJob
 ```

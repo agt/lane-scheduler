@@ -77,13 +77,18 @@ def _has_inhibit_taint(node: dict) -> bool:
     return False
 
 
-def _gpu_class_lane(node: dict) -> Optional[object]:
-    """Return the GPU Lane member from the node's gpu-class label, or None."""
+def _gpu_class_lane(node: dict) -> tuple[Optional[object], str]:
+    """
+    Return (lane, raw_label) for the node's gpu-class label.
+
+    lane is None if either the label is absent OR present-but-unknown to this
+    controller.  Callers should use raw_label to distinguish those two cases.
+    """
     labels = (node.get("metadata", {}) or {}).get("labels", {}) or {}
     gpu_class = labels.get(GPU_CLASS_LABEL_KEY, "").strip()
     if gpu_class:
-        return lane_for_gpu_class(gpu_class)
-    return None
+        return lane_for_gpu_class(gpu_class, strict=True), gpu_class
+    return None, ""
 
 
 def _parse_cpu_cores(value: str) -> float:
@@ -169,7 +174,20 @@ class NodeCapacityTracker:
                 logger.warning("Unparseable GPU allocatable on node %s: %r",
                                name, allocatable[_GPU_RESOURCE])
 
-        gpu_lane = _gpu_class_lane(node)
+        gpu_lane, raw_gpu_class = _gpu_class_lane(node)
+
+        # Unknown gpu-class label → do not classify as anything; exclude from
+        # the managed pool so we don't mis-route pods to a fallback lane.
+        if raw_gpu_class and gpu_lane is None:
+            logger.warning(
+                "Node %s has unmanaged gpu-class label %r — excluding from pool. "
+                "Restart controller after the class is added to recognise it.",
+                name, raw_gpu_class,
+            )
+            with self._lock:
+                self._nodes.pop(name, None)
+            return
+
         if gpu_lane is not None and gpu_count > 0:
             lane = gpu_lane
         elif gpu_lane is not None and gpu_count == 0:

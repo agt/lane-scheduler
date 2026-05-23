@@ -112,6 +112,13 @@ class PodEventSchedule:
             if self.emit_count == 1:
                 # Anchor the milestone clock on the first observed median wait
                 self._anchor_wait = max(median_wait, 0.0)
+            elif (self._anchor_wait > 0
+                  and median_wait > 2.0 * self._anchor_wait):
+                # Re-anchor on >=2x growth so milestones track reality when
+                # the queue grew much longer than first estimated.  We never
+                # shrink the anchor (a transient dip should not pull
+                # milestones forward).
+                self._anchor_wait = median_wait
             if self.emit_count < _BATCH_MAX_EMITS:
                 fraction = _BATCH_FRACTIONS[self.emit_count - 1]
                 self.next_emit_at = self.enqueued_at + fraction * self._anchor_wait

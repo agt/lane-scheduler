@@ -29,6 +29,7 @@ Startup contract
 from __future__ import annotations
 
 import math
+import threading
 import time
 import logging
 from dataclasses import dataclass, field
@@ -108,12 +109,15 @@ def initialise_lanes(gpu_classes: list[str]) -> type[IntEnum]:
     return Lane
 
 
-def lane_for_gpu_class(gpu_class: str, fallback_name: str = "small") -> "IntEnum":
+def lane_for_gpu_class(gpu_class: str, fallback_name: str = "small",
+                       strict: bool = False) -> "Optional[IntEnum]":
     """
     Return the Lane member for *gpu_class* (case-insensitive).
 
-    If the class is unrecognised, return the Lane for *fallback_name* if it
-    exists, otherwise the lowest-valued GPU lane, logging a warning either way.
+    If the class is unrecognised:
+      - strict=True  → return None (caller decides what to do; no warning logged)
+      - strict=False → return the Lane for *fallback_name* if it exists,
+                       otherwise the lowest-valued GPU lane, with a warning.
     """
     if Lane is None:
         raise RuntimeError("initialise_lanes() has not been called")
@@ -122,6 +126,9 @@ def lane_for_gpu_class(gpu_class: str, fallback_name: str = "small") -> "IntEnum
     lane = _GPU_CLASS_TO_LANE.get(key)
     if lane is not None:
         return lane
+
+    if strict:
+        return None
 
     fallback = _GPU_CLASS_TO_LANE.get(fallback_name.lower())
     if fallback is None and GPU_LANES:
@@ -178,6 +185,22 @@ class SchedulerConfig:
     epsilon:            float = DEFAULTS["epsilon"]
     utilization_window: float = DEFAULTS["utilization_window"]
     dispatch_k:         int   = DEFAULTS["dispatch_k"]
+
+    def __post_init__(self) -> None:
+        if self.alpha < 0:
+            raise ValueError(f"alpha must be >= 0, got {self.alpha}")
+        if self.t_half_interactive <= 0:
+            raise ValueError(f"t_half_interactive must be > 0, got {self.t_half_interactive}")
+        if self.t_half_batch <= 0:
+            raise ValueError(f"t_half_batch must be > 0, got {self.t_half_batch}")
+        if self.batch_mode_penalty <= 0:
+            raise ValueError(f"batch_mode_penalty must be > 0, got {self.batch_mode_penalty}")
+        if self.epsilon <= 0:
+            raise ValueError(f"epsilon must be > 0, got {self.epsilon}")
+        if self.utilization_window <= 0:
+            raise ValueError(f"utilization_window must be > 0, got {self.utilization_window}")
+        if self.dispatch_k <= 0:
+            raise ValueError(f"dispatch_k must be > 0, got {self.dispatch_k}")
 
     def t_half(self, batch: bool) -> float:
         return self.t_half_batch if batch else self.t_half_interactive
@@ -250,8 +273,13 @@ class UtilizationTracker:
         ts     = now if now is not None else time.monotonic()
         cutoff = ts - self._window
         key    = (class_id, lane)
-        self._events[key] = [(t, u) for t, u in self._events[key] if t >= cutoff]
-        total    = sum(u for _, u in self._events[key])
+        filtered = [(t, u) for t, u in self._events[key] if t >= cutoff]
+        if filtered:
+            self._events[key] = filtered
+        else:
+            # Drop the key entirely to bound long-term memory growth
+            self._events.pop(key, None)
+        total    = sum(u for _, u in filtered)
         capacity = self._lane_capacity.get(lane, 1.0)
         return total / (capacity * self._window) if capacity > 0 else 0.0
 
@@ -345,31 +373,72 @@ class Scheduler:
         self.util    = UtilizationTracker(self.config.utilization_window, lane_capacity)
         self.deficit = DeficitTracker()
 
+        # Single re-entrant lock protects _classes, _queues, _last_cycle, and
+        # the internal state of self.util and self.deficit (which are not
+        # accessed from outside Scheduler).  Acquisition order: any controller
+        # lock (_pending_lock, _admitted_lock, _running_lock, _running_ctx_lock)
+        # is acquired BEFORE Scheduler._lock, never after.
+        self._lock = threading.RLock()
+
         # {lane: {class_id: {student_id: [Job, ...]}}}
         self._queues: dict = {
             lane: defaultdict(lambda: defaultdict(list))
             for lane in Lane
         }
         self._last_cycle: float = time.monotonic()
-        self._dispatched: list[Job] = []
+
+    def set_lane_capacity(self, lane_capacity: dict) -> None:
+        """Atomically replace the lane-capacity view used for scoring."""
+        with self._lock:
+            self.lane_capacity = lane_capacity
+            self.util._lane_capacity = lane_capacity
 
     def register_class(self, course: CourseClass) -> None:
-        self._classes[course.class_id] = course
+        with self._lock:
+            self._classes[course.class_id] = course
         logger.info(
             "Registered class %s (tier=%s enrollment=%d weight=%.4f)",
             course.class_id, course.tier.name,
             course.enrollment, course.class_weight,
         )
 
+    def has_class(self, class_id: str) -> bool:
+        with self._lock:
+            return class_id in self._classes
+
     def submit(self, job: Job) -> None:
-        if job.class_id not in self._classes:
-            raise ValueError(f"Unknown class_id: {job.class_id!r}")
-        self._queues[job.lane][job.class_id][job.student_id].append(job)
+        with self._lock:
+            if job.class_id not in self._classes:
+                raise ValueError(f"Unknown class_id: {job.class_id!r}")
+            self._queues[job.lane][job.class_id][job.student_id].append(job)
         logger.debug(
             "Queued job %s [lane=%s student=%s class=%s]",
             job.job_id, LANE_NAMES.get(job.lane, str(job.lane)),
             job.student_id, job.class_id,
         )
+
+    def remove_job(self, job_id: str) -> Optional[Job]:
+        """
+        Remove the queued job whose job_id matches and return it, or None.
+
+        Walks all lanes; intended for handling pod DELETED events so an
+        orphan Job doesn't sit in the scheduler queue after the pod is gone.
+        Does not touch utilization or deficit (the job never ran).
+        """
+        with self._lock:
+            for lane in Lane:
+                lane_queue = self._queues[lane]
+                for class_id, student_map in list(lane_queue.items()):
+                    for student_id, jobs in list(student_map.items()):
+                        for idx, job in enumerate(jobs):
+                            if job.job_id == job_id:
+                                del jobs[idx]
+                                if not jobs:
+                                    del student_map[student_id]
+                                if not student_map:
+                                    del lane_queue[class_id]
+                                return job
+        return None
 
     def cycle(self, now: Optional[float] = None) -> list[Job]:
         """
@@ -381,62 +450,67 @@ class Scheduler:
         4. Update utilization and deficit trackers.
         """
         now = now if now is not None else time.monotonic()
-        dt  = now - self._last_cycle
-        self._last_cycle = now
         dispatched: list[Job] = []
+        log_entries: list[tuple] = []
 
-        for lane in Lane:
-            lane_queue = self._queues[lane]
-            if not lane_queue:
-                continue
+        with self._lock:
+            dt  = now - self._last_cycle
+            self._last_cycle = now
 
-            # Step 1 — accrue deficits
-            for class_id, student_map in lane_queue.items():
-                course = self._classes[class_id]
-                for student_id, jobs in list(student_map.items()):
-                    if jobs:
-                        self.deficit.accrue(student_id, lane, course.class_weight, dt)
-
-            # Step 2 — one candidate per class
-            candidates: list[tuple[float, Job, CourseClass]] = []
-            for class_id, student_map in lane_queue.items():
-                course          = self._classes[class_id]
-                active_students = {s for s, jobs in student_map.items() if jobs}
-                if not active_students:
+            for lane in Lane:
+                lane_queue = self._queues[lane]
+                if not lane_queue:
                     continue
-                student_id = self.deficit.top_student(active_students, lane)
-                job        = student_map[student_id][0]
-                util       = self.util.utilization(class_id, lane, now)
-                score      = self.scorer.score(job, course, util, now)
-                candidates.append((score, job, course))
 
-            if not candidates:
-                continue
+                # Step 1 — accrue deficits
+                for class_id, student_map in lane_queue.items():
+                    course = self._classes[class_id]
+                    for student_id, jobs in list(student_map.items()):
+                        if jobs:
+                            self.deficit.accrue(student_id, lane, course.class_weight, dt)
 
-            # Step 3 — dispatch top-K
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            for score, job, course in candidates[: self.config.dispatch_k]:
-                job.dispatch_time = now
-                student_jobs = self._queues[lane][job.class_id][job.student_id]
-                student_jobs.pop(0)
-                if not student_jobs:
-                    del self._queues[lane][job.class_id][job.student_id]
-                if not self._queues[lane][job.class_id]:
-                    del self._queues[lane][job.class_id]
+                # Step 2 — one candidate per class
+                candidates: list[tuple[float, Job, CourseClass]] = []
+                for class_id, student_map in lane_queue.items():
+                    course          = self._classes[class_id]
+                    active_students = {s for s, jobs in student_map.items() if jobs}
+                    if not active_students:
+                        continue
+                    student_id = self.deficit.top_student(active_students, lane)
+                    job        = student_map[student_id][0]
+                    util       = self.util.utilization(class_id, lane, now)
+                    score      = self.scorer.score(job, course, util, now)
+                    candidates.append((score, job, course))
 
-                self.util.record(job.class_id, lane, job.resource_units, now)
-                self.deficit.debit(job.student_id, lane, job.resource_units)
-                dispatched.append(job)
+                if not candidates:
+                    continue
 
-                mode = "batch" if job.batch else "interactive"
-                logger.info(
-                    "Dispatched job %s [lane=%s mode=%s score=%.4f "
-                    "class=%s student=%s wait=%.1fs]",
-                    job.job_id, LANE_NAMES.get(lane, str(lane)), mode, score,
-                    job.class_id, job.student_id, job.wait_seconds(now),
-                )
+                # Step 3 — dispatch top-K
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                for score, job, course in candidates[: self.config.dispatch_k]:
+                    job.dispatch_time = now
+                    student_jobs = self._queues[lane][job.class_id][job.student_id]
+                    student_jobs.pop(0)
+                    if not student_jobs:
+                        del self._queues[lane][job.class_id][job.student_id]
+                    if not self._queues[lane][job.class_id]:
+                        del self._queues[lane][job.class_id]
 
-        self._dispatched.extend(dispatched)
+                    self.util.record(job.class_id, lane, job.resource_units, now)
+                    self.deficit.debit(job.student_id, lane, job.resource_units)
+                    dispatched.append(job)
+                    log_entries.append((job, lane, score))
+
+        # Logging outside the lock — formatting is non-trivial and the
+        # dispatched job objects we hold are safe to read after release.
+        for job, lane, score in log_entries:
+            mode = "batch" if job.batch else "interactive"
+            logger.info(
+                "Dispatched job %s [lane=%s mode=%s score=%.4f "
+                "class=%s student=%s wait=%.1fs]",
+                job.job_id, LANE_NAMES.get(lane, str(lane)), mode, score,
+                job.class_id, job.student_id, job.wait_seconds(now),
+            )
         return dispatched
 
     def _scored_candidates(self, lane: "IntEnum",
@@ -447,19 +521,20 @@ class Scheduler:
         pass rather than calling queue_rank() per pod (O(Q) vs O(Q²)).
         """
         now = now if now is not None else time.monotonic()
-        candidates: list[tuple[float, "Job"]] = []
-        for class_id, student_map in self._queues[lane].items():
-            course          = self._classes[class_id]
-            active_students = {s for s, jobs in student_map.items() if jobs}
-            if not active_students:
-                continue
-            student_id = self.deficit.top_student(active_students, lane)
-            job        = student_map[student_id][0]
-            util       = self.util.utilization(class_id, lane, now)
-            score      = self.scorer.score(job, course, util, now)
-            candidates.append((score, job))
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates
+        with self._lock:
+            candidates: list[tuple[float, "Job"]] = []
+            for class_id, student_map in self._queues[lane].items():
+                course          = self._classes[class_id]
+                active_students = {s for s, jobs in student_map.items() if jobs}
+                if not active_students:
+                    continue
+                student_id = self.deficit.top_student(active_students, lane)
+                job        = student_map[student_id][0]
+                util       = self.util.utilization(class_id, lane, now)
+                score      = self.scorer.score(job, course, util, now)
+                candidates.append((score, job))
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            return candidates
 
     def queue_rank(self, job_uid: str, lane: "IntEnum",
                    now: Optional[float] = None) -> Optional[int]:
@@ -472,35 +547,37 @@ class Scheduler:
         (e.g. on-demand per student request, not every cycle).
         """
         now = now if now is not None else time.monotonic()
-        candidates: list[tuple[float, str]] = []   # (score, job_uid)
+        with self._lock:
+            candidates: list[tuple[float, str]] = []   # (score, job_uid)
 
-        for class_id, student_map in self._queues[lane].items():
-            course          = self._classes[class_id]
-            active_students = {s for s, jobs in student_map.items() if jobs}
-            if not active_students:
-                continue
-            student_id = self.deficit.top_student(active_students, lane)
-            job        = student_map[student_id][0]
-            util       = self.util.utilization(class_id, lane, now)
-            score      = self.scorer.score(job, course, util, now)
-            candidates.append((score, job.job_id))
+            for class_id, student_map in self._queues[lane].items():
+                course          = self._classes[class_id]
+                active_students = {s for s, jobs in student_map.items() if jobs}
+                if not active_students:
+                    continue
+                student_id = self.deficit.top_student(active_students, lane)
+                job        = student_map[student_id][0]
+                util       = self.util.utilization(class_id, lane, now)
+                score      = self.scorer.score(job, course, util, now)
+                candidates.append((score, job.job_id))
 
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        for rank, (_, uid) in enumerate(candidates, start=1):
-            if uid == job_uid:
-                return rank
-        return None
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            for rank, (_, uid) in enumerate(candidates, start=1):
+                if uid == job_uid:
+                    return rank
+            return None
 
     def queue_depths(self) -> dict[str, dict[str, int]]:
         """Returns {lane_name: {class_id: job_count}} for monitoring."""
         result: dict[str, dict[str, int]] = {}
-        for lane in Lane:
-            counts = {
-                class_id: sum(len(jobs) for jobs in student_map.values())
-                for class_id, student_map in self._queues[lane].items()
-            }
-            if counts:
-                result[LANE_NAMES.get(lane, str(lane))] = counts
+        with self._lock:
+            for lane in Lane:
+                counts = {
+                    class_id: sum(len(jobs) for jobs in student_map.values())
+                    for class_id, student_map in self._queues[lane].items()
+                }
+                if counts:
+                    result[LANE_NAMES.get(lane, str(lane))] = counts
         return result
 
     def class_scores(self, lane: "IntEnum",
@@ -508,13 +585,14 @@ class Scheduler:
         """Current top-candidate score per class in a lane.  For dashboards."""
         now    = now if now is not None else time.monotonic()
         scores = {}
-        for class_id, student_map in self._queues[lane].items():
-            course  = self._classes[class_id]
-            active  = {s for s, jobs in student_map.items() if jobs}
-            if not active:
-                continue
-            student_id = self.deficit.top_student(active, lane)
-            job        = student_map[student_id][0]
-            util       = self.util.utilization(class_id, lane, now)
-            scores[class_id] = self.scorer.score(job, course, util, now)
+        with self._lock:
+            for class_id, student_map in self._queues[lane].items():
+                course  = self._classes[class_id]
+                active  = {s for s, jobs in student_map.items() if jobs}
+                if not active:
+                    continue
+                student_id = self.deficit.top_student(active, lane)
+                job        = student_map[student_id][0]
+                util       = self.util.utilization(class_id, lane, now)
+                scores[class_id] = self.scorer.score(job, course, util, now)
         return scores

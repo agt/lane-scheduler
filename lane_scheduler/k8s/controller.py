@@ -134,6 +134,14 @@ NO_UNKNOWN_GPU_CLASS_EVENTS = os.environ.get(
     "LANE_NO_UNKNOWN_GPU_CLASS_EVENTS", ""
 ).lower() in ("1", "true", "yes")
 
+# Admission retry / circuit breaker
+_MAX_ADMIT_ATTEMPTS = 5
+_MAX_ADMIT_BACKOFF  = 300.0   # cap individual backoff sleep at 5 minutes
+
+# Eviction TTL for completion context entries when a pod's completion event
+# was missed (e.g. watch reconnection gap).  24 hours.
+_RUNNING_CTX_TTL = 86400.0
+
 
 # ---------------------------------------------------------------------------
 # Controller
@@ -200,10 +208,30 @@ class LaneSchedulerController:
         self._running: dict[object, dict[str, RunningPod]] = {}
         self._running_lock = threading.Lock()
 
-        # Completion context: uid → (course_id, lane_name, batch, deadline)
+        # Completion context: uid → (course_id, lane_name, batch, deadline, ctx_created_monotonic)
         # Needed to record residency when a running pod reaches a terminal phase.
-        self._running_ctx: dict[str, tuple[str, str, bool, float]] = {}
+        # ctx_created_monotonic is used by _sweep_running_ctx to evict stale
+        # entries when a completion event is missed (e.g. watch gap).
+        self._running_ctx: dict[str, tuple[str, str, bool, float, float]] = {}
         self._running_ctx_lock = threading.Lock()
+
+        # Per-pod admission retry state for non-404 apiserver errors.
+        # uid → (attempt_count, next_retry_monotonic).  Cleared on success or 404.
+        self._admit_attempts: dict[str, tuple[int, float]] = {}
+        self._admit_attempts_lock = threading.Lock()
+
+        # Last-seen resourceVersion for each watch, used to resume after
+        # disconnect without losing events.  Reset to None on a 410 ("Gone")
+        # to force a fresh list.
+        self._pod_resource_version:  Optional[str] = None
+        self._node_resource_version: Optional[str] = None
+
+        # Watch handles stored so stop() can interrupt blocking streams.
+        self._pod_watch:  Optional["watch.Watch"] = None
+        self._node_watch: Optional["watch.Watch"] = None
+
+        # Background threads (populated in run()) so shutdown can join them.
+        self._threads: list[threading.Thread] = []
 
         # Per-course residency statistics (Bayesian, updated on completions)
         self.residency_stats = ResidencyStats(
@@ -236,13 +264,13 @@ class LaneSchedulerController:
 
         self.wait_cache.start()
 
-        threads = [
+        self._threads = [
             threading.Thread(target=self._pod_watch_loop,    name="pod-watch",    daemon=True),
             threading.Thread(target=self._node_watch_loop,   name="node-watch",   daemon=True),
             threading.Thread(target=self._cycle_loop,        name="cycle",        daemon=True),
             threading.Thread(target=self._csv_reload_loop,   name="csv-reload",   daemon=True),
         ]
-        for t in threads:
+        for t in self._threads:
             t.start()
 
         if self.web_port > 0:
@@ -255,32 +283,99 @@ class LaneSchedulerController:
         except KeyboardInterrupt:
             pass
         finally:
-            self._stop.set()
+            self.stop()
             self.wait_cache.stop()
+            for t in self._threads:
+                t.join(timeout=10.0)
+                if t.is_alive():
+                    logger.warning("Thread %s did not exit within 10s", t.name)
             logger.info("Lane Scheduler stopped")
 
     def stop(self) -> None:
         self._stop.set()
+        # Interrupt any in-progress watch.stream() calls so the loops can
+        # observe _stop without waiting up to 60s for the next timeout.
+        for w in (self._pod_watch, self._node_watch):
+            if w is not None:
+                try:
+                    w.stop()
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Pod watch
     # ------------------------------------------------------------------
 
     def _pod_watch_loop(self) -> None:
-        w = watch.Watch()
         while not self._stop.is_set():
             try:
-                logger.info("Starting pod watch")
+                if self._pod_resource_version is None:
+                    self._bootstrap_pods()
+
+                w = watch.Watch()
+                self._pod_watch = w
+                logger.info(
+                    "Starting pod watch (resource_version=%s)",
+                    self._pod_resource_version,
+                )
+                stream_kwargs = {"timeout_seconds": 60, "allow_watch_bookmarks": True}
+                if self._pod_resource_version is not None:
+                    stream_kwargs["resource_version"] = self._pod_resource_version
+
                 for event in w.stream(
                     self.core_v1.list_pod_for_all_namespaces,
-                    timeout_seconds=60,
+                    **stream_kwargs,
                 ):
                     if self._stop.is_set():
                         break
+                    self._update_resource_version(event, is_pod=True)
+                    if event.get("type") == "BOOKMARK":
+                        continue
                     self._handle_pod_event(event)
+            except client.exceptions.ApiException as exc:
+                if exc.status == 410:
+                    logger.warning(
+                        "Pod watch resourceVersion %s expired (410) — relisting",
+                        self._pod_resource_version,
+                    )
+                    self._pod_resource_version = None
+                else:
+                    logger.warning("Pod watch API error: %s — reconnecting in 5s", exc)
+                    if not self._stop.wait(5.0):
+                        pass
             except Exception as exc:
                 logger.warning("Pod watch error: %s — reconnecting in 5s", exc)
-                time.sleep(5.0)
+                if not self._stop.wait(5.0):
+                    pass
+            finally:
+                self._pod_watch = None
+
+    def _bootstrap_pods(self) -> None:
+        """List all pods and seed our state + resourceVersion."""
+        resp = self.core_v1.list_pod_for_all_namespaces()
+        items = getattr(resp, "items", None) or []
+        rv = None
+        meta = getattr(resp, "metadata", None)
+        if meta is not None:
+            rv = getattr(meta, "resource_version", None)
+        for item in items:
+            self._handle_pod_event({"type": "ADDED", "object": item})
+        self._pod_resource_version = rv
+
+    def _update_resource_version(self, event: dict, *, is_pod: bool) -> None:
+        obj = event.get("object")
+        rv: Optional[str] = None
+        if hasattr(obj, "metadata") and getattr(obj.metadata, "resource_version", None):
+            rv = obj.metadata.resource_version
+        elif isinstance(obj, dict):
+            md = obj.get("metadata") or {}
+            rv = md.get("resourceVersion") or md.get("resource_version")
+        if not rv:
+            return
+        if is_pod:
+            self._pod_resource_version = rv
+        else:
+            self._node_resource_version = rv
 
     def _handle_pod_event(self, event: dict) -> None:
         etype = event.get("type", "")
@@ -379,7 +474,9 @@ class LaneSchedulerController:
             self._running[lane][uid] = rp
 
         with self._running_ctx_lock:
-            self._running_ctx[uid] = (course_id, lane_name, batch, deadline)
+            self._running_ctx[uid] = (
+                course_id, lane_name, batch, deadline, time.monotonic(),
+            )
 
     def _remove_running(self, uid: str) -> None:
         with self._running_lock:
@@ -402,7 +499,7 @@ class LaneSchedulerController:
         if ctx is None:
             return   # pod wasn't tracked (no deadline, or never seen as Running)
 
-        course_id, lane_name, batch, deadline = ctx
+        course_id, lane_name, batch, deadline, _ctx_created = ctx
         if deadline <= 0:
             return
 
@@ -484,7 +581,7 @@ class LaneSchedulerController:
             course     = self.registry.get(course_id)
 
             # Register course with scheduler if not yet known
-            if course_id not in self.scheduler._classes:
+            if not self.scheduler.has_class(course_id):
                 self.scheduler.register_class(course)
 
             submit_time = time.monotonic()
@@ -502,10 +599,16 @@ class LaneSchedulerController:
 
     def _dequeue(self, uid: str) -> None:
         with self._pending_lock:
-            self._pending.pop(uid, None)
+            was_pending = self._pending.pop(uid, None) is not None
         with self._admitted_lock:
             self._admitted.discard(uid)
         self._ignored_gpu_class.discard(uid)
+        with self._admit_attempts_lock:
+            self._admit_attempts.pop(uid, None)
+        # If the pod was still queued, also remove its Job from the scheduler
+        # queue so it doesn't get dispatched against a no-longer-pending pod.
+        if was_pending:
+            self.scheduler.remove_job(uid)
         self.event_publisher.deregister(uid)
         self.event_publisher.clear_unknown_gpu_warning(uid)
 
@@ -514,21 +617,62 @@ class LaneSchedulerController:
     # ------------------------------------------------------------------
 
     def _node_watch_loop(self) -> None:
-        w = watch.Watch()
         while not self._stop.is_set():
             try:
-                logger.info("Starting node watch")
+                if self._node_resource_version is None:
+                    self._bootstrap_nodes()
+
+                w = watch.Watch()
+                self._node_watch = w
+                logger.info(
+                    "Starting node watch (resource_version=%s)",
+                    self._node_resource_version,
+                )
+                stream_kwargs = {"timeout_seconds": 60, "allow_watch_bookmarks": True}
+                if self._node_resource_version is not None:
+                    stream_kwargs["resource_version"] = self._node_resource_version
+
                 for event in w.stream(
                     self.core_v1.list_node,
-                    timeout_seconds=60,
+                    **stream_kwargs,
                 ):
                     if self._stop.is_set():
                         break
+                    self._update_resource_version(event, is_pod=False)
+                    if event.get("type") == "BOOKMARK":
+                        continue
                     self._handle_node_event(event)
                     self._sync_lane_capacity()
+            except client.exceptions.ApiException as exc:
+                if exc.status == 410:
+                    logger.warning(
+                        "Node watch resourceVersion %s expired (410) — relisting",
+                        self._node_resource_version,
+                    )
+                    self._node_resource_version = None
+                else:
+                    logger.warning("Node watch API error: %s — reconnecting in 5s", exc)
+                    if not self._stop.wait(5.0):
+                        pass
             except Exception as exc:
                 logger.warning("Node watch error: %s — reconnecting in 5s", exc)
-                time.sleep(5.0)
+                if not self._stop.wait(5.0):
+                    pass
+            finally:
+                self._node_watch = None
+
+    def _bootstrap_nodes(self) -> None:
+        """List all nodes and seed NodeCapacityTracker + resourceVersion."""
+        resp = self.core_v1.list_node()
+        items = getattr(resp, "items", None) or []
+        rv = None
+        meta = getattr(resp, "metadata", None)
+        if meta is not None:
+            rv = getattr(meta, "resource_version", None)
+        for item in items:
+            self._handle_node_event({"type": "ADDED", "object": item})
+        self._sync_lane_capacity()
+        self._node_resource_version = rv
 
     def _handle_node_event(self, event: dict) -> None:
         etype = event.get("type", "")
@@ -546,8 +690,7 @@ class LaneSchedulerController:
     def _sync_lane_capacity(self) -> None:
         """Push current node capacity into the scheduler's utilization tracker."""
         caps = self.node_tracker.lane_capacity()
-        self.scheduler.lane_capacity = caps
-        self.scheduler.util._lane_capacity = caps
+        self.scheduler.set_lane_capacity(caps)
 
     # ------------------------------------------------------------------
     # Scheduling cycle
@@ -555,14 +698,40 @@ class LaneSchedulerController:
 
     def _cycle_loop(self) -> None:
         # Wait briefly for the watches to populate initial state
-        time.sleep(max(self.cycle_interval, 5.0))
+        self._stop.wait(max(self.cycle_interval, 5.0))
 
         while not self._stop.is_set():
             try:
+                self._sweep_running_ctx()
                 self._run_cycle()
             except Exception as exc:
                 logger.error("Cycle error: %s", exc, exc_info=True)
             self._stop.wait(self.cycle_interval)
+
+    def _sweep_running_ctx(self) -> None:
+        """
+        Evict completion-context entries that are older than _RUNNING_CTX_TTL
+        AND whose uid is not currently in self._running.  Catches leaks from
+        missed completion events (e.g. watch reconnection gaps).
+        """
+        now = time.monotonic()
+        with self._running_lock:
+            running_uids: set[str] = set()
+            for lane_dict in self._running.values():
+                running_uids.update(lane_dict.keys())
+        stale: list[str] = []
+        with self._running_ctx_lock:
+            for uid, ctx in list(self._running_ctx.items()):
+                ctx_created = ctx[4]
+                if uid not in running_uids and (now - ctx_created) > _RUNNING_CTX_TTL:
+                    stale.append(uid)
+            for uid in stale:
+                self._running_ctx.pop(uid, None)
+        if stale:
+            logger.info(
+                "Evicted %d stale completion-context entries (TTL exceeded)",
+                len(stale),
+            )
 
     def _run_cycle(self) -> None:
         caps = self.node_tracker.lane_capacity()
@@ -580,6 +749,23 @@ class LaneSchedulerController:
         logger.info("Cycle dispatching %d jobs", len(dispatched))
 
         for job in dispatched:
+            # Honour retry backoff: if this pod recently failed admission,
+            # do not try again until next_retry_monotonic has passed.
+            with self._admit_attempts_lock:
+                attempts_entry = self._admit_attempts.get(job.job_id)
+            if attempts_entry is not None and attempts_entry[1] > now:
+                # Re-queue the Job so it'll be considered again in a later cycle.
+                with self._pending_lock:
+                    pod = self._pending.get(job.job_id)
+                if pod is not None:
+                    # Job stays in _pending; re-submit so the scheduler still
+                    # has it in its queue (cycle just popped it).
+                    try:
+                        self.scheduler.submit(job)
+                    except ValueError:
+                        pass
+                continue
+
             pod = self._pop_pending(job.job_id)
             if pod is None:
                 logger.warning("Dispatched job %s has no matching pending pod", job.job_id)
@@ -603,6 +789,8 @@ class LaneSchedulerController:
             logger.debug("Pod %s/%s already has toleration — skipping patch", namespace, name)
             with self._admitted_lock:
                 self._admitted.add(uid)
+            with self._admit_attempts_lock:
+                self._admit_attempts.pop(uid, None)
             return
 
         if self.dry_run:
@@ -614,6 +802,8 @@ class LaneSchedulerController:
             )
             with self._admitted_lock:
                 self._admitted.add(uid)
+            with self._admit_attempts_lock:
+                self._admit_attempts.pop(uid, None)
             return
 
         try:
@@ -624,6 +814,8 @@ class LaneSchedulerController:
             )
             with self._admitted_lock:
                 self._admitted.add(uid)
+            with self._admit_attempts_lock:
+                self._admit_attempts.pop(uid, None)
             logger.info(
                 "Admitted pod %s/%s [course=%s lane=%s wait=%.1fs]",
                 namespace, name, job.class_id, job.lane.name,
@@ -632,12 +824,61 @@ class LaneSchedulerController:
         except client.exceptions.ApiException as exc:
             if exc.status == 404:
                 logger.info("Pod %s/%s vanished before admission — skipping", namespace, name)
+                with self._admit_attempts_lock:
+                    self._admit_attempts.pop(uid, None)
+                return
+            self._handle_admit_failure(pod, job, exc)
+
+    def _handle_admit_failure(self, pod: dict, job: Job,
+                              exc: "client.exceptions.ApiException") -> None:
+        meta      = pod.get("metadata", {}) or {}
+        namespace = meta.get("namespace", "")
+        name      = meta.get("name", "")
+        uid       = meta.get("uid", "")
+
+        with self._admit_attempts_lock:
+            prev_attempts, _ = self._admit_attempts.get(uid, (0, 0.0))
+            attempts = prev_attempts + 1
+            if attempts >= _MAX_ADMIT_ATTEMPTS:
+                self._admit_attempts.pop(uid, None)
+                give_up = True
             else:
-                logger.error("Failed to patch pod %s/%s: %s", namespace, name, exc)
-                # Re-enqueue so it is retried next cycle
-                with self._pending_lock:
-                    self._pending[uid] = pod
-                self.scheduler.submit(job)
+                backoff = min(2.0 ** attempts, _MAX_ADMIT_BACKOFF)
+                self._admit_attempts[uid] = (attempts, time.monotonic() + backoff)
+                give_up = False
+
+        if give_up:
+            logger.error(
+                "Giving up on pod %s/%s after %d admit failures: %s",
+                namespace, name, _MAX_ADMIT_ATTEMPTS, exc,
+            )
+            # Best-effort cleanup: drop any copies left in the scheduler queue
+            # (a Job may have been re-submitted on each failed attempt),
+            # remove controller state, and surface a Warning Event so the
+            # student/operator sees it.
+            while self.scheduler.remove_job(uid) is not None:
+                pass
+            with self._pending_lock:
+                self._pending.pop(uid, None)
+            try:
+                self.event_publisher.warn_unknown_gpu_class(uid, pod)
+            except Exception:
+                pass
+            return
+
+        logger.warning(
+            "Failed to patch pod %s/%s (attempt %d/%d): %s — backing off",
+            namespace, name, attempts, _MAX_ADMIT_ATTEMPTS, exc,
+        )
+        # Put the pod back in _pending and re-submit the Job into the
+        # scheduler queue so a later cycle can retry once backoff elapses.
+        with self._pending_lock:
+            self._pending[uid] = pod
+        try:
+            self.scheduler.submit(job)
+        except ValueError:
+            # Class was unregistered between cycles — nothing we can do.
+            pass
 
     def get_wait_estimate(self, pod_uid: str) -> Optional[WaitEstimate]:
         """
@@ -721,7 +962,7 @@ class LaneSchedulerController:
                     n = self.registry.load_csv(self.course_csv)
                     # Re-register any newly loaded courses
                     for course in self.registry.all_courses():
-                        if course.class_id not in self.scheduler._classes:
+                        if not self.scheduler.has_class(course.class_id):
                             self.scheduler.register_class(course)
                     logger.info("CSV reload: %d courses", n)
                 except Exception as exc:
@@ -841,8 +1082,9 @@ def main() -> None:
         no_unknown_gpu_class_events  = args.no_unknown_gpu_class_events,
     )
 
-    # Graceful shutdown on SIGTERM (standard in Kubernetes)
+    # Graceful shutdown on SIGTERM (Kubernetes) and SIGINT (local Ctrl-C)
     signal.signal(signal.SIGTERM, lambda *_: controller.stop())
+    signal.signal(signal.SIGINT,  lambda *_: controller.stop())
 
     controller.run()
 

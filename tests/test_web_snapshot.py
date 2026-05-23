@@ -353,5 +353,88 @@ class TestControllerDryRun(unittest.TestCase):
         core_v1.patch_namespaced_pod.assert_called_once()
 
 
+class TestAdmitBackoff(unittest.TestCase):
+    """_admit_pod must back off on transient API errors and give up after
+    _MAX_ADMIT_ATTEMPTS."""
+
+    def _make_ctrl_with_failing_patch(self):
+        from lane_scheduler.k8s.controller import LaneSchedulerController
+        from lane_scheduler.estimation.wait_estimator import ResidencyProfile
+        from kubernetes import client as k8s_client
+
+        core_v1 = MagicMock()
+        core_v1.patch_namespaced_pod.side_effect = (
+            k8s_client.exceptions.ApiException(status=500, reason="Internal")
+        )
+        registry = CourseRegistry()
+        ctrl = LaneSchedulerController(
+            core_v1=core_v1,
+            registry=registry,
+            sched_config=SchedulerConfig(),
+            residency_profiles={
+                "interactive": ResidencyProfile(mean_pct=0.4, std_pct=0.2),
+                "batch":       ResidencyProfile(mean_pct=0.7, std_pct=0.15),
+            },
+            dry_run=False,
+            web_port=0,
+        )
+        return ctrl, core_v1
+
+    def _make_pod_job(self, ctrl, uid="uid-retry"):
+        _register(ctrl, "CSE101")
+        job = _submit(ctrl, "CSE101", _cpu(), job_id=uid, student_id="s1")
+        pod = {
+            "metadata": {
+                "name": "retry-pod", "namespace": "ns",
+                "uid": uid, "labels": {"dsmlp/course": "CSE101"},
+            },
+            "spec": {"tolerations": [], "containers": []},
+            "status": {},
+        }
+        return pod, job
+
+    def test_first_failure_records_backoff(self):
+        ctrl, _ = self._make_ctrl_with_failing_patch()
+        pod, job = self._make_pod_job(ctrl)
+        ctrl._admit_pod(pod, job)
+        # Backoff state recorded; pod re-queued; not in _admitted
+        with ctrl._admit_attempts_lock:
+            self.assertIn("uid-retry", ctrl._admit_attempts)
+            attempts, next_retry = ctrl._admit_attempts["uid-retry"]
+        self.assertEqual(attempts, 1)
+        import time
+        self.assertGreater(next_retry, time.monotonic())
+        with ctrl._pending_lock:
+            self.assertIn("uid-retry", ctrl._pending)
+
+    def test_gives_up_after_max_attempts(self):
+        from lane_scheduler.k8s.controller import _MAX_ADMIT_ATTEMPTS
+        ctrl, _ = self._make_ctrl_with_failing_patch()
+        pod, job = self._make_pod_job(ctrl)
+        for _ in range(_MAX_ADMIT_ATTEMPTS):
+            ctrl._admit_pod(pod, job)
+        # After the last attempt, state is cleared and pod is dropped.
+        with ctrl._admit_attempts_lock:
+            self.assertNotIn("uid-retry", ctrl._admit_attempts)
+        with ctrl._pending_lock:
+            self.assertNotIn("uid-retry", ctrl._pending)
+        # Scheduler queue should also be empty for this job
+        self.assertIsNone(ctrl.scheduler.remove_job("uid-retry"))
+
+    def test_404_clears_attempts(self):
+        from kubernetes import client as k8s_client
+        ctrl, core_v1 = self._make_ctrl_with_failing_patch()
+        pod, job = self._make_pod_job(ctrl)
+        # First call fails 500 → attempt recorded
+        ctrl._admit_pod(pod, job)
+        # Switch to 404; next attempt clears the entry without dropping
+        core_v1.patch_namespaced_pod.side_effect = (
+            k8s_client.exceptions.ApiException(status=404, reason="Not Found")
+        )
+        ctrl._admit_pod(pod, job)
+        with ctrl._admit_attempts_lock:
+            self.assertNotIn("uid-retry", ctrl._admit_attempts)
+
+
 if __name__ == "__main__":
     unittest.main()

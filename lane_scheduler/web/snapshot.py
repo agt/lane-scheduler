@@ -56,13 +56,16 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
     lane_capacity = ctrl.node_tracker.lane_capacity()   # {Lane: float}
     node_counts   = ctrl.node_tracker.node_count()      # {Lane: int}
 
+    with ctrl._pending_lock:
+        pending_count = len(ctrl._pending)
     with ctrl._running_lock:
         running_snap = {
             lane: dict(pods)
             for lane, pods in ctrl._running.items()
         }
     with ctrl._running_ctx_lock:
-        ctx_snap = dict(ctrl._running_ctx)  # uid → (course_id, lane_name, batch, deadline)
+        # uid → (course_id, lane_name, batch, deadline, ctx_created_monotonic)
+        ctx_snap = dict(ctrl._running_ctx)
 
     queue_depths  = ctrl.scheduler.queue_depths()   # {lane_name: {class_id: count}}
     cached_ests   = ctrl.wait_cache.all_estimates()  # {pod_uid: WaitEstimate}
@@ -85,7 +88,8 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
             running_units_by_lane[lane_name] += rp.resource_units
             running_count_by_lane[lane_name] += 1
 
-    for uid, (course_id, lane_name, batch, deadline) in ctx_snap.items():
+    for uid, ctx in ctx_snap.items():
+        course_id, lane_name = ctx[0], ctx[1]
         running_by_course_lane[(course_id, lane_name)] += 1
 
     # ------------------------------------------------------------------
@@ -242,6 +246,7 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
             "wait_cache_age_s":      round(cache_age, 1) if cache_age is not None else None,
             "wait_cache_duration_s": round(ctrl.wait_cache.last_duration, 2),
             "course_count":          len(ctrl.registry),
+            "pending_count":         pending_count,
         },
         "lanes":   lanes_out,
         "courses": courses_out,

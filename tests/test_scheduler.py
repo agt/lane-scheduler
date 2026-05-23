@@ -298,5 +298,150 @@ class TestIsKnownGpuClass(unittest.TestCase):
         self.assertFalse(is_known_gpu_class("  "))
 
 
+class TestSchedulerConfigValidation(unittest.TestCase):
+    """SchedulerConfig.__post_init__ rejects invalid values."""
+
+    def test_valid_defaults(self):
+        SchedulerConfig()   # must not raise
+
+    def test_negative_alpha(self):
+        with self.assertRaises(ValueError):
+            SchedulerConfig(alpha=-0.1)
+
+    def test_zero_epsilon(self):
+        with self.assertRaises(ValueError):
+            SchedulerConfig(epsilon=0.0)
+
+    def test_negative_epsilon(self):
+        with self.assertRaises(ValueError):
+            SchedulerConfig(epsilon=-1.0)
+
+    def test_zero_t_half_interactive(self):
+        with self.assertRaises(ValueError):
+            SchedulerConfig(t_half_interactive=0.0)
+
+    def test_zero_t_half_batch(self):
+        with self.assertRaises(ValueError):
+            SchedulerConfig(t_half_batch=0.0)
+
+    def test_zero_batch_mode_penalty(self):
+        with self.assertRaises(ValueError):
+            SchedulerConfig(batch_mode_penalty=0.0)
+
+    def test_zero_utilization_window(self):
+        with self.assertRaises(ValueError):
+            SchedulerConfig(utilization_window=0.0)
+
+    def test_zero_dispatch_k(self):
+        with self.assertRaises(ValueError):
+            SchedulerConfig(dispatch_k=0)
+
+
+class TestRemoveJob(unittest.TestCase):
+    """Scheduler.remove_job clears orphan Jobs from the queue."""
+
+    def setUp(self):
+        self.s = Scheduler(lane_capacity=CAPACITY())
+        self.s.register_class(make_course("CSE-100", Tier.UPPER_DIV, 50))
+
+    def test_remove_unknown_returns_none(self):
+        self.assertIsNone(self.s.remove_job("does-not-exist"))
+
+    def test_remove_existing_returns_job_and_clears_queue(self):
+        job = make_job(job_id="JOB-A", class_id="CSE-100", student_id="S1")
+        self.s.submit(job)
+        removed = self.s.remove_job("JOB-A")
+        self.assertIs(removed, job)
+        # Queue path should be cleaned up
+        self.assertEqual(self.s.queue_depths(), {})
+
+    def test_remove_preserves_other_jobs(self):
+        j1 = make_job(job_id="JOB-A", class_id="CSE-100", student_id="S1")
+        j2 = make_job(job_id="JOB-B", class_id="CSE-100", student_id="S2")
+        self.s.submit(j1)
+        self.s.submit(j2)
+        self.s.remove_job("JOB-A")
+        depths = self.s.queue_depths()
+        self.assertEqual(sum(sum(cm.values()) for cm in depths.values()), 1)
+
+
+class TestUtilizationPruning(unittest.TestCase):
+    """UtilizationTracker drops empty keys to bound memory."""
+
+    def test_empty_key_pruned_after_expiry(self):
+        u = UtilizationTracker(window=10.0, lane_capacity={_cpu(): 100.0})
+        u.record("CSE-100", _cpu(), 1.0, now=0.0)
+        # Far future — all events expired
+        u.utilization("CSE-100", _cpu(), now=1000.0)
+        self.assertNotIn(("CSE-100", _cpu()), u._events)
+
+
+class TestConcurrentSubmitCycle(unittest.TestCase):
+    """Scheduler.submit and Scheduler.cycle from concurrent threads must
+    not crash and must preserve queue invariants."""
+
+    def test_no_exceptions_under_contention(self):
+        import threading
+
+        s = Scheduler(lane_capacity=CAPACITY())
+        for cid in ("CSE-100", "CSE-200", "CSE-300"):
+            s.register_class(make_course(cid, Tier.UPPER_DIV, 50))
+
+        stop = threading.Event()
+        errors: list[Exception] = []
+
+        def submitter(prefix: str):
+            i = 0
+            try:
+                while not stop.is_set():
+                    job = make_job(
+                        job_id=f"{prefix}-{i}",
+                        class_id="CSE-100",
+                        student_id=f"S{i % 5}",
+                    )
+                    s.submit(job)
+                    i += 1
+            except Exception as e:
+                errors.append(e)
+
+        def cycler():
+            try:
+                while not stop.is_set():
+                    s.cycle()
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=submitter, args=("A",)),
+            threading.Thread(target=submitter, args=("B",)),
+            threading.Thread(target=cycler),
+        ]
+        for t in threads:
+            t.start()
+        import time as _t
+        _t.sleep(0.5)
+        stop.set()
+        for t in threads:
+            t.join(timeout=5.0)
+
+        self.assertFalse(errors, f"thread errors: {errors!r}")
+
+
+class TestLaneForGpuClassStrict(unittest.TestCase):
+    """strict=True returns None for unknown classes; default still falls back."""
+
+    def test_strict_returns_none_for_unknown(self):
+        self.assertIsNone(lane_for_gpu_class("h200", strict=True))
+
+    def test_strict_returns_lane_for_known(self):
+        from lane_scheduler.core.scheduler import Lane
+        self.assertEqual(lane_for_gpu_class("medium", strict=True),
+                         Lane.GPU_MEDIUM)
+
+    def test_non_strict_falls_back_to_small(self):
+        from lane_scheduler.core.scheduler import Lane
+        self.assertEqual(lane_for_gpu_class("h200"), Lane.GPU_SMALL)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
