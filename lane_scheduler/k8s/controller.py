@@ -1108,6 +1108,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # --- Kubernetes label/taint wiring ---
     p.add_argument("--course-label", default=LABEL_COURSE,
                    help="Pod label key for course identifier (default: %(default)s)")
+    p.add_argument("--batch-label", default=LABEL_BATCH,
+                   help="Pod label key for batch mode flag (default: %(default)s)")
     p.add_argument("--pod-gpu-class-label", default=LABEL_GPU_CLASS,
                    help="Pod label key for requested GPU class (default: %(default)s)")
     p.add_argument("--node-gpu-class-label", default=GPU_CLASS_LABEL_KEY,
@@ -1156,6 +1158,7 @@ def main() -> None:
     _pt.INHIBIT_TAINT_KEY   = args.inhibit_taint_key
     _pt.INHIBIT_TAINT_VALUE = args.inhibit_taint_value
     _pt.LABEL_COURSE        = args.course_label
+    _pt.LABEL_BATCH         = args.batch_label
     _pt.LABEL_GPU_CLASS     = args.pod_gpu_class_label
     # Also update the names imported into this module's own namespace, which are
     # referenced by _enqueue() and _upsert_running() as module globals.

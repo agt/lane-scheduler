@@ -87,6 +87,7 @@ All defaults live in `controller.py` lines ~98–127. The most operationally rel
 | `LANE_NODE_GPU_CLASS_LABEL` | `gpu-class` | Node label key used to identify GPU class/lane |
 | `LANE_POD_GPU_CLASS_LABEL` | `gpu-class` | Pod label key used to identify requested GPU class/lane |
 | `LANE_COURSE_LABEL` | `dsmlp/course` | Pod label key used to identify the course |
+| `LANE_BATCH_LABEL` | `dsmlp/batch` | Pod label key used to identify batch-mode jobs |
 | `LANE_INHIBIT_TAINT_KEY` | `dsmlp/scheduling-gate` | Taint key on managed nodes (inhibitory gate) |
 | `LANE_INHIBIT_TAINT_VALUE` | `controller` | Taint value paired with the inhibitory gate key |
 
