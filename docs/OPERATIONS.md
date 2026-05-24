@@ -126,33 +126,27 @@ LANE_COURSE_CSV=/etc/lane-scheduler/courses.csv   (default path)
 ```
 
 ```csv
-course_id,level,seats
-CSE101_SP26_A00,lower,210
-CSE150_SP26_A00,upper,55
-CSE234_SP26_A00,graduate,18
+course_id,tier,seats
+CSE101_SP26_A00,1,210
+CSE150_SP26_A00,2,55
+CSE234_SP26_A00,3,18
 ```
 
 Headers are required; column order is flexible. Blank lines and leading/trailing whitespace are tolerated.
 
-**`level` values** (case-insensitive):
+**`tier` values:**
 
-| CSV value | Tier | Tier weight |
-|-----------|------|-------------|
-| `lower`, `lower_div`, `lower division`, `intro`, `undergraduate` | INTRO | 1.0 |
-| `upper`, `upper_div`, `upper division` | UPPER_DIV | 2.0 |
-| `graduate`, `grad`, `phd` | GRAD | 3.0 |
+| CSV value | Meaning | Tier weight |
+|-----------|---------|-------------|
+| `1` | Intro / lower-division | 1.0 |
+| `2` | Upper-division | 2.0 |
+| `3` | Graduate | 3.0 |
 
-### 4.2 Fallback Inference
+Rows with an unrecognised tier value or an unparseable seat count are skipped with a warning logged.
 
-If a pod's course label is absent from the CSV, the tier is inferred from the numeric portion of the course code (`course_registry.py:36-40`):
+### 4.2 Unknown Course Fallback
 
-| Course number range | Inferred tier | Fallback enrollment |
-|--------------------|---------------|---------------------|
-| < 100 | INTRO | 200 |
-| 100 – 199 | UPPER_DIV | 200 |
-| ≥ 200 | GRAD | 50 |
-
-Courses using entirely non-numeric codes default to INTRO / 200 enrollment.
+If a pod's course label is absent from the CSV, the scheduler uses tier 1 and 200 seats as defaults, logs a warning, and caches the synthetic entry so the warning appears only once per unknown course per registry load.
 
 ### 4.3 Reloading
 
@@ -562,7 +556,7 @@ Enable `LANE_NO_UNKNOWN_GPU_CLASS_EVENTS` if the class is intentionally unmanage
 
 **Uneven fairness across courses**
 
-Verify that all active courses appear in the CSV with correct tier and enrollment. Pods from courses absent from the CSV fall back to inference defaults which may over- or under-weight them. Set `LANE_LOG_LEVEL=DEBUG` and watch cycle log output to see per-job scores and which student is selected as each course's candidate.
+Verify that all active courses appear in the CSV with correct tier and enrollment. Pods from courses absent from the CSV fall back to tier 1 / 200 seats, which under-weights grad courses and may distort fairness. Set `LANE_LOG_LEVEL=DEBUG` and watch cycle log output to see per-job scores and which student is selected as each course's candidate.
 
 **High Kubernetes API error rate**
 

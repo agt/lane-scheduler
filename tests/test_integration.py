@@ -12,7 +12,7 @@ from pathlib import Path
 from lane_scheduler.core.scheduler import (
     Lane, Tier, initialise_lanes, lane_for_gpu_class,
 )
-from lane_scheduler.core.course_registry import CourseRegistry, _infer_tier
+from lane_scheduler.core.course_registry import CourseRegistry
 from lane_scheduler.k8s.pod_translator import (
     admission_patch, needs_scheduling, pod_to_job, NO_COURSE_LABEL,
 )
@@ -43,7 +43,7 @@ def _gpu(cls):
 
 def _write_csv(rows):
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False)
-    writer = csv.DictWriter(tmp, fieldnames=["course_id", "level", "seats"])
+    writer = csv.DictWriter(tmp, fieldnames=["course_id", "tier", "seats"])
     writer.writeheader()
     writer.writerows(rows)
     tmp.close()
@@ -109,23 +109,12 @@ def _gpu_pod(gpu_class, batch=False, gpu_count="1"):
 # CourseRegistry
 # ---------------------------------------------------------------------------
 
-class TestCourseRegistryInference(unittest.TestCase):
-
-    def test_lower_division(self):
-        self.assertEqual(_infer_tier("CSE8_SP26_A00"),    Tier.INTRO)
-        self.assertEqual(_infer_tier("MATH20C_FA25_B01"), Tier.INTRO)
-
-    def test_upper_division(self):
-        self.assertEqual(_infer_tier("CSE101_SP26_A00"), Tier.UPPER_DIV)
-        self.assertEqual(_infer_tier("CSE150_SP26_A00"), Tier.UPPER_DIV)
-
-    def test_graduate(self):
-        self.assertEqual(_infer_tier("CSE234_SP26_A00"), Tier.GRAD)
+class TestCourseRegistry(unittest.TestCase):
 
     def test_csv_load(self):
         path = _write_csv([
-            {"course_id": "CSE101_SP26_A00", "level": "upper",    "seats": 55},
-            {"course_id": "CSE234_SP26_A00", "level": "graduate", "seats": 18},
+            {"course_id": "CSE101_SP26_A00", "tier": 2, "seats": 55},
+            {"course_id": "CSE234_SP26_A00", "tier": 3, "seats": 18},
         ])
         reg = CourseRegistry()
         self.assertEqual(reg.load_csv(path), 2)
@@ -133,26 +122,45 @@ class TestCourseRegistryInference(unittest.TestCase):
         self.assertEqual(c.tier, Tier.UPPER_DIV)
         self.assertEqual(c.enrollment, 55)
 
+    def test_all_tier_values(self):
+        path = _write_csv([
+            {"course_id": "A", "tier": 1, "seats": 200},
+            {"course_id": "B", "tier": 2, "seats": 60},
+            {"course_id": "C", "tier": 3, "seats": 15},
+        ])
+        reg = CourseRegistry()
+        reg.load_csv(path)
+        self.assertEqual(reg.get("A").tier, Tier.INTRO)
+        self.assertEqual(reg.get("B").tier, Tier.UPPER_DIV)
+        self.assertEqual(reg.get("C").tier, Tier.GRAD)
+
     def test_fallback_on_unknown_course(self):
         reg = CourseRegistry()
-        c   = reg.get("CSE234_SP26_A00")
-        self.assertEqual(c.tier, Tier.GRAD)
-        self.assertEqual(c.enrollment, 50)
+        c   = reg.get("UNKNOWN_SP26_A00")
+        self.assertEqual(c.tier, Tier.INTRO)
+        self.assertEqual(c.enrollment, 200)
 
     def test_fallback_cached(self):
         reg = CourseRegistry()
         self.assertIs(reg.get("CSE101_SP26_A00"), reg.get("CSE101_SP26_A00"))
 
     def test_missing_column_raises(self):
-        tmp = _write_csv([{"course_id": "X", "level": "grad", "seats": 10}])
-        tmp.write_text("course_id,level\nX,grad\n")
+        tmp = _write_csv([{"course_id": "X", "tier": 1, "seats": 10}])
+        tmp.write_text("course_id,tier\nX,1\n")
         with self.assertRaises(ValueError):
             CourseRegistry().load_csv(tmp)
 
     def test_bad_seat_count_skipped(self):
         path = _write_csv([
-            {"course_id": "CSE101_SP26_A00", "level": "upper",    "seats": "bad"},
-            {"course_id": "CSE234_SP26_A00", "level": "graduate", "seats": "18"},
+            {"course_id": "CSE101_SP26_A00", "tier": 2, "seats": "bad"},
+            {"course_id": "CSE234_SP26_A00", "tier": 3, "seats": "18"},
+        ])
+        self.assertEqual(CourseRegistry().load_csv(path), 1)
+
+    def test_bad_tier_skipped(self):
+        path = _write_csv([
+            {"course_id": "CSE101_SP26_A00", "tier": 9, "seats": 55},
+            {"course_id": "CSE234_SP26_A00", "tier": 3, "seats": 18},
         ])
         self.assertEqual(CourseRegistry().load_csv(path), 1)
 
