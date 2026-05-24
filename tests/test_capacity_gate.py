@@ -148,9 +148,7 @@ def _enqueue_pod(ctrl, pod):
 
 def _queue_depth(sched, lane):
     """Total jobs waiting in a lane across all courses."""
-    from lane_scheduler.core.scheduler import LANE_NAMES
-    lane_name = LANE_NAMES.get(lane, str(lane))
-    return sum(sched.queue_depths().get(lane_name, {}).values())
+    return sum(sched.queue_depths().get(lane, {}).values())
 
 
 # ---------------------------------------------------------------------------

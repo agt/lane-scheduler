@@ -18,7 +18,7 @@ _GPU_CLASSES = ["small", "medium", "large"]
 initialise_lanes(_GPU_CLASSES)
 
 from lane_scheduler.core.scheduler import (  # noqa: E402 — after initialise_lanes
-    CourseClass, Job, Lane, LANE_NAMES, Scheduler, SchedulerConfig, Tier,
+    CourseClass, Job, CPU_LANE, Scheduler, SchedulerConfig, Tier,
 )
 
 
@@ -35,10 +35,10 @@ class SimConfig:
 
     # Lane capacities (arbitrary resource units)
     lane_capacity: dict = field(default_factory=lambda: {
-        Lane.CPU:        200.0,
-        Lane.GPU_SMALL:   20.0,
-        Lane.GPU_MEDIUM:  10.0,
-        Lane.GPU_LARGE:    5.0,
+        "cpu":         200.0,
+        "gpu-small":    20.0,
+        "gpu-medium":   10.0,
+        "gpu-large":     5.0,
     })
 
 
@@ -62,20 +62,20 @@ def _tier_profiles() -> dict:
     return {
         Tier.INTRO: dict(
             rate=2.0,
-            lane_probs={Lane.CPU: 0.90, Lane.GPU_SMALL: 0.10},
+            lane_probs={"cpu": 0.90, "gpu-small": 0.10},
             resource_range=(0.5, 2.0),
             batch_prob=0.0,
         ),
         Tier.UPPER_DIV: dict(
             rate=3.0,
-            lane_probs={Lane.CPU: 0.70, Lane.GPU_SMALL: 0.20, Lane.GPU_MEDIUM: 0.10},
+            lane_probs={"cpu": 0.70, "gpu-small": 0.20, "gpu-medium": 0.10},
             resource_range=(1.0, 4.0),
             batch_prob=0.1,
         ),
         Tier.GRAD: dict(
             rate=4.0,
-            lane_probs={Lane.CPU: 0.50, Lane.GPU_SMALL: 0.15,
-                        Lane.GPU_MEDIUM: 0.20, Lane.GPU_LARGE: 0.15},
+            lane_probs={"cpu": 0.50, "gpu-small": 0.15,
+                        "gpu-medium": 0.20, "gpu-large": 0.15},
             resource_range=(2.0, 8.0),
             batch_prob=0.35,
         ),
@@ -89,7 +89,7 @@ def pick_lane(probs: dict, rng: random.Random):
         cumulative += p
         if r < cumulative:
             return lane
-    return Lane.CPU
+    return CPU_LANE
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +108,7 @@ def record(stats: Stats, job: Job, course: CourseClass) -> None:
     wait = (job.dispatch_time - job.submit_time)
     stats.dispatched_by_class[job.class_id] += 1
     stats.wait_by_class[job.class_id].append(wait)
-    stats.dispatched_by_lane[LANE_NAMES[job.lane]] += 1
+    stats.dispatched_by_lane[job.lane] += 1
     stats.dispatched_by_tier[course.tier.name] += 1
 
 

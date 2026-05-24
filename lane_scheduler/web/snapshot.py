@@ -45,7 +45,7 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
     as _build_wait_snapshot().  Safe to call from any thread concurrently
     with the scheduling cycle.
     """
-    from lane_scheduler.core.scheduler import Lane, LANE_NAMES
+    from lane_scheduler.core.scheduler import Lane
     from lane_scheduler.estimation.wait_estimator import estimate_wait
 
     now = time.monotonic()
@@ -83,7 +83,7 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
             rp_by_uid[uid] = rp
 
     for lane, pods in running_snap.items():
-        lane_name = LANE_NAMES.get(lane, str(lane))
+        lane_name = lane
         for uid, rp in pods.items():
             running_units_by_lane[lane_name] += rp.resource_units
             running_count_by_lane[lane_name] += 1
@@ -96,8 +96,8 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
     # Scored candidates per lane — maps (lane_name, class_id) → top-candidate info
     # ------------------------------------------------------------------
     course_top: dict[tuple, dict] = {}
-    for lane in Lane:
-        lane_name    = LANE_NAMES.get(lane, str(lane))
+    for lane in sorted(Lane or []):
+        lane_name    = lane
         running_pods = list(running_snap.get(lane, {}).values())
         try:
             candidates = ctrl.scheduler._scored_candidates(lane, now)
@@ -116,8 +116,8 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
     # Lane rows (View 1)
     # ------------------------------------------------------------------
     lanes_out = []
-    for lane in Lane:
-        lane_name    = LANE_NAMES.get(lane, str(lane))
+    for lane in sorted(Lane or []):
+        lane_name    = lane
         capacity     = lane_capacity.get(lane, 0.0)
         nodes        = node_counts.get(lane, 0)
         run_units    = running_units_by_lane.get(lane_name, 0.0)
@@ -173,8 +173,8 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
         course = ctrl.registry.get(course_id)
         course_lanes = []
 
-        for lane in Lane:
-            lane_name = LANE_NAMES.get(lane, str(lane))
+        for lane in sorted(Lane or []):
+            lane_name = lane
             queued  = queue_depths.get(lane_name, {}).get(course_id, 0)
             running = running_by_course_lane.get((course_id, lane_name), 0)
             if queued == 0 and running == 0:

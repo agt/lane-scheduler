@@ -176,7 +176,7 @@ class TestPublishDue(unittest.TestCase):
         job  = _mock_job(uid, "CSE101")
         import lane_scheduler.core.scheduler as _sched
         _sched.initialise_lanes(["medium"])
-        lane = _sched.Lane.CPU
+        lane = _sched.CPU_LANE
         return pub, core_v1, uid, est, now, job, lane
 
     def test_event_created_when_due(self):
@@ -272,7 +272,7 @@ class TestPublishDue(unittest.TestCase):
         pub, core_v1 = _make_publisher()
         import lane_scheduler.core.scheduler as _sched
         _sched.initialise_lanes(["medium"])
-        lane = _sched.Lane.CPU
+        lane = _sched.CPU_LANE
         now  = time.monotonic()
         uids = [f"uid-{i}" for i in range(4)]
         for uid in uids:
@@ -452,7 +452,7 @@ class TestBatchPublishDue(unittest.TestCase):
         pub     = EventPublisher(core_v1)
         import lane_scheduler.core.scheduler as _sched
         _sched.initialise_lanes(["medium"])
-        lane    = _sched.Lane.CPU
+        lane    = _sched.CPU_LANE
         uid     = "bu-1"
         job     = _mock_job(uid, "CSE234")
         median  = 4000.0
@@ -493,7 +493,7 @@ class TestBatchPublishDue(unittest.TestCase):
         pub     = EventPublisher(core_v1)
         import lane_scheduler.core.scheduler as _sched
         _sched.initialise_lanes(["medium"])
-        lane    = _sched.Lane.CPU
+        lane    = _sched.CPU_LANE
         uid     = "bu-2"
         job     = _mock_job(uid, "CSE234")
 

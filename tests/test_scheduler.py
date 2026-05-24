@@ -20,7 +20,7 @@ def setUpModule():
 
 # Convenience aliases resolved after setUpModule() — accessed via functions
 # rather than module-level names so they're evaluated lazily after init.
-def _cpu():        from lane_scheduler.core.scheduler import Lane; return Lane.CPU
+def _cpu():        from lane_scheduler.core.scheduler import CPU_LANE; return CPU_LANE
 def _gpu(cls):     return lane_for_gpu_class(cls)
 
 CAPACITY = lambda: {
@@ -44,8 +44,8 @@ def make_course(class_id="TEST-101", tier=Tier.INTRO, enrollment=100):
 def make_job(job_id="J001", class_id="TEST-101", student_id="S001",
              lane=None, submit_time=0.0, resource_units=1.0, batch=False):
     if lane is None:
-        from lane_scheduler.core.scheduler import Lane
-        lane = Lane.CPU
+        from lane_scheduler.core.scheduler import CPU_LANE
+        lane = CPU_LANE
     j = Job(job_id=job_id, class_id=class_id, student_id=student_id,
             lane=lane, batch=batch, resource_units=resource_units)
     j.submit_time = submit_time
@@ -249,11 +249,13 @@ class TestDynamicLane(unittest.TestCase):
         self.assertEqual(lane_for_gpu_class("Medium"), lane_for_gpu_class("medium"))
         self.assertEqual(lane_for_gpu_class("LARGE"),  lane_for_gpu_class("large"))
 
-    def test_unknown_class_returns_fallback(self):
+    def test_unknown_class_returns_none(self):
+        lane = lane_for_gpu_class("supergpu", strict=True)
+        self.assertIsNone(lane)
+
+    def test_unknown_class_non_strict_returns_none(self):
         lane = lane_for_gpu_class("supergpu")
-        self.assertIsNotNone(lane)
-        self.assertIn(lane, lane_for_gpu_class.__globals__.get(
-            "GPU_LANES", set()) or set() or {lane})
+        self.assertIsNone(lane)
 
     def test_gpu_lanes_distinct_from_cpu(self):
         from lane_scheduler.core.scheduler import GPU_LANES
@@ -261,23 +263,10 @@ class TestDynamicLane(unittest.TestCase):
         for cls in ("xsmall", "small", "medium", "large", "xlarge"):
             self.assertIn(lane_for_gpu_class(cls), GPU_LANES)
 
-    def test_build_lanes_idempotent_values(self):
-        """Same input → same integer values regardless of call order."""
-        from lane_scheduler.core.scheduler import build_lanes
-        la = build_lanes(["small", "large", "medium"])
-        lb = build_lanes(["large", "small", "medium"])
-        self.assertEqual(
-            {m.name: m.value for m in la},
-            {m.name: m.value for m in lb},
-        )
-
-    def test_new_class_appended(self):
-        """A new gpu-class sorts into the existing sequence without renumbering."""
-        from lane_scheduler.core.scheduler import build_lanes
-        base    = build_lanes(["small", "medium", "large"])
-        extended = build_lanes(["small", "medium", "large", "xlarge"])
-        for member in base:
-            self.assertEqual(member.value, extended[member.name].value)
+    def test_lane_strings_have_expected_format(self):
+        for cls in ("xsmall", "small", "medium", "large", "xlarge"):
+            lane = lane_for_gpu_class(cls)
+            self.assertEqual(lane, f"gpu-{cls}")
 
 
 class TestIsKnownGpuClass(unittest.TestCase):
@@ -434,13 +423,10 @@ class TestLaneForGpuClassStrict(unittest.TestCase):
         self.assertIsNone(lane_for_gpu_class("h200", strict=True))
 
     def test_strict_returns_lane_for_known(self):
-        from lane_scheduler.core.scheduler import Lane
-        self.assertEqual(lane_for_gpu_class("medium", strict=True),
-                         Lane.GPU_MEDIUM)
+        self.assertEqual(lane_for_gpu_class("medium", strict=True), "gpu-medium")
 
-    def test_non_strict_falls_back_to_small(self):
-        from lane_scheduler.core.scheduler import Lane
-        self.assertEqual(lane_for_gpu_class("h200"), Lane.GPU_SMALL)
+    def test_non_strict_unknown_returns_none(self):
+        self.assertIsNone(lane_for_gpu_class("h200"))
 
 
 if __name__ == "__main__":
