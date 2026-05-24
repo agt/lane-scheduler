@@ -222,6 +222,8 @@ class LaneSchedulerController:
 
         # Running pods per lane: {lane: {uid: RunningPod}}
         self._running: dict[object, dict[str, RunningPod]] = {}
+        # uid → student_id (namespace) for running pods; kept in sync with _running
+        self._running_student: dict[str, str] = {}
         self._running_lock = threading.Lock()
 
         # Completion context: uid → (course_id, lane_name, batch, deadline, ctx_created_monotonic)
@@ -473,6 +475,7 @@ class LaneSchedulerController:
         course_id = (
             (pod.get("metadata") or {}).get("labels") or {}
         ).get(LABEL_COURSE, NO_COURSE_LABEL) or NO_COURSE_LABEL
+        student_id = (pod.get("metadata") or {}).get("namespace", "")
         batch     = _is_batch(pod)
         deadline  = float((pod.get("spec") or {}).get("activeDeadlineSeconds") or 0)
 
@@ -480,6 +483,7 @@ class LaneSchedulerController:
             if lane not in self._running:
                 self._running[lane] = {}
             self._running[lane][uid] = rp
+            self._running_student[uid] = student_id
 
         with self._running_ctx_lock:
             self._running_ctx[uid] = (
@@ -490,6 +494,7 @@ class LaneSchedulerController:
         with self._running_lock:
             for lane_dict in self._running.values():
                 lane_dict.pop(uid, None)
+            self._running_student.pop(uid, None)
         with self._running_ctx_lock:
             self._running_ctx.pop(uid, None)
 
@@ -751,13 +756,24 @@ class LaneSchedulerController:
 
         now       = time.monotonic()
 
-        # Snapshot running units per lane before the cycle so the gate has a
-        # consistent baseline that is unaffected by concurrent pod-watch events.
+        # Snapshot running units and student counts in one lock acquisition so
+        # both views are consistent and unaffected by concurrent pod-watch events.
         with self._running_lock:
             running_units: dict = {
                 lane: sum(rp.resource_units for rp in pods.values())
                 for lane, pods in self._running.items()
             }
+            running_counts: dict = {}
+            for lane, pods in self._running.items():
+                counts: dict = {}
+                for uid in pods:
+                    sid = self._running_student.get(uid, "")
+                    counts[sid] = counts.get(sid, 0) + 1
+                running_counts[lane] = counts
+
+        # Push student running counts so the scheduler can apply the
+        # minimum-running-then-oldest-job prioritization rule.
+        self.scheduler.update_running_counts(running_counts)
 
         # Snapshot admitted-but-not-running units; augmented in the loop below
         # so jobs committed earlier in the same cycle are visible to later ones.

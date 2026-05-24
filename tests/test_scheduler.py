@@ -6,7 +6,7 @@ import math
 import unittest
 
 from lane_scheduler.core.scheduler import (
-    CourseClass, DeficitTracker, Job, PriorityScorer,
+    CourseClass, Job, PriorityScorer,
     Scheduler, SchedulerConfig, Tier, UtilizationTracker,
     initialise_lanes, lane_for_gpu_class, is_known_gpu_class,
 )
@@ -141,28 +141,85 @@ class TestUtilizationTracker(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# DeficitTracker tests
+# Student prioritization tests
 # ---------------------------------------------------------------------------
 
-class TestDeficitTracker(unittest.TestCase):
+class TestStudentPrioritization(unittest.TestCase):
+    """Tests for _top_student: fewest running → oldest pending job."""
 
-    def test_accrual(self):
-        dt = DeficitTracker()
-        dt.accrue("S1", _cpu(), dt=10.0)
-        self.assertAlmostEqual(dt.deficit("S1", _cpu()), 10.0)
+    def _sched_with_counts(self, running_counts):
+        sched = Scheduler(lane_capacity=CAPACITY(), config=SchedulerConfig())
+        sched.update_running_counts(running_counts)
+        return sched
 
-    def test_debit(self):
-        dt = DeficitTracker()
-        dt.accrue("S1", _cpu(), dt=10.0)
-        dt.debit("S1", _cpu(), units=3.0)
-        self.assertAlmostEqual(dt.deficit("S1", _cpu()), 7.0)
+    def _student_map(self, entries):
+        """entries: [(student_id, submit_time), ...]"""
+        sm = {}
+        for sid, t in entries:
+            j = make_job(job_id=sid, student_id=sid, submit_time=t)
+            sm[sid] = [j]
+        return sm
 
-    def test_top_student(self):
-        dt = DeficitTracker()
-        dt.accrue("S1", _cpu(), dt=5.0)
-        dt.accrue("S2", _cpu(), dt=20.0)
-        dt.accrue("S3", _cpu(), dt=10.0)
-        self.assertEqual(dt.top_student({"S1", "S2", "S3"}, _cpu()), "S2")
+    def test_no_running_picks_oldest(self):
+        sched = self._sched_with_counts({})
+        sm = self._student_map([("S1", 100.0), ("S2", 50.0), ("S3", 75.0)])
+        # all have 0 running; S2 submitted earliest
+        result = sched._top_student(set(sm), _cpu(), sm)
+        self.assertEqual(result, "S2")
+
+    def test_fewest_running_wins_over_older_submit(self):
+        sched = self._sched_with_counts({_cpu(): {"S1": 2, "S2": 1, "S3": 0}})
+        # S1 has oldest job but most running; S3 has fewest running
+        sm = self._student_map([("S1", 10.0), ("S2", 20.0), ("S3", 30.0)])
+        result = sched._top_student(set(sm), _cpu(), sm)
+        self.assertEqual(result, "S3")
+
+    def test_tie_in_running_broken_by_submit_time(self):
+        sched = self._sched_with_counts({_cpu(): {"S1": 1, "S2": 1, "S3": 0, "S4": 0}})
+        sm = self._student_map([("S1", 10.0), ("S2", 20.0), ("S3", 40.0), ("S4", 30.0)])
+        # S3 and S4 tied at 0 running; S4 submitted earlier
+        result = sched._top_student({"S3", "S4"}, _cpu(), sm)
+        self.assertEqual(result, "S4")
+
+    def test_single_student_always_selected(self):
+        sched = self._sched_with_counts({_cpu(): {"S1": 5}})
+        sm = self._student_map([("S1", 100.0)])
+        result = sched._top_student({"S1"}, _cpu(), sm)
+        self.assertEqual(result, "S1")
+
+    def test_unknown_student_treated_as_zero_running(self):
+        # S2 appears in running_counts with 1; S1 has no entry → 0 running
+        sched = self._sched_with_counts({_cpu(): {"S2": 1}})
+        sm = self._student_map([("S1", 200.0), ("S2", 10.0)])
+        result = sched._top_student(set(sm), _cpu(), sm)
+        self.assertEqual(result, "S1")
+
+    def test_different_lane_counts_not_mixed(self):
+        # S1 has 3 running in gpu-small but 0 in cpu; S2 has 0 in both
+        gpu = _gpu("small")
+        sched = self._sched_with_counts({gpu: {"S1": 3}})
+        sm = self._student_map([("S1", 10.0), ("S2", 20.0)])
+        # Both have 0 running in cpu; S1 wins on submit time
+        result = sched._top_student(set(sm), _cpu(), sm)
+        self.assertEqual(result, "S1")
+
+    def test_cycle_respects_running_counts(self):
+        """Scheduler.cycle() selects the student with fewest running pods."""
+        sched = Scheduler(lane_capacity=CAPACITY(), config=SchedulerConfig(dispatch_k=1))
+        course = make_course()
+        sched.register_class(course)
+
+        # S1 submitted first but has a running pod; S2 has none
+        j1 = make_job("J1", student_id="S1", submit_time=0.0)
+        j2 = make_job("J2", student_id="S2", submit_time=5.0)
+        sched.submit(j1)
+        sched.submit(j2)
+
+        sched.update_running_counts({_cpu(): {"S1": 1}})
+        dispatched = sched.cycle(now=100.0)
+
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(dispatched[0].student_id, "S2")
 
 
 # ---------------------------------------------------------------------------
