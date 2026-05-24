@@ -64,7 +64,7 @@ P(job, lane) = W(course) × Mode(job) × Age(job) / U(course, lane)
 - **Age** = `1 + α × log(1 + wait / t_half)`  (logarithmic, prevents starvation)
 - **U** = 5-minute rolling utilization (idle courses score higher)
 
-Within-class fairness is enforced by a **deficit round-robin** `DeficitTracker` so no single student monopolizes a course's allocation.
+Within-class fairness is enforced by selecting the student with the **fewest running pods** in that lane; ties broken by oldest pending job submit time (FIFO).
 
 ### Wait-time estimation
 

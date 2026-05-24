@@ -126,33 +126,27 @@ LANE_COURSE_CSV=/etc/lane-scheduler/courses.csv   (default path)
 ```
 
 ```csv
-course_id,level,seats
-CSE101_SP26_A00,lower,210
-CSE150_SP26_A00,upper,55
-CSE234_SP26_A00,graduate,18
+course_id,tier,seats
+CSE101_SP26_A00,1,210
+CSE150_SP26_A00,2,55
+CSE234_SP26_A00,3,18
 ```
 
 Headers are required; column order is flexible. Blank lines and leading/trailing whitespace are tolerated.
 
-**`level` values** (case-insensitive):
+**`tier` values:**
 
-| CSV value | Tier | Tier weight |
-|-----------|------|-------------|
-| `lower`, `lower_div`, `lower division`, `intro`, `undergraduate` | INTRO | 1.0 |
-| `upper`, `upper_div`, `upper division` | UPPER_DIV | 2.0 |
-| `graduate`, `grad`, `phd` | GRAD | 3.0 |
+| CSV value | Meaning | Tier weight |
+|-----------|---------|-------------|
+| `1` | Intro / lower-division | 1.0 |
+| `2` | Upper-division | 2.0 |
+| `3` | Graduate | 3.0 |
 
-### 4.2 Fallback Inference
+Rows with an unrecognised tier value or an unparseable seat count are skipped with a warning logged.
 
-If a pod's course label is absent from the CSV, the tier is inferred from the numeric portion of the course code (`course_registry.py:36-40`):
+### 4.2 Unknown Course Fallback
 
-| Course number range | Inferred tier | Fallback enrollment |
-|--------------------|---------------|---------------------|
-| < 100 | INTRO | 200 |
-| 100 – 199 | UPPER_DIV | 200 |
-| ≥ 200 | GRAD | 50 |
-
-Courses using entirely non-numeric codes default to INTRO / 200 enrollment.
+If a pod's course label is absent from the CSV, the scheduler uses tier 1 and 200 seats as defaults, logs a warning, and caches the synthetic entry so the warning appears only once per unknown course per registry load.
 
 ### 4.3 Reloading
 
@@ -219,11 +213,14 @@ The logarithmic form prevents starvation while keeping priority growth bounded. 
 
 Setting `LANE_ALPHA=0` disables aging entirely (pure weighted fair-share with no starvation protection).
 
-### 5.4 Deficit Round-Robin
+### 5.4 Within-Course Student Ordering
 
-Within each course, the student with the highest accumulated deficit (credit minus usage) is selected as the course's representative candidate for each cycle. This enforces within-course fairness and prevents any one student from monopolising a course's allocation.
+Within each course, the student selected as the course's representative candidate for each cycle is determined by two ordered rules:
 
-There are no tuning knobs for the deficit tracker; its behaviour is fully determined by the dispatch order and the W/Mode/Age/U formula.
+1. **Fewest running pods in the lane** — a student who already has a running session is deferred in favour of classmates who have none.
+2. **Oldest pending job** — among students tied on running-pod count, the one whose job has been waiting longest is selected (FIFO tiebreaker).
+
+There are no tuning knobs for this ordering; it is fully determined by the current running-pod snapshot and job submit times.
 
 ### 5.5 Wait-Time Estimation
 
@@ -290,7 +287,7 @@ The controller's ServiceAccount needs a ClusterRole with these rules (see `deplo
 
 ### 7.2 Single-Replica Requirement
 
-The controller maintains in-memory state (deficit trackers, utilization windows, residency statistics). **Do not run more than one replica.** Horizontal scaling is not supported; use a PodDisruptionBudget with `minAvailable: 1` to avoid eviction during node maintenance.
+The controller maintains in-memory state (utilization windows, residency statistics, running-pod snapshots). **Do not run more than one replica.** Horizontal scaling is not supported; use a PodDisruptionBudget with `minAvailable: 1` to avoid eviction during node maintenance.
 
 ### 7.3 Namespace Scope
 
@@ -453,7 +450,7 @@ Startup prints a prominent notice:
 
 ### Caveats
 
-Because pods are never actually admitted, the queue will grow without bound during a dry run. The scoring and deficit state will diverge from what would happen in production over time. Dry-run sessions are best kept short (a few minutes, covering a handful of cycles) unless the intent is queue analysis rather than admission verification.
+Because pods are never actually admitted, the queue will grow without bound during a dry run. Scoring, utilization, and running-pod counts will diverge from what would happen in production over time. Dry-run sessions are best kept short (a few minutes, covering a handful of cycles) unless the intent is queue analysis rather than admission verification.
 
 ---
 
@@ -559,7 +556,7 @@ Enable `LANE_NO_UNKNOWN_GPU_CLASS_EVENTS` if the class is intentionally unmanage
 
 **Uneven fairness across courses**
 
-Verify that all active courses appear in the CSV with correct tier and enrollment. Pods from courses absent from the CSV fall back to inference defaults which may over- or under-weight them. Inspect deficit accumulation by setting `LANE_LOG_LEVEL=DEBUG` and watching cycle log output.
+Verify that all active courses appear in the CSV with correct tier and enrollment. Pods from courses absent from the CSV fall back to tier 1 / 200 seats, which under-weights grad courses and may distort fairness. Set `LANE_LOG_LEVEL=DEBUG` and watch cycle log output to see per-job scores and which student is selected as each course's candidate.
 
 **High Kubernetes API error rate**
 

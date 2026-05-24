@@ -225,7 +225,7 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
 
         courses_out.append({
             "course_id":  course_id,
-            "tier":       course.tier.name,
+            "tier":       course.tier,
             "enrollment": course.enrollment,
             "weight":     round(course.class_weight, 4),
             "lanes":      course_lanes,

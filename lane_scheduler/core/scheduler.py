@@ -30,7 +30,7 @@ import time
 import logging
 from dataclasses import dataclass, field
 from collections import defaultdict
-from enum import IntEnum
+
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -114,16 +114,6 @@ def is_known_gpu_class(gpu_class: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Tier
-# ---------------------------------------------------------------------------
-
-class Tier(IntEnum):
-    INTRO     = 1
-    UPPER_DIV = 2
-    GRAD      = 3
-
-
-# ---------------------------------------------------------------------------
 # Tuning defaults
 # ---------------------------------------------------------------------------
 
@@ -183,12 +173,12 @@ class SchedulerConfig:
 class CourseClass:
     """A class section registered with the scheduler."""
     class_id:   str
-    tier:       Tier
+    tier:       int   # arbitrary positive integer; higher → more scheduling weight
     enrollment: int
 
     @property
     def tier_weight(self) -> float:
-        return float(self.tier.value)   # 1.0 / 2.0 / 3.0
+        return float(self.tier)
 
     @property
     def class_weight(self) -> float:
@@ -294,7 +284,7 @@ class Scheduler:
     - Tier-weighted, enrollment-normalized class weights
     - Log-aging wait boost with batch/interactive half-lives
     - Batch mode penalty keeps interactive jobs preferred
-    - Deficit round-robin within each class
+    - Fewest-running-then-oldest-submit student ordering within each class
     - Rolling-window utilization tracking
     """
 
@@ -364,7 +354,7 @@ class Scheduler:
             self._classes[course.class_id] = course
         logger.info(
             "Registered class %s (tier=%s enrollment=%d weight=%.4f)",
-            course.class_id, course.tier.name,
+            course.class_id, course.tier,
             course.enrollment, course.class_weight,
         )
 
@@ -389,7 +379,7 @@ class Scheduler:
 
         Walks all lanes; intended for handling pod DELETED events so an
         orphan Job doesn't sit in the scheduler queue after the pod is gone.
-        Does not touch utilization or deficit (the job never ran).
+        Does not touch utilization tracking (the job never ran).
         """
         with self._lock:
             for lane in Lane:

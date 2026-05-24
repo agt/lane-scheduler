@@ -52,7 +52,7 @@ The scheduler is implemented as a Kubernetes controller. It does not replace the
 
 | Module | Responsibility |
 |---|---|
-| `lane_scheduler/core/scheduler.py` | Core scheduling logic: priority scoring, deficit round-robin, utilization tracking |
+| `lane_scheduler/core/scheduler.py` | Core scheduling logic: priority scoring, within-class fairness, utilization tracking |
 | `lane_scheduler/core/course_registry.py` | Course metadata (tier, enrollment) from registrar CSV with inference fallback |
 | `lane_scheduler/core/node_capacity.py` | Tracks allocatable capacity per GPU class lane from node watch events |
 | `lane_scheduler/k8s/controller.py` | Orchestrates all threads; Kubernetes API interactions |
@@ -121,7 +121,7 @@ Rolling-window utilization over the past 5 minutes. Classes already consuming re
 
 ### Within-Class Fairness
 
-When multiple students in the same course have jobs waiting, the scheduler uses deficit round-robin to select which student's job to promote to the global queue. Each student accrues a deficit (proportional to the class weight and elapsed time) while waiting; the student with the highest deficit is promoted first. This prevents a single active student from monopolizing a class's share of resources.
+When multiple students in the same course have jobs waiting, the scheduler selects the student with the fewest currently running pods in that lane. Among students tied on running-pod count, the one with the oldest pending job (earliest submit time) is chosen. This prevents a student who already has a running session from blocking classmates who have none.
 
 ### Course Registry
 

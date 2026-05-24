@@ -52,7 +52,7 @@ def _gpu(cls):
 
 def _write_csv(rows):
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False)
-    writer = csv.DictWriter(tmp, fieldnames=["course_id", "level", "seats"])
+    writer = csv.DictWriter(tmp, fieldnames=["course_id", "tier", "seats"])
     writer.writeheader()
     writer.writerows(rows)
     tmp.close()
@@ -159,9 +159,9 @@ class TestCapacityGate(unittest.TestCase):
 
     def setUp(self):
         self.csv_path = _write_csv([
-            {"course_id": "CSE234_SP26_A00", "level": "grad",  "seats": "20"},
-            {"course_id": "CSE190_SP26_A00", "level": "upper", "seats": "30"},
-            {"course_id": "CSE100_SP26_A00", "level": "intro", "seats": "40"},
+            {"course_id": "CSE234_SP26_A00", "tier": 3, "seats": "20"},
+            {"course_id": "CSE190_SP26_A00", "tier": 2, "seats": "30"},
+            {"course_id": "CSE100_SP26_A00", "tier": 1, "seats": "40"},
         ])
 
     def tearDown(self):
