@@ -59,7 +59,7 @@ Every managed node carries an inhibitory taint (`dsmlp/scheduling-gate=controlle
 P(job, lane) = W(course) × Mode(job) × Age(job) / U(course, lane)
 ```
 
-- **W** = `tier_weight / √enrollment`  (tier weights: intro=1, upper=2, grad=3)
+- **W** = `tier_weight / √enrollment`  (tier_weight = tier value from CSV; conventional: 1 lower-div, 2 upper-div, 3 grad)
 - **Mode** = 1.0 (interactive) or 0.3 (batch)
 - **Age** = `1 + α × log(1 + wait / t_half)`  (logarithmic, prevents starvation)
 - **U** = 5-minute rolling utilization (idle courses score higher)

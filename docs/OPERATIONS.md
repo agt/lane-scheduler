@@ -134,15 +134,15 @@ CSE234_SP26_A00,3,18
 
 Headers are required; column order is flexible. Blank lines and leading/trailing whitespace are tolerated.
 
-**`tier` values:**
+**`tier`** must be a positive integer. It is used directly as the scheduling weight (`tier_weight = tier`). Conventional assignments:
 
-| CSV value | Meaning | Tier weight |
-|-----------|---------|-------------|
-| `1` | Intro / lower-division | 1.0 |
-| `2` | Upper-division | 2.0 |
-| `3` | Graduate | 3.0 |
+| CSV value | Meaning |
+|-----------|---------|
+| `1` | Lower-division / intro |
+| `2` | Upper-division |
+| `3` | Graduate |
 
-Rows with an unrecognised tier value or an unparseable seat count are skipped with a warning logged.
+Any positive integer is accepted — use higher values to give a cohort stronger scheduling priority without a code change. Rows with a non-positive, non-integer, or missing tier value are skipped with a warning logged.
 
 ### 4.2 Unknown Course Fallback
 
@@ -179,7 +179,7 @@ P(job, lane) = W(course) × Mode(job) × Age(job) / U(course, lane)
 W = tier_weight / sqrt(enrollment)
 ```
 
-Larger courses are naturally penalised so they do not crowd out small graduate sections. Tier weights are fixed at 1 / 2 / 3 for intro / upper / grad.
+Larger courses are naturally penalised so they do not crowd out small graduate sections. The tier weight equals the numeric tier value from the CSV (conventional: 1 lower-div, 2 upper-div, 3 grad; any positive integer accepted).
 
 **Mode** (`scheduler.py:168, 208-209`)
 

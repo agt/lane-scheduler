@@ -12,7 +12,8 @@ Expected CSV columns (order-independent, header required):
         CSE101_SP26_A00,1,210
         CSE150_SP26_A00,2,55
 
-    tier must be 1 (intro/lower), 2 (upper-division), or 3 (graduate).
+    tier must be a positive integer; conventional values are 1 (lower-div),
+    2 (upper-div), 3 (grad), but any positive integer is accepted.
 
 Reload at any time by calling CourseRegistry.load_csv(); the registry is
 replaced atomically so the controller never sees a partially-loaded state.
