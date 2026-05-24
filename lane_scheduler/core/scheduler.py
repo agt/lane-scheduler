@@ -2,7 +2,7 @@
 Cluster Priority Scheduler
 Weighted fair-share scheduling across heterogeneous resource lanes,
 with per-class tier weighting, enrollment normalization, wait-time aging,
-and within-class deficit round-robin.
+and within-class fair scheduling via minimum-running-then-oldest-job ordering.
 
 Lane model
 ~~~~~~~~~~
@@ -253,32 +253,6 @@ class UtilizationTracker:
         self._events.pop((class_id, lane), None)
 
 
-# ---------------------------------------------------------------------------
-# Deficit tracker (within-class round-robin)
-# ---------------------------------------------------------------------------
-
-class DeficitTracker:
-    """
-    Accrues credit to students while they have waiting jobs,
-    and debits on dispatch.  Highest deficit → promoted next.
-    """
-
-    def __init__(self) -> None:
-        self._deficit: dict[tuple, float] = defaultdict(float)
-
-    def accrue(self, student_id: str, lane: str, dt: float) -> None:
-        self._deficit[(student_id, lane)] += dt
-
-    def debit(self, student_id: str, lane: str, units: float) -> None:
-        self._deficit[(student_id, lane)] -= units
-
-    def deficit(self, student_id: str, lane: str) -> float:
-        return self._deficit[(student_id, lane)]
-
-    def top_student(self, student_ids: set[str], lane: str) -> Optional[str]:
-        if not student_ids:
-            return None
-        return max(student_ids, key=lambda s: self._deficit[(s, lane)])
 
 
 # ---------------------------------------------------------------------------
@@ -336,13 +310,16 @@ class Scheduler:
         self.scorer  = PriorityScorer(self.config)
         self._classes: dict[str, CourseClass] = {}
         self.util    = UtilizationTracker(self.config.utilization_window, lane_capacity)
-        self.deficit = DeficitTracker()
 
-        # Single re-entrant lock protects _classes, _queues, _last_cycle, and
-        # the internal state of self.util and self.deficit (which are not
-        # accessed from outside Scheduler).  Acquisition order: any controller
-        # lock (_pending_lock, _admitted_lock, _running_lock, _running_ctx_lock)
-        # is acquired BEFORE Scheduler._lock, never after.
+        # Per-lane per-student count of currently running pods, set each cycle
+        # by the controller before calling cycle().  Used by _top_student().
+        self._running_counts: dict = {}  # {lane: {student_id: count}}
+
+        # Single re-entrant lock protects _classes, _queues, _running_counts,
+        # and the internal state of self.util (which is not accessed from outside
+        # Scheduler).  Acquisition order: any controller lock (_pending_lock,
+        # _admitted_lock, _running_lock, _running_ctx_lock) is acquired BEFORE
+        # Scheduler._lock, never after.
         self._lock = threading.RLock()
 
         # {lane: {class_id: {student_id: [Job, ...]}}}
@@ -350,13 +327,37 @@ class Scheduler:
             lane: defaultdict(lambda: defaultdict(list))
             for lane in Lane
         }
-        self._last_cycle: float = time.monotonic()
 
     def set_lane_capacity(self, lane_capacity: dict) -> None:
         """Atomically replace the lane-capacity view used for scoring."""
         with self._lock:
             self.lane_capacity = lane_capacity
             self.util._lane_capacity = lane_capacity
+
+    def update_running_counts(self, counts: dict) -> None:
+        """
+        Replace the per-lane per-student running-pod count snapshot.
+
+        Called by the controller at the start of each cycle, before cycle().
+        counts: {lane_str: {student_id: int}}
+        """
+        with self._lock:
+            self._running_counts = counts
+
+    def _top_student(self, active_students: set[str], lane: str,
+                     student_map: dict) -> str:
+        """
+        Return the highest-priority student among *active_students* for *lane*.
+
+        Priority rules (applied in order):
+          1. Fewest currently running pods in this lane.
+          2. Oldest pending job submit_time (FIFO among equally-loaded students).
+        """
+        running_in_lane = self._running_counts.get(lane, {})
+        min_running = min(running_in_lane.get(s, 0) for s in active_students)
+        candidates = [s for s in active_students
+                      if running_in_lane.get(s, 0) == min_running]
+        return min(candidates, key=lambda s: student_map[s][0].submit_time)
 
     def register_class(self, course: CourseClass) -> None:
         with self._lock:
@@ -409,39 +410,28 @@ class Scheduler:
         """
         Run one scheduling cycle.  Returns dispatched jobs.
 
-        1. Compute dt; accrue deficits for students with waiting jobs.
-        2. Per lane: select one candidate per class via deficit round-robin.
-        3. Score candidates; dispatch top-K.
-        4. Update utilization and deficit trackers.
+        1. Per lane: select one candidate per class via _top_student().
+        2. Score candidates; dispatch top-K.
+        3. Update utilization tracker.
         """
         now = now if now is not None else time.monotonic()
         dispatched: list[Job] = []
         log_entries: list[tuple] = []
 
         with self._lock:
-            dt  = now - self._last_cycle
-            self._last_cycle = now
-
             for lane in Lane:
                 lane_queue = self._queues[lane]
                 if not lane_queue:
                     continue
 
-                # Step 1 — accrue deficits
-                for class_id, student_map in lane_queue.items():
-                    course = self._classes[class_id]
-                    for student_id, jobs in list(student_map.items()):
-                        if jobs:
-                            self.deficit.accrue(student_id, lane, dt)
-
-                # Step 2 — one candidate per class
+                # Step 1 — one candidate per class
                 candidates: list[tuple[float, Job, CourseClass]] = []
                 for class_id, student_map in lane_queue.items():
                     course          = self._classes[class_id]
                     active_students = {s for s, jobs in student_map.items() if jobs}
                     if not active_students:
                         continue
-                    student_id = self.deficit.top_student(active_students, lane)
+                    student_id = self._top_student(active_students, lane, student_map)
                     job        = student_map[student_id][0]
                     util       = self.util.utilization(class_id, lane, now)
                     score      = self.scorer.score(job, course, util, now)
@@ -450,7 +440,7 @@ class Scheduler:
                 if not candidates:
                     continue
 
-                # Step 3 — dispatch top-K
+                # Step 2 — dispatch top-K
                 candidates.sort(key=lambda x: x[0], reverse=True)
                 for score, job, course in candidates[: self.config.dispatch_k]:
                     job.dispatch_time = now
@@ -462,7 +452,6 @@ class Scheduler:
                         del self._queues[lane][job.class_id]
 
                     self.util.record(job.class_id, lane, job.resource_units, now)
-                    self.deficit.debit(job.student_id, lane, job.resource_units)
                     dispatched.append(job)
                     log_entries.append((job, lane, score))
 
@@ -493,7 +482,7 @@ class Scheduler:
                 active_students = {s for s, jobs in student_map.items() if jobs}
                 if not active_students:
                     continue
-                student_id = self.deficit.top_student(active_students, lane)
+                student_id = self._top_student(active_students, lane, student_map)
                 job        = student_map[student_id][0]
                 util       = self.util.utilization(class_id, lane, now)
                 score      = self.scorer.score(job, course, util, now)
@@ -520,7 +509,7 @@ class Scheduler:
                 active_students = {s for s, jobs in student_map.items() if jobs}
                 if not active_students:
                     continue
-                student_id = self.deficit.top_student(active_students, lane)
+                student_id = self._top_student(active_students, lane, student_map)
                 job        = student_map[student_id][0]
                 util       = self.util.utilization(class_id, lane, now)
                 score      = self.scorer.score(job, course, util, now)
@@ -556,7 +545,7 @@ class Scheduler:
                 active  = {s for s, jobs in student_map.items() if jobs}
                 if not active:
                     continue
-                student_id = self.deficit.top_student(active, lane)
+                student_id = self._top_student(active, lane, student_map)
                 job        = student_map[student_id][0]
                 util       = self.util.utilization(class_id, lane, now)
                 scores[class_id] = self.scorer.score(job, course, util, now)
