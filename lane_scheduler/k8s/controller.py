@@ -214,6 +214,11 @@ class LaneSchedulerController:
         self._admitted: set[str] = set()
         self._admitted_lock = threading.Lock()
 
+        # Admitted pods not yet Running: uid → (lane, resource_units).
+        # Used by the capacity gate so we don't over-commit a lane.
+        self._admitted_resources: dict[str, tuple[object, float]] = {}
+        self._admitted_resources_lock = threading.Lock()
+
         # Running pods per lane: {lane: {uid: RunningPod}}
         self._running: dict[object, dict[str, RunningPod]] = {}
         self._running_lock = threading.Lock()
@@ -442,11 +447,9 @@ class LaneSchedulerController:
         except Exception:
             return None
 
-        gpu_lane   = _gpu_lane(pod)
-        _, has_gpu = _resource_units(pod, gpu_lane)
-        batch      = _is_batch(pod)
+        gpu_lane = _gpu_lane(pod)
+        batch    = _is_batch(pod)
 
-        # resource_units — reuse pod_translator logic
         from lane_scheduler.k8s.pod_translator import _resource_units as _ru
         units = _ru(pod, gpu_lane)
 
@@ -613,6 +616,8 @@ class LaneSchedulerController:
             was_pending = self._pending.pop(uid, None) is not None
         with self._admitted_lock:
             self._admitted.discard(uid)
+        with self._admitted_resources_lock:
+            self._admitted_resources.pop(uid, None)
         self._ignored_gpu_class.discard(uid)
         with self._admit_attempts_lock:
             self._admit_attempts.pop(uid, None)
@@ -751,6 +756,22 @@ class LaneSchedulerController:
             return
 
         now       = time.monotonic()
+
+        # Snapshot running units per lane before the cycle so the gate has a
+        # consistent baseline that is unaffected by concurrent pod-watch events.
+        with self._running_lock:
+            running_units: dict = {
+                lane: sum(rp.resource_units for rp in pods.values())
+                for lane, pods in self._running.items()
+            }
+
+        # Snapshot admitted-but-not-running units; augmented in the loop below
+        # so jobs committed earlier in the same cycle are visible to later ones.
+        with self._admitted_resources_lock:
+            admitted_units: dict = {}
+            for _uid, (lane, units) in self._admitted_resources.items():
+                admitted_units[lane] = admitted_units.get(lane, 0.0) + units
+
         dispatched = self.scheduler.cycle(now=now)
 
         if not dispatched:
@@ -777,9 +798,37 @@ class LaneSchedulerController:
                         pass
                 continue
 
+            # Capacity gate: only admit if genuine free capacity exists.
+            lane_cap = caps.get(job.lane, 0.0)
+            running  = running_units.get(job.lane, 0.0)
+            admitted = admitted_units.get(job.lane, 0.0)
+            free     = lane_cap - running - admitted
+            if free < job.resource_units:
+                with self._pending_lock:
+                    pod = self._pending.get(job.job_id)
+                if pod is not None:
+                    try:
+                        self.scheduler.submit(job)
+                    except ValueError:
+                        pass
+                logger.debug(
+                    "Capacity gate: deferred %s (need=%.1f free=%.1f lane=%s)",
+                    job.job_id, job.resource_units, free, job.lane.name,
+                )
+                continue
+
+            # Speculatively record before the patch so later jobs in this cycle
+            # see the reservation; rolled back below if _pop_pending fails.
+            with self._admitted_resources_lock:
+                self._admitted_resources[job.job_id] = (job.lane, job.resource_units)
+            admitted_units[job.lane] = admitted + job.resource_units
+
             pod = self._pop_pending(job.job_id)
             if pod is None:
                 logger.warning("Dispatched job %s has no matching pending pod", job.job_id)
+                with self._admitted_resources_lock:
+                    self._admitted_resources.pop(job.job_id, None)
+                admitted_units[job.lane] -= job.resource_units
                 continue
             self._admit_pod(pod, job)
 
@@ -833,6 +882,9 @@ class LaneSchedulerController:
                 job.wait_seconds(now=time.monotonic()),
             )
         except client.exceptions.ApiException as exc:
+            # Patch failed — release the speculative capacity reservation.
+            with self._admitted_resources_lock:
+                self._admitted_resources.pop(uid, None)
             if exc.status == 404:
                 logger.info("Pod %s/%s vanished before admission — skipping", namespace, name)
                 with self._admit_attempts_lock:
