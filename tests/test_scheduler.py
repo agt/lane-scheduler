@@ -148,20 +148,20 @@ class TestDeficitTracker(unittest.TestCase):
 
     def test_accrual(self):
         dt = DeficitTracker()
-        dt.accrue("S1", _cpu(), class_weight=1.0, dt=10.0)
+        dt.accrue("S1", _cpu(), dt=10.0)
         self.assertAlmostEqual(dt.deficit("S1", _cpu()), 10.0)
 
     def test_debit(self):
         dt = DeficitTracker()
-        dt.accrue("S1", _cpu(), class_weight=1.0, dt=10.0)
+        dt.accrue("S1", _cpu(), dt=10.0)
         dt.debit("S1", _cpu(), units=3.0)
         self.assertAlmostEqual(dt.deficit("S1", _cpu()), 7.0)
 
     def test_top_student(self):
         dt = DeficitTracker()
-        dt.accrue("S1", _cpu(), class_weight=1.0, dt=5.0)
-        dt.accrue("S2", _cpu(), class_weight=1.0, dt=20.0)
-        dt.accrue("S3", _cpu(), class_weight=1.0, dt=10.0)
+        dt.accrue("S1", _cpu(), dt=5.0)
+        dt.accrue("S2", _cpu(), dt=20.0)
+        dt.accrue("S3", _cpu(), dt=10.0)
         self.assertEqual(dt.top_student({"S1", "S2", "S3"}, _cpu()), "S2")
 
 

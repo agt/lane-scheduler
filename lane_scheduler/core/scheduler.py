@@ -300,9 +300,8 @@ class DeficitTracker:
     def __init__(self) -> None:
         self._deficit: dict[tuple, float] = defaultdict(float)
 
-    def accrue(self, student_id: str, lane: "IntEnum",
-               class_weight: float, dt: float) -> None:
-        self._deficit[(student_id, lane)] += class_weight * dt
+    def accrue(self, student_id: str, lane: "IntEnum", dt: float) -> None:
+        self._deficit[(student_id, lane)] += dt
 
     def debit(self, student_id: str, lane: "IntEnum", units: float) -> None:
         self._deficit[(student_id, lane)] -= units
@@ -467,7 +466,7 @@ class Scheduler:
                     course = self._classes[class_id]
                     for student_id, jobs in list(student_map.items()):
                         if jobs:
-                            self.deficit.accrue(student_id, lane, course.class_weight, dt)
+                            self.deficit.accrue(student_id, lane, dt)
 
                 # Step 2 — one candidate per class
                 candidates: list[tuple[float, Job, CourseClass]] = []
