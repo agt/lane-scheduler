@@ -34,7 +34,10 @@ except ImportError:
 
 from lane_scheduler.core.scheduler import Job, Lane, SchedulerConfig, Scheduler, initialise_lanes, lane_for_gpu_class, is_known_gpu_class
 from lane_scheduler.core.course_registry import CourseRegistry
-from lane_scheduler.core.node_capacity import NodeCapacityTracker
+from lane_scheduler.core.node_capacity import (
+    NodeCapacityTracker,
+    INHIBIT_TAINT_KEY, INHIBIT_TAINT_VALUE, GPU_CLASS_LABEL_KEY,
+)
 from lane_scheduler.k8s.pod_translator import (
     NO_COURSE_LABEL,
     LABEL_COURSE,
@@ -134,6 +137,11 @@ EWMA_ALPHA           = _env_float("LANE_EWMA_ALPHA",             0.1)  # residen
 NO_UNKNOWN_GPU_CLASS_EVENTS = os.environ.get(
     "LANE_NO_UNKNOWN_GPU_CLASS_EVENTS", ""
 ).lower() in ("1", "true", "yes")
+
+# Environment variable fallbacks for flags that previously had no env-var equivalent
+KUBECONFIG = os.environ.get("KUBECONFIG")                                    # standard k8s convention
+LOG_LEVEL  = os.environ.get("LANE_LOG_LEVEL", "INFO").upper()
+DRY_RUN    = os.environ.get("LANE_DRY_RUN", "").lower() in ("1", "true", "yes")
 
 # Admission retry / circuit breaker
 _MAX_ADMIT_ATTEMPTS = 5
@@ -979,24 +987,71 @@ class LaneSchedulerController:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Lane-based Priority Scheduler")
-    p.add_argument("--kubeconfig", default=None,
-                   help="Path to kubeconfig (omit to use in-cluster config)")
+
+    # --- Kubernetes connection ---
+    p.add_argument("--kubeconfig", default=KUBECONFIG,
+                   help="Path to kubeconfig (default: $KUBECONFIG; omit for in-cluster config)")
+
+    # --- Course registry ---
     p.add_argument("--course-csv", default=COURSE_CSV,
                    help="Path to registrar CSV (default: %(default)s)")
-    p.add_argument("--cycle-interval", type=float, default=CYCLE_INTERVAL,
-                   help="Scheduling cycle interval in seconds (default: %(default)s)")
     p.add_argument("--reload-interval", type=float, default=RELOAD_INTERVAL,
                    help="CSV reload interval in seconds (default: %(default)s)")
-    p.add_argument("--wait-cache-interval", type=float, default=WAIT_CACHE_INTERVAL,
-                   help="Wait-time cache refresh interval in seconds (default: %(default)s)")
+
+    # --- Scheduling cycle ---
+    p.add_argument("--cycle-interval", type=float, default=CYCLE_INTERVAL,
+                   help="Scheduling cycle interval in seconds (default: %(default)s)")
+    p.add_argument("--dispatch-k", type=int, default=DISPATCH_K,
+                   help="Max jobs admitted per lane per cycle (default: %(default)s)")
+
+    # --- Priority scoring formula ---
+    p.add_argument("--alpha", type=float, default=ALPHA,
+                   help="Aging boost scale α in P=W×Mode×Age/U (default: %(default)s)")
+    p.add_argument("--t-half-interactive", type=float, default=T_HALF_INTERACTIVE,
+                   help="Interactive aging half-life in seconds (default: %(default)s)")
+    p.add_argument("--t-half-batch", type=float, default=T_HALF_BATCH,
+                   help="Batch aging half-life in seconds (default: %(default)s)")
+    p.add_argument("--epsilon", type=float, default=EPSILON,
+                   help="Utilization floor epsilon (default: %(default)s)")
+    p.add_argument("--util-window", type=float, default=UTIL_WINDOW,
+                   help="Utilization rolling window in seconds (default: %(default)s)")
+
+    # --- Residency priors ---
+    p.add_argument("--interactive-mean-pct", type=float, default=INTERACTIVE_MEAN_PCT,
+                   help="Interactive residency mean as fraction of deadline (default: %(default)s)")
+    p.add_argument("--interactive-std-pct", type=float, default=INTERACTIVE_STD_PCT,
+                   help="Interactive residency std as fraction of deadline (default: %(default)s)")
+    p.add_argument("--batch-mean-pct", type=float, default=BATCH_MEAN_PCT,
+                   help="Batch residency mean as fraction of deadline (default: %(default)s)")
+    p.add_argument("--batch-std-pct", type=float, default=BATCH_STD_PCT,
+                   help="Batch residency std as fraction of deadline (default: %(default)s)")
     p.add_argument("--prior-weight", type=float, default=PRIOR_WEIGHT,
                    help="Bayesian prior pseudo-count for per-course residency (default: %(default)s)")
     p.add_argument("--ewma-alpha", type=float, default=EWMA_ALPHA,
                    help="EWMA smoothing factor for per-course residency (0,1); higher = faster adaptation (default: %(default)s)")
+
+    # --- Wait-time cache ---
+    p.add_argument("--wait-cache-interval", type=float, default=WAIT_CACHE_INTERVAL,
+                   help="Wait-time cache refresh interval in seconds (default: %(default)s)")
+
+    # --- Kubernetes label/taint wiring ---
+    p.add_argument("--course-label", default=LABEL_COURSE,
+                   help="Pod label key for course identifier (default: %(default)s)")
+    p.add_argument("--pod-gpu-class-label", default=LABEL_GPU_CLASS,
+                   help="Pod label key for requested GPU class (default: %(default)s)")
+    p.add_argument("--node-gpu-class-label", default=GPU_CLASS_LABEL_KEY,
+                   help="Node label key for GPU class (default: %(default)s)")
+    p.add_argument("--inhibit-taint-key", default=INHIBIT_TAINT_KEY,
+                   help="Inhibitory scheduling-gate taint key (default: %(default)s)")
+    p.add_argument("--inhibit-taint-value", default=INHIBIT_TAINT_VALUE,
+                   help="Inhibitory scheduling-gate taint value (default: %(default)s)")
+
+    # --- Operational ---
     p.add_argument("--web-port", type=int, default=WEB_PORT,
                    help="Port for the queue-snapshot dashboard (0 = disabled, default: %(default)s)")
-    p.add_argument("--dry-run", action="store_true", default=False,
-                   help="Log what would be done without patching pods or creating events")
+    p.add_argument("--dry-run", action="store_true", default=DRY_RUN,
+                   help="Log what would be done without patching pods or creating events "
+                        "(also set via LANE_DRY_RUN=true)")
     p.add_argument("--no-unknown-gpu-class-events", action="store_true",
                    default=NO_UNKNOWN_GPU_CLASS_EVENTS,
                    help=(
@@ -1005,8 +1060,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        "ungated GPU classes coexist in the same cluster). "
                        "Also set via LANE_NO_UNKNOWN_GPU_CLASS_EVENTS=true."
                    ))
-    p.add_argument("--log-level", default="INFO",
-                   choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p.add_argument("--log-level", default=LOG_LEVEL,
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                   help="Logging verbosity (also set via LANE_LOG_LEVEL, default: %(default)s)")
     return p
 
 
@@ -1017,6 +1073,24 @@ def main() -> None:
         format  = "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
         datefmt = "%Y-%m-%dT%H:%M:%S",
     )
+
+    # Propagate CLI overrides for Kubernetes wiring to every module that reads them.
+    # These modules capture env vars as module-level constants at import time; updating
+    # the attributes here ensures CLI flags take precedence regardless of import order.
+    import lane_scheduler.core.node_capacity as _nc
+    import lane_scheduler.k8s.pod_translator as _pt
+    _nc.INHIBIT_TAINT_KEY   = args.inhibit_taint_key
+    _nc.INHIBIT_TAINT_VALUE = args.inhibit_taint_value
+    _nc.GPU_CLASS_LABEL_KEY = args.node_gpu_class_label
+    _pt.INHIBIT_TAINT_KEY   = args.inhibit_taint_key
+    _pt.INHIBIT_TAINT_VALUE = args.inhibit_taint_value
+    _pt.LABEL_COURSE        = args.course_label
+    _pt.LABEL_GPU_CLASS     = args.pod_gpu_class_label
+    # Also update the names imported into this module's own namespace, which are
+    # referenced by _enqueue() and _upsert_running() as module globals.
+    _g = globals()
+    _g['LABEL_COURSE']    = args.course_label
+    _g['LABEL_GPU_CLASS'] = args.pod_gpu_class_label
 
     # Load Kubernetes config
     if args.kubeconfig:
@@ -1047,29 +1121,29 @@ def main() -> None:
                        csv_path)
 
     sched_config = SchedulerConfig(
-        alpha               = ALPHA,
-        t_half_interactive  = T_HALF_INTERACTIVE,
-        t_half_batch        = T_HALF_BATCH,
-        epsilon             = EPSILON,
-        utilization_window  = UTIL_WINDOW,
-        dispatch_k          = DISPATCH_K,
+        alpha               = args.alpha,
+        t_half_interactive  = args.t_half_interactive,
+        t_half_batch        = args.t_half_batch,
+        epsilon             = args.epsilon,
+        utilization_window  = args.util_window,
+        dispatch_k          = args.dispatch_k,
     )
 
     residency_profiles = {
         "interactive": ResidencyProfile(
-            mean_pct = INTERACTIVE_MEAN_PCT,
-            std_pct  = INTERACTIVE_STD_PCT,
+            mean_pct = args.interactive_mean_pct,
+            std_pct  = args.interactive_std_pct,
         ),
         "batch": ResidencyProfile(
-            mean_pct = BATCH_MEAN_PCT,
-            std_pct  = BATCH_STD_PCT,
+            mean_pct = args.batch_mean_pct,
+            std_pct  = args.batch_std_pct,
         ),
     }
     logger.info(
         "Residency profiles — interactive: mean=%.0f%% std=%.0f%%  "
         "batch: mean=%.0f%% std=%.0f%%",
-        INTERACTIVE_MEAN_PCT * 100, INTERACTIVE_STD_PCT * 100,
-        BATCH_MEAN_PCT * 100,       BATCH_STD_PCT * 100,
+        args.interactive_mean_pct * 100, args.interactive_std_pct * 100,
+        args.batch_mean_pct * 100,       args.batch_std_pct * 100,
     )
 
     controller = LaneSchedulerController(
