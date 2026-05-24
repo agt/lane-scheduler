@@ -59,7 +59,7 @@ Every managed node carries an inhibitory taint (`dsmlp/scheduling-gate=controlle
 P(job, lane) = W(course) × Mode(job) × Age(job) / U(course, lane)
 ```
 
-- **W** = `tier_weight / √enrollment`  (tier_weight = tier value from CSV; conventional: 1 lower-div, 2 upper-div, 3 grad)
+- **W** = `class_weight` supplied directly from the course CSV (positive float)
 - **Mode** = 1.0 (interactive) or 0.3 (batch)
 - **Age** = `1 + α × log(1 + wait / t_half)`  (logarithmic, prevents starvation)
 - **U** = 5-minute rolling utilization (idle courses score higher)
@@ -96,8 +96,8 @@ All defaults live in `controller.py` lines ~98–127. The most operationally rel
 ```
 lane_scheduler/
   core/
-    scheduler.py        # Priority scoring, Lane enum, Scheduler, DeficitTracker
-    course_registry.py  # Loads/parses registrar CSV; tier inference
+    scheduler.py        # Priority scoring, Lane strings, Scheduler
+    course_registry.py  # Loads/parses registrar CSV; course weight lookup
     node_capacity.py    # Watches node labels; aggregates per-lane capacity
   k8s/
     controller.py       # Thread orchestration; Kubernetes API calls

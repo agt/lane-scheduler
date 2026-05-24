@@ -1,7 +1,7 @@
 """
 Cluster Priority Scheduler
 Weighted fair-share scheduling across heterogeneous resource lanes,
-with per-class tier weighting, enrollment normalization, wait-time aging,
+with per-class weight-based priority, wait-time aging,
 and within-class fair scheduling via minimum-running-then-oldest-job ordering.
 
 Lane model
@@ -172,18 +172,8 @@ class SchedulerConfig:
 @dataclass
 class CourseClass:
     """A class section registered with the scheduler."""
-    class_id:   str
-    tier:       int   # arbitrary positive integer; higher → more scheduling weight
-    enrollment: int
-
-    @property
-    def tier_weight(self) -> float:
-        return float(self.tier)
-
-    @property
-    def class_weight(self) -> float:
-        """W(c) = tier_weight / sqrt(enrollment)"""
-        return self.tier_weight / math.sqrt(max(1, self.enrollment))
+    class_id:     str
+    class_weight: float  # scheduling weight supplied directly from the course CSV
 
 
 @dataclass
@@ -281,7 +271,7 @@ class Scheduler:
     """
     Priority scheduler with:
     - Per-lane independent queues (one per GPU class + CPU)
-    - Tier-weighted, enrollment-normalized class weights
+    - Per-class scheduling weights supplied externally (from course CSV)
     - Log-aging wait boost with batch/interactive half-lives
     - Batch mode penalty keeps interactive jobs preferred
     - Fewest-running-then-oldest-submit student ordering within each class
@@ -353,9 +343,8 @@ class Scheduler:
         with self._lock:
             self._classes[course.class_id] = course
         logger.info(
-            "Registered class %s (tier=%s enrollment=%d weight=%.4f)",
-            course.class_id, course.tier,
-            course.enrollment, course.class_weight,
+            "Registered class %s (weight=%.4f)",
+            course.class_id, course.class_weight,
         )
 
     def has_class(self, class_id: str) -> bool:

@@ -37,8 +37,8 @@ CAPACITY = lambda: {
 # Helpers
 # ---------------------------------------------------------------------------
 
-def make_course(class_id="TEST-101", tier=1, enrollment=100):
-    return CourseClass(class_id=class_id, tier=tier, enrollment=enrollment)
+def make_course(class_id="TEST-101", weight=1.0):
+    return CourseClass(class_id=class_id, class_weight=weight)
 
 
 def make_job(job_id="J001", class_id="TEST-101", student_id="S001",
@@ -58,21 +58,16 @@ def make_job(job_id="J001", class_id="TEST-101", student_id="S001",
 
 class TestCourseWeight(unittest.TestCase):
 
-    def test_tier_ordering(self):
-        intro = make_course(tier=1,     enrollment=100)
-        upper = make_course(tier=2, enrollment=100)
-        grad  = make_course(tier=3,      enrollment=100)
-        self.assertLess(intro.class_weight, upper.class_weight)
-        self.assertLess(upper.class_weight, grad.class_weight)
+    def test_weight_stored_directly(self):
+        c = make_course(weight=0.75)
+        self.assertAlmostEqual(c.class_weight, 0.75)
 
-    def test_enrollment_penalty(self):
-        small = make_course(tier=1, enrollment=20)
-        large = make_course(tier=1, enrollment=200)
-        self.assertGreater(small.class_weight, large.class_weight)
-
-    def test_sqrt_scaling(self):
-        c = make_course(tier=3, enrollment=25)
-        self.assertAlmostEqual(c.class_weight, 3.0 / math.sqrt(25))
+    def test_weight_ordering(self):
+        low  = make_course(weight=0.1)
+        mid  = make_course(weight=0.5)
+        high = make_course(weight=1.0)
+        self.assertLess(low.class_weight, mid.class_weight)
+        self.assertLess(mid.class_weight, high.class_weight)
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +79,7 @@ class TestPriorityScorer(unittest.TestCase):
     def setUp(self):
         self.cfg    = SchedulerConfig()
         self.scorer = PriorityScorer(self.cfg)
-        self.course = make_course(tier=3, enrollment=16)
+        self.course = make_course(weight=0.75)
 
     def test_age_boost_increases_with_wait(self):
         j0 = make_job(submit_time=1000.0)
@@ -233,8 +228,8 @@ class TestScheduler(unittest.TestCase):
             lane_capacity=CAPACITY(),
             config=SchedulerConfig(dispatch_k=4),
         )
-        self.intro = make_course("INTRO-101", 1,  200)
-        self.grad  = make_course("GRAD-301",  3,    10)
+        self.intro = make_course("INTRO-101", weight=0.07)
+        self.grad  = make_course("GRAD-301",  weight=0.77)
         self.sched.register_class(self.intro)
         self.sched.register_class(self.grad)
 
@@ -269,7 +264,7 @@ class TestScheduler(unittest.TestCase):
 
     def test_wait_time_boosts_priority(self):
         scorer = PriorityScorer(SchedulerConfig())
-        course = make_course(tier=3, enrollment=9)
+        course = make_course(weight=1.0)
         old_job   = make_job(submit_time=0.0)
         fresh_job = make_job(submit_time=7200.0)
         self.assertGreater(
@@ -388,7 +383,7 @@ class TestRemoveJob(unittest.TestCase):
 
     def setUp(self):
         self.s = Scheduler(lane_capacity=CAPACITY())
-        self.s.register_class(make_course("CSE-100", 2, 50))
+        self.s.register_class(make_course("CSE-100"))
 
     def test_remove_unknown_returns_none(self):
         self.assertIsNone(self.s.remove_job("does-not-exist"))
@@ -431,7 +426,7 @@ class TestConcurrentSubmitCycle(unittest.TestCase):
 
         s = Scheduler(lane_capacity=CAPACITY())
         for cid in ("CSE-100", "CSE-200", "CSE-300"):
-            s.register_class(make_course(cid, 2, 50))
+            s.register_class(make_course(cid))
 
         stop = threading.Event()
         errors: list[Exception] = []

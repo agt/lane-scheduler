@@ -43,7 +43,7 @@ def _gpu(cls):
 
 def _write_csv(rows):
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False)
-    writer = csv.DictWriter(tmp, fieldnames=["course_id", "tier", "seats"])
+    writer = csv.DictWriter(tmp, fieldnames=["course_id", "weight"])
     writer.writeheader()
     writer.writerows(rows)
     tmp.close()
@@ -113,54 +113,52 @@ class TestCourseRegistry(unittest.TestCase):
 
     def test_csv_load(self):
         path = _write_csv([
-            {"course_id": "CSE101_SP26_A00", "tier": 2, "seats": 55},
-            {"course_id": "CSE234_SP26_A00", "tier": 3, "seats": 18},
+            {"course_id": "CSE101_SP26_A00", "weight": 0.270},
+            {"course_id": "CSE234_SP26_A00", "weight": 0.775},
         ])
         reg = CourseRegistry()
         self.assertEqual(reg.load_csv(path), 2)
         c = reg.get("CSE101_SP26_A00")
-        self.assertEqual(c.tier, 2)
-        self.assertEqual(c.enrollment, 55)
+        self.assertAlmostEqual(c.class_weight, 0.270)
 
-    def test_all_tier_values(self):
+    def test_weight_values(self):
         path = _write_csv([
-            {"course_id": "A", "tier": 1, "seats": 200},
-            {"course_id": "B", "tier": 2, "seats": 60},
-            {"course_id": "C", "tier": 3, "seats": 15},
+            {"course_id": "A", "weight": 0.07},
+            {"course_id": "B", "weight": 0.27},
+            {"course_id": "C", "weight": 0.77},
         ])
         reg = CourseRegistry()
         reg.load_csv(path)
-        self.assertEqual(reg.get("A").tier, 1)
-        self.assertEqual(reg.get("B").tier, 2)
-        self.assertEqual(reg.get("C").tier, 3)
+        self.assertAlmostEqual(reg.get("A").class_weight, 0.07)
+        self.assertAlmostEqual(reg.get("B").class_weight, 0.27)
+        self.assertAlmostEqual(reg.get("C").class_weight, 0.77)
 
     def test_fallback_on_unknown_course(self):
         reg = CourseRegistry()
         c   = reg.get("UNKNOWN_SP26_A00")
-        self.assertEqual(c.tier, 1)
-        self.assertEqual(c.enrollment, 200)
+        self.assertAlmostEqual(c.class_weight, 1.0)
 
     def test_fallback_cached(self):
         reg = CourseRegistry()
         self.assertIs(reg.get("CSE101_SP26_A00"), reg.get("CSE101_SP26_A00"))
 
     def test_missing_column_raises(self):
-        tmp = _write_csv([{"course_id": "X", "tier": 1, "seats": 10}])
-        tmp.write_text("course_id,tier\nX,1\n")
+        tmp = _write_csv([{"course_id": "X", "weight": 1.0}])
+        tmp.write_text("course_id\nX\n")
         with self.assertRaises(ValueError):
             CourseRegistry().load_csv(tmp)
 
-    def test_bad_seat_count_skipped(self):
+    def test_bad_weight_skipped(self):
         path = _write_csv([
-            {"course_id": "CSE101_SP26_A00", "tier": 2, "seats": "bad"},
-            {"course_id": "CSE234_SP26_A00", "tier": 3, "seats": "18"},
+            {"course_id": "CSE101_SP26_A00", "weight": "bad"},
+            {"course_id": "CSE234_SP26_A00", "weight": 0.77},
         ])
         self.assertEqual(CourseRegistry().load_csv(path), 1)
 
-    def test_bad_tier_skipped(self):
+    def test_nonpositive_weight_skipped(self):
         path = _write_csv([
-            {"course_id": "CSE101_SP26_A00", "tier": "bad", "seats": 55},
-            {"course_id": "CSE234_SP26_A00", "tier": 3, "seats": 18},
+            {"course_id": "CSE101_SP26_A00", "weight": -1.0},
+            {"course_id": "CSE234_SP26_A00", "weight": 0.77},
         ])
         self.assertEqual(CourseRegistry().load_csv(path), 1)
 
@@ -406,7 +404,7 @@ class TestBatchModePenalty(unittest.TestCase):
         self.cfg    = SchedulerConfig()
         self.scorer = PriorityScorer(self.cfg)
         from lane_scheduler.core.scheduler import CourseClass
-        self.course = CourseClass("C", 3, 16)
+        self.course = CourseClass("C", class_weight=0.75)
 
     def test_interactive_beats_batch(self):
         si = self.scorer.score(self._job(False), self.course, 0.1, 100.0)

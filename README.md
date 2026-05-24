@@ -96,7 +96,7 @@ P(j, l) = W(c) × Mode(j) × Age(j) / U(c, l)
 W(c) = tier_weight(c) / √enrollment(c)
 ```
 
-The tier weight equals the numeric tier value from the course CSV (a positive integer). Conventional assignments are 1 for lower-division, 2 for upper-division, and 3 for graduate, but any positive integer is accepted — allowing fine-grained priority bands without code changes. The square-root enrollment denominator softens but does not eliminate the size difference — a 200-student intro class gets less weight than a 12-student grad seminar, but is not ignored entirely.
+The class weight `W` is supplied directly as a positive float in the course CSV. A grad seminar can be given a weight of `0.775` and a large intro course `0.071`; any positive value is accepted. How the weight is computed (e.g. `tier / sqrt(enrollment)`) is left to the operator — the scheduler uses the value as-is.
 
 **`Mode(j)` — Batch Penalty**
 
@@ -128,13 +128,13 @@ When multiple students in the same course have jobs waiting, the scheduler selec
 Course metadata is loaded from a CSV file exported daily from the university registrar:
 
 ```
-course_id,tier,seats
-CSE234_SP26_A00,3,18
-CSE10_SP26_A00,1,210
-CSE150_SP26_A00,2,55
+course_id,weight
+CSE234_SP26_A00,0.775
+CSE10_SP26_A00,0.069
+CSE150_SP26_A00,0.270
 ```
 
-`tier` is a positive integer used directly as the scheduling weight. Conventional values are 1 (lower-division), 2 (upper-division), and 3 (graduate); any positive integer is accepted for finer-grained priority bands. If a pod references a course not in the registry, the scheduler defaults to tier 1 and 200 seats, logging a warning.
+`weight` is a positive float used directly as `W` in the priority formula. The operator is free to compute it however makes sense (e.g. `tier / sqrt(enrollment)`). If a pod references a course not in the registry, the scheduler defaults to `weight=1.0`, logging a warning.
 
 ---
 

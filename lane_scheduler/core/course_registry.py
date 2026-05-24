@@ -1,19 +1,18 @@
 """
 Course Registry
 ---------------
-Loads course metadata (tier + enrollment) from a CSV file exported by the
-registrar.  Pods that reference an unknown course default to tier 1 and
-200 seats.
+Loads course metadata (scheduling weight) from a CSV file exported by the
+registrar.  Pods that reference an unknown course default to weight 1.0.
 
 Expected CSV columns (order-independent, header required):
-    course_id, tier, seats
+    course_id, weight
     e.g.:
-        CSE234_SP26_A00,3,18
-        CSE101_SP26_A00,1,210
-        CSE150_SP26_A00,2,55
+        CSE234_SP26_A00,0.775
+        CSE101_SP26_A00,0.071
+        CSE150_SP26_A00,0.270
 
-    tier must be a positive integer; conventional values are 1 (lower-div),
-    2 (upper-div), 3 (grad), but any positive integer is accepted.
+    weight must be a positive float.  It is used directly as W in the
+    priority formula P = W × Mode × Age / U.
 
 Reload at any time by calling CourseRegistry.load_csv(); the registry is
 replaced atomically so the controller never sees a partially-loaded state.
@@ -30,8 +29,7 @@ from lane_scheduler.core.scheduler import CourseClass
 
 logger = logging.getLogger(__name__)
 
-_FALLBACK_TIER       = 1
-_FALLBACK_ENROLLMENT = 200
+_FALLBACK_WEIGHT = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +64,7 @@ class CourseRegistry:
 
         with open(path, newline="", encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
-            required = {"course_id", "tier", "seats"}
+            required = {"course_id", "weight"}
             if not reader.fieldnames:
                 raise ValueError(f"CSV {path} appears to be empty")
             missing = required - {f.strip().lower() for f in reader.fieldnames}
@@ -78,21 +76,15 @@ class CourseRegistry:
                 if not course_id:
                     continue
                 try:
-                    seats = int(row["seats"].strip())
+                    weight = float(row["weight"].strip())
+                    if weight <= 0:
+                        raise ValueError("weight must be positive")
                 except ValueError:
-                    logger.warning("Bad seat count for %s (%r) — skipping",
-                                   course_id, row["seats"])
-                    continue
-                try:
-                    tier = int(row["tier"].strip())
-                    if tier <= 0:
-                        raise ValueError("tier must be positive")
-                except ValueError:
-                    logger.warning("Bad tier %r for %s — skipping",
-                                   row["tier"], course_id)
+                    logger.warning("Bad weight %r for %s — skipping",
+                                   row["weight"], course_id)
                     continue
                 new_courses[course_id] = CourseClass(
-                    class_id=course_id, tier=tier, enrollment=seats
+                    class_id=course_id, class_weight=weight
                 )
 
         with self._lock:
@@ -108,7 +100,7 @@ class CourseRegistry:
     def get(self, course_id: str) -> CourseClass:
         """
         Return the CourseClass for *course_id*.  If unknown, return a synthetic
-        entry with tier=1 and enrollment=200, and log a warning.  Never raises.
+        entry with weight=1.0 and log a warning.  Never raises.
         """
         with self._lock:
             course = self._courses.get(course_id)
@@ -117,13 +109,12 @@ class CourseRegistry:
             return course
 
         logger.warning(
-            "Unknown course %r — defaulting to tier=%d enrollment=%d",
-            course_id, _FALLBACK_TIER, _FALLBACK_ENROLLMENT,
+            "Unknown course %r — defaulting to weight=%.3f",
+            course_id, _FALLBACK_WEIGHT,
         )
         synthetic = CourseClass(
-            class_id   = course_id,
-            tier       = _FALLBACK_TIER,
-            enrollment = _FALLBACK_ENROLLMENT,
+            class_id     = course_id,
+            class_weight = _FALLBACK_WEIGHT,
         )
 
         # Cache the synthetic entry so repeated lookups don't keep warning
