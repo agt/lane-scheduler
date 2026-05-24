@@ -100,9 +100,7 @@ footer span{white-space:nowrap;display:flex;align-items:center;gap:5px}
       <thead>
         <tr>
           <th>Course</th>
-          <th>Tier</th>
-          <th class="r">Enroll</th>
-          <th class="r">Wt</th>
+          <th class="r">Weight</th>
           <th>Lane</th>
           <th class="r">Running</th>
           <th class="r">Queued</th>
@@ -110,7 +108,7 @@ footer span{white-space:nowrap;display:flex;align-items:center;gap:5px}
           <th>Tail wait (P80)</th>
         </tr>
       </thead>
-      <tbody id="course-body"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody>
+      <tbody id="course-body"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
     </table>
   </div>
 </main>
@@ -169,16 +167,11 @@ function renderLanes(lanes) {
   }).join('');
 }
 
-function tierBadge(t) {
-  const map = {INTRO:'t-intro', UPPER_DIV:'t-upper', GRAD:'t-grad'};
-  const lbl = {INTRO:'Intro', UPPER_DIV:'Upper', GRAD:'Grad'};
-  return '<span class="badge ' + (map[t]||'') + '">' + (lbl[t]||t) + '</span>';
-}
 
 function renderCourses(courses) {
   const tb = document.getElementById('course-body');
   if (!courses || !courses.length) {
-    tb.innerHTML = '<tr><td colspan="9" class="empty">No courses in queue</td></tr>';
+    tb.innerHTML = '<tr><td colspan="7" class="empty">No courses in queue</td></tr>';
     return;
   }
   const rows = [];
@@ -191,8 +184,6 @@ function renderCourses(courses) {
       if (i === 0) {
         rows.push('<tr>'
           + '<td rowspan="' + n + '"><strong class="mono">' + c.course_id + '</strong></td>'
-          + '<td rowspan="' + n + '">' + tierBadge(c.tier) + '</td>'
-          + '<td class="r" rowspan="' + n + '">' + c.enrollment + '</td>'
           + '<td class="r" rowspan="' + n + '">' + c.weight.toFixed(3) + '</td>'
           + '<td class="mono">' + l.lane_name + '</td>'
           + '<td class="r">' + l.running_count + '</td>'

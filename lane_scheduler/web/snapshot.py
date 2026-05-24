@@ -224,11 +224,9 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
             continue
 
         courses_out.append({
-            "course_id":  course_id,
-            "tier":       course.tier,
-            "enrollment": course.enrollment,
-            "weight":     round(course.class_weight, 4),
-            "lanes":      course_lanes,
+            "course_id": course_id,
+            "weight":    round(course.class_weight, 4),
+            "lanes":     course_lanes,
         })
 
     # Most-queued courses first

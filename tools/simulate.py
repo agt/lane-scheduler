@@ -46,14 +46,17 @@ class SimConfig:
 # Synthetic class definitions
 # ---------------------------------------------------------------------------
 
+import math as _math
+
 CLASSES = [
-    # (class_id, tier, enrollment)
-    ("INTRO-101",    1, 220),
-    ("INTRO-102",    1, 180),
-    ("UPPER-201",    2,  60),
-    ("UPPER-202",    2,  45),
-    ("GRAD-301",     3,  15),
-    ("GRAD-302",     3,  10),
+    # (class_id, weight,                          profile, n_students)
+    # Weights computed as tier / sqrt(enrollment) — adjust externally as needed.
+    ("INTRO-101",  1.0 / _math.sqrt(220),   1, 220),
+    ("INTRO-102",  1.0 / _math.sqrt(180),   1, 180),
+    ("UPPER-201",  2.0 / _math.sqrt(60),    2,  60),
+    ("UPPER-202",  2.0 / _math.sqrt(45),    2,  45),
+    ("GRAD-301",   3.0 / _math.sqrt(15),    3,  15),
+    ("GRAD-302",   3.0 / _math.sqrt(10),    3,  10),
 ]
 
 _TIER_PROFILES = {
@@ -98,15 +101,15 @@ class Stats:
     dispatched_by_class:    dict = field(default_factory=lambda: defaultdict(int))
     wait_by_class:          dict = field(default_factory=lambda: defaultdict(list))
     dispatched_by_lane:     dict = field(default_factory=lambda: defaultdict(int))
-    dispatched_by_tier:     dict = field(default_factory=lambda: defaultdict(int))
+    dispatched_by_profile:  dict = field(default_factory=lambda: defaultdict(int))
 
 
-def record(stats: Stats, job: Job, course: CourseClass) -> None:
+def record(stats: Stats, job: Job, course: CourseClass, profile: int) -> None:
     wait = (job.dispatch_time - job.submit_time)
     stats.dispatched_by_class[job.class_id] += 1
     stats.wait_by_class[job.class_id].append(wait)
     stats.dispatched_by_lane[job.lane] += 1
-    stats.dispatched_by_tier[course.tier] += 1
+    stats.dispatched_by_profile[profile] += 1
 
 
 def print_report(stats: Stats, classes: dict[str, CourseClass],
@@ -117,10 +120,10 @@ def print_report(stats: Stats, classes: dict[str, CourseClass],
     print("=" * 70)
 
     # Per-class table
-    print(f"\n{'Class':<14} {'Tier':<10} {'Enroll':>6} {'Weight':>7} "
+    print(f"\n{'Class':<14} {'Weight':>7} "
           f"{'Submit':>7} {'Dispatched':>10} {'Dispatch%':>10} "
           f"{'AvgWait(s)':>11} {'P95Wait(s)':>11}")
-    print("-" * 90)
+    print("-" * 75)
 
     for class_id, course in sorted(classes.items()):
         submitted  = total_submitted.get(class_id, 0)
@@ -130,14 +133,14 @@ def print_report(stats: Stats, classes: dict[str, CourseClass],
         avg_wait   = statistics.mean(waits) if waits else 0
         p95_wait   = sorted(waits)[int(0.95 * len(waits))] if waits else 0
 
-        print(f"{class_id:<14} {course.tier:<10} {course.enrollment:>6} "
+        print(f"{class_id:<14} "
               f"{course.class_weight:>7.4f} {submitted:>7} {dispatched:>10} "
               f"{pct:>9.1f}% {avg_wait:>11.1f} {p95_wait:>11.1f}")
 
-    # By tier
-    print(f"\n{'--- By Tier ---'}")
-    for tier_name, count in sorted(stats.dispatched_by_tier.items()):
-        print(f"  {tier_name:<12}: {count} jobs dispatched")
+    # By profile
+    print(f"\n{'--- By Profile ---'}")
+    for profile, count in sorted(stats.dispatched_by_profile.items()):
+        print(f"  Profile {profile:<8}: {count} jobs dispatched")
 
     # By lane
     print(f"\n{'--- By Lane ---'}")
@@ -160,21 +163,23 @@ def run(sim_cfg: SimConfig | None = None) -> None:
     scheduler = Scheduler(lane_capacity=sim_cfg.lane_capacity, config=sched_cfg)
 
     courses: dict[str, CourseClass] = {}
-    for class_id, tier, enrollment in CLASSES:
-        c = CourseClass(class_id=class_id, tier=tier, enrollment=enrollment)
+    class_profiles: dict[str, int] = {}  # class_id → profile key (1/2/3)
+    for class_id, weight, profile_key, n_students in CLASSES:
+        c = CourseClass(class_id=class_id, class_weight=weight)
         courses[class_id] = c
+        class_profiles[class_id] = profile_key
         scheduler.register_class(c)
 
     # Pre-generate job submission events
-    # Each student submits jobs at a Poisson rate based on their tier profile
+    # Each student submits jobs at a Poisson rate based on their profile
     events: list[tuple[float, Job]] = []
     job_counter = 0
 
-    for class_id, tier, enrollment in CLASSES:
-        profile = _TIER_PROFILES[tier]
+    for class_id, _weight, profile_key, n_students in CLASSES:
+        profile = _TIER_PROFILES[profile_key]
         rate_per_second = profile["rate"] / 3600.0
 
-        for student_idx in range(enrollment):
+        for student_idx in range(n_students):
             student_id = f"{class_id}-S{student_idx:04d}"
             t = rng.expovariate(rate_per_second)
             while t < sim_cfg.duration:
@@ -195,7 +200,7 @@ def run(sim_cfg: SimConfig | None = None) -> None:
                 t += rng.expovariate(rate_per_second)
 
     events.sort(key=lambda x: x[0])
-    total_students = sum(e for _, _, e in CLASSES)
+    total_students = sum(n for _, _, _, n in CLASSES)
     print(f"Generated {len(events)} job submissions across "
           f"{total_students} students.")
 
@@ -219,7 +224,7 @@ def run(sim_cfg: SimConfig | None = None) -> None:
         # Run scheduling cycle
         dispatched = scheduler.cycle(now=t)
         for job in dispatched:
-            record(stats, job, courses[job.class_id])
+            record(stats, job, courses[job.class_id], class_profiles[job.class_id])
 
         t += sim_cfg.cycle_interval
 

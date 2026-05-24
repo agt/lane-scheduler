@@ -107,7 +107,7 @@ These labels are read from the pod at enqueue time (`pod_translator.py`). They s
 | GPU class | `gpu-class` | `LANE_POD_GPU_CLASS_LABEL` | No | `xsmall` `small` `medium` `large` `xlarge` |
 | Batch mode | `dsmlp/batch` | `LANE_BATCH_LABEL` | No | `"true"` |
 
-**Course label:** Pods without it are bucketed under `__unlabelled__` and scored using fallback tier/enrollment defaults. They are still scheduled but receive no course-aware fairness treatment.
+**Course label:** Pods without it are bucketed under `__unlabelled__` and scored using a fallback weight of 1.0. They are still scheduled but receive no course-aware fairness treatment.
 
 **GPU class label:** Absent → pod is routed to the CPU lane. A value that does not correspond to a lane discovered at startup causes the pod to be ignored (and optionally a Warning event emitted; see [Section 10](#10-scenario-no-event-on-unknown-gpu-class)).
 
@@ -119,34 +119,26 @@ These labels are read from the pod at enqueue time (`pod_translator.py`). They s
 
 ### 4.1 Format
 
-The registrar CSV is the authoritative source of course tier and enrollment data.
+The registrar CSV is the authoritative source of course scheduling weights.
 
 ```
 LANE_COURSE_CSV=/etc/lane-scheduler/courses.csv   (default path)
 ```
 
 ```csv
-course_id,tier,seats
-CSE101_SP26_A00,1,210
-CSE150_SP26_A00,2,55
-CSE234_SP26_A00,3,18
+course_id,weight
+CSE101_SP26_A00,0.069
+CSE150_SP26_A00,0.270
+CSE234_SP26_A00,0.775
 ```
 
 Headers are required; column order is flexible. Blank lines and leading/trailing whitespace are tolerated.
 
-**`tier`** must be a positive integer. It is used directly as the scheduling weight (`tier_weight = tier`). Conventional assignments:
-
-| CSV value | Meaning |
-|-----------|---------|
-| `1` | Lower-division / intro |
-| `2` | Upper-division |
-| `3` | Graduate |
-
-Any positive integer is accepted — use higher values to give a cohort stronger scheduling priority without a code change. Rows with a non-positive, non-integer, or missing tier value are skipped with a warning logged.
+**`weight`** must be a positive float. It is used directly as `W` in the priority formula `P = W × Mode × Age / U`. The operator is responsible for computing meaningful values — a common starting point is `tier / sqrt(enrollment)`, which gives higher-tier and smaller courses stronger weight. Rows with a non-positive, non-numeric, or missing weight are skipped with a warning logged.
 
 ### 4.2 Unknown Course Fallback
 
-If a pod's course label is absent from the CSV, the scheduler uses tier 1 and 200 seats as defaults, logs a warning, and caches the synthetic entry so the warning appears only once per unknown course per registry load.
+If a pod's course label is absent from the CSV, the scheduler defaults to `weight=1.0`, logs a warning, and caches the synthetic entry so the warning appears only once per unknown course per registry load.
 
 ### 4.3 Reloading
 
@@ -179,7 +171,7 @@ P(job, lane) = W(course) × Mode(job) × Age(job) / U(course, lane)
 W = tier_weight / sqrt(enrollment)
 ```
 
-Larger courses are naturally penalised so they do not crowd out small graduate sections. The tier weight equals the numeric tier value from the CSV (conventional: 1 lower-div, 2 upper-div, 3 grad; any positive integer accepted).
+The class weight `W` is supplied directly from the course CSV as a positive float. How it is computed (e.g. `tier / sqrt(enrollment)`) is left to the operator.
 
 **Mode** (`scheduler.py:168, 208-209`)
 

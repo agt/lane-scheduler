@@ -54,8 +54,8 @@ def _make_controller(cycle_interval=10.0):
     return ctrl
 
 
-def _register(ctrl, class_id, tier=1, enrollment=100):
-    course = CourseClass(class_id=class_id, tier=tier, enrollment=enrollment)
+def _register(ctrl, class_id, weight=1.0):
+    course = CourseClass(class_id=class_id, class_weight=weight)
     ctrl.registry._courses[class_id] = course
     ctrl.scheduler.register_class(course)
     return course
@@ -141,8 +141,8 @@ class TestBuildSnapshotWithJobs(unittest.TestCase):
 
     def setUp(self):
         self.ctrl = _make_controller()
-        _register(self.ctrl, "CSE101", tier=1, enrollment=200)
-        _register(self.ctrl, "CSE250", tier=3,  enrollment=40)
+        _register(self.ctrl, "CSE101", weight=0.07)
+        _register(self.ctrl, "CSE250", weight=0.47)
 
     def test_queued_course_appears(self):
         from lane_scheduler.web.snapshot import build_snapshot
@@ -173,9 +173,7 @@ class TestBuildSnapshotWithJobs(unittest.TestCase):
         _submit(self.ctrl, "CSE250", _small(), job_id="J1", student_id="s1")
         snap = build_snapshot(self.ctrl)
         cse250 = next(c for c in snap["courses"] if c["course_id"] == "CSE250")
-        self.assertEqual(cse250["tier"], 3)
-        self.assertEqual(cse250["enrollment"], 40)
-        self.assertAlmostEqual(cse250["weight"], 3.0 / (40 ** 0.5), places=3)
+        self.assertAlmostEqual(cse250["weight"], 0.47, places=2)
 
     def test_tail_wait_absent_for_single_job(self):
         from lane_scheduler.web.snapshot import build_snapshot
@@ -216,7 +214,7 @@ class TestNoPrivateIdentifiers(unittest.TestCase):
 
     def setUp(self):
         self.ctrl = _make_controller()
-        _register(self.ctrl, "CSE101", tier=1, enrollment=100)
+        _register(self.ctrl, "CSE101")
 
     def test_no_student_ids(self):
         from lane_scheduler.web.snapshot import build_snapshot
@@ -230,7 +228,7 @@ class TestNoPrivateIdentifiers(unittest.TestCase):
         from lane_scheduler.web.snapshot import build_snapshot
         from lane_scheduler.k8s.pod_translator import NO_COURSE_LABEL
         ctrl = _make_controller()
-        course = CourseClass(class_id=NO_COURSE_LABEL, tier=1, enrollment=1)
+        course = CourseClass(class_id=NO_COURSE_LABEL, class_weight=1.0)
         ctrl.scheduler._classes[NO_COURSE_LABEL] = course
         job = Job(job_id="J-unlabelled", class_id=NO_COURSE_LABEL,
                   student_id="s1", lane=_cpu())

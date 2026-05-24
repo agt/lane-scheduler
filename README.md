@@ -18,6 +18,14 @@ This scheduler addresses that by:
 
 The scheduler is implemented as a Kubernetes controller. It does not replace the default Kubernetes scheduler; instead it acts as a gating layer, holding pods in a Pending state via node taints until they reach the top of the priority queue, then patching in a toleration that allows the default scheduler to place them normally.
 
+### Scheduling Model
+
+The system operates as a set of independent finite-capacity multi-server queues (lanes), one per GPU hardware class plus one for CPU workloads. Each lane accepts a multi-class open workload of heterogeneous jobs; jobs are held in a pre-admission gate and released in discrete scheduling cycles. The service discipline within each lane is a dynamic non-preemptive priority rule: at each cycle, queued jobs are scored and the top-*K* are admitted subject to a capacity constraint.
+
+The per-job priority score is P(*j*, *l*) = W(*c*) · M(*j*) · A(*j*) / U(*c*, *l*), where W(*c*) is a static operator-assigned class weight, M(*j*) ∈ {0.3, 1.0} is a batch/interactive mode multiplier, A(*j*) = 1 + α log(1 + *t*_w / *t*_½) is a logarithmic age boost parameterised by wait time *t*_w and configurable half-life *t*_½, and U(*c*, *l*) is the rolling-window resource utilisation of class *c* in lane *l* over a recent time window. The utilisation denominator gives the discipline its fairness character: a class currently consuming a large share of lane capacity scores lower than an equally weighted idle class, producing a weighted max-min allocation across active classes analogous to Generalised Processor Sharing (GPS), but approximated in periodic discrete cycles rather than fluid flow. Logarithmic aging is preferred over linear aging to bound runaway priority elevation while still guaranteeing finite waiting — a job's score grows without bound but at a rate that decreases with wait time, suppressing the synchronised burst discharges that arise when many long-waiting jobs simultaneously reach a linear threshold.
+
+Within each class the scheduler applies a secondary max-min fairness rule: among all students with pending jobs in the lane, it selects the one with the fewest currently running pods, breaking ties by earliest submit time. This min-running / FIFO discipline is a discrete analogue of per-user processor sharing, ensuring that no individual student can exhaust a course's dispatch share while holding active sessions. Admission is gated by a closed-loop capacity check — free capacity is computed as total lane capacity minus running resource units minus admitted-but-unplaced resource units — preventing the phantom-capacity over-commitment that arises in two-level scheduling architectures during the interval between pod admission and physical placement. Wait-time estimates are derived by modelling each running pod's residency as a truncated normal random variable; summing completion-probability integrals across all running pods gives the expected freed capacity as a function of time, and bisection inverts this to find the wait percentile corresponding to a job's queue rank. Per-course residency parameters are maintained online via Welford's algorithm with Bayesian shrinkage toward a cluster-wide prior, so estimates converge from prior toward course-specific behaviour as observations accumulate.
+
 ---
 
 ## Architecture Overview
@@ -96,7 +104,7 @@ P(j, l) = W(c) × Mode(j) × Age(j) / U(c, l)
 W(c) = tier_weight(c) / √enrollment(c)
 ```
 
-The tier weight equals the numeric tier value from the course CSV (a positive integer). Conventional assignments are 1 for lower-division, 2 for upper-division, and 3 for graduate, but any positive integer is accepted — allowing fine-grained priority bands without code changes. The square-root enrollment denominator softens but does not eliminate the size difference — a 200-student intro class gets less weight than a 12-student grad seminar, but is not ignored entirely.
+The class weight `W` is supplied directly as a positive float in the course CSV. A grad seminar can be given a weight of `0.775` and a large intro course `0.071`; any positive value is accepted. How the weight is computed (e.g. `tier / sqrt(enrollment)`) is left to the operator — the scheduler uses the value as-is.
 
 **`Mode(j)` — Batch Penalty**
 
@@ -128,13 +136,13 @@ When multiple students in the same course have jobs waiting, the scheduler selec
 Course metadata is loaded from a CSV file exported daily from the university registrar:
 
 ```
-course_id,tier,seats
-CSE234_SP26_A00,3,18
-CSE10_SP26_A00,1,210
-CSE150_SP26_A00,2,55
+course_id,weight
+CSE234_SP26_A00,0.775
+CSE10_SP26_A00,0.069
+CSE150_SP26_A00,0.270
 ```
 
-`tier` is a positive integer used directly as the scheduling weight. Conventional values are 1 (lower-division), 2 (upper-division), and 3 (graduate); any positive integer is accepted for finer-grained priority bands. If a pod references a course not in the registry, the scheduler defaults to tier 1 and 200 seats, logging a warning.
+`weight` is a positive float used directly as `W` in the priority formula. The operator is free to compute it however makes sense (e.g. `tier / sqrt(enrollment)`). If a pod references a course not in the registry, the scheduler defaults to `weight=1.0`, logging a warning.
 
 ---
 
