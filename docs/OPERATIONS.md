@@ -167,11 +167,7 @@ P(job, lane) = W(course) × Mode(job) × Age(job) / U(course, lane)
 
 **W — Course weight** (`scheduler.py:224-230`)
 
-```
-W = tier_weight / sqrt(enrollment)
-```
-
-The class weight `W` is supplied directly from the course CSV as a positive float. How it is computed (e.g. `tier / sqrt(enrollment)`) is left to the operator.
+The class weight `W` is a positive float read directly from the course CSV. The scheduler treats it as opaque; computation is the operator's responsibility. For a tiered academic environment a useful formula is `tier / sqrt(seats)` — this encodes both academic level and enrollment, rewarding smaller high-priority courses while still allowing large courses to compete.
 
 **Mode** (`scheduler.py:168, 208-209`)
 
@@ -549,7 +545,7 @@ Enable `LANE_NO_UNKNOWN_GPU_CLASS_EVENTS` if the class is intentionally unmanage
 
 **Uneven fairness across courses**
 
-Verify that all active courses appear in the CSV with correct tier and enrollment. Pods from courses absent from the CSV fall back to tier 1 / 200 seats, which under-weights grad courses and may distort fairness. Set `LANE_LOG_LEVEL=DEBUG` and watch cycle log output to see per-job scores and which student is selected as each course's candidate.
+Verify that all active courses appear in the CSV with meaningful weights. Pods from courses absent from the CSV fall back to `weight=1.0`, which may over- or under-weight them relative to the rest of the registry and distort fairness. Set `LANE_LOG_LEVEL=DEBUG` and watch cycle log output to see per-job scores and which student is selected as each course's candidate.
 
 **High Kubernetes API error rate**
 

@@ -106,3 +106,9 @@ Top-5 remaining
 	3.	Fix H3: uncomment or replace the CronJob fetch command so it fails loudly when /tmp/courses.csv is absent.
 	4.	Fix H8 + M2: make snapshot reads fully atomic; handle pod-UID reuse so dead Jobs don't survive in student buckets.
 	5.	Fix M4: add CSV-size sanity check to course_registry.py to reject suspiciously shrunken registrar exports.
+Documentation
+	•	README.md now has two sections covering overlapping ground: the prose Goals section
+	  (lines ~7–19) and the new Scheduling Model section added for academic audiences. A human
+	  should review both for consistency of framing and remove any redundancy — in particular,
+	  the Goals bullets and the Scheduling Model opening sentence describe the same fairness
+	  problem from different angles and may benefit from consolidation or a clearer transition.

@@ -1,16 +1,16 @@
 # Lane-based Priority Scheduler
 
-A Kubernetes controller that fairly allocates cluster resources across university courses, preventing large introductory classes from crowding out smaller graduate seminars while respecting heterogeneous GPU hardware classes.
+A Kubernetes controller that fairly allocates cluster resources across university courses, preventing high-volume courses from crowding out lower-volume ones with higher scheduling priority, while respecting heterogeneous GPU hardware classes.
 
 ---
 
 ## Goals
 
-University teaching clusters face a structural fairness problem: a 200-student introductory course will naturally generate far more queued jobs than a 12-student graduate seminar, causing smaller classes to starve during peak periods even when those smaller classes have equivalent pedagogical priority.
+University teaching clusters face a structural fairness problem: a high-enrollment course will naturally generate far more queued jobs than a small one, causing lower-volume courses to starve during peak periods even when they warrant equal or higher scheduling priority.
 
 This scheduler addresses that by:
 
-- Weighting courses by academic tier (graduate > upper-division > introductory) and inversely by enrollment, so a small graduate seminar competes on equal or better footing with a large introductory section
+- Assigning each course an operator-defined weight that can incorporate whatever priority factors are relevant — academic level, enrollment, or any other consideration — so high-priority courses compete on equal or better footing with high-volume ones regardless of raw job count
 - Distributing a course's share fairly among its individual students, so no single active student within a course monopolizes its allocation
 - Preferring interactive jobs over batch jobs within any resource lane, while ensuring batch jobs eventually drain overnight
 - Providing students with real-time queue position and estimated wait time via Kubernetes Events visible in `kubectl describe pod`
@@ -61,7 +61,7 @@ Within each class the scheduler applies a secondary max-min fairness rule: among
 | Module | Responsibility |
 |---|---|
 | `lane_scheduler/core/scheduler.py` | Core scheduling logic: priority scoring, within-class fairness, utilization tracking |
-| `lane_scheduler/core/course_registry.py` | Course metadata (tier, enrollment) from registrar CSV with inference fallback |
+| `lane_scheduler/core/course_registry.py` | Course scheduling weights from registrar CSV; fallback for unknown courses |
 | `lane_scheduler/core/node_capacity.py` | Tracks allocatable capacity per GPU class lane from node watch events |
 | `lane_scheduler/k8s/controller.py` | Orchestrates all threads; Kubernetes API interactions |
 | `lane_scheduler/k8s/pod_translator.py` | Translates Kubernetes pod dicts into scheduler domain objects |
@@ -100,11 +100,13 @@ P(j, l) = W(c) × Mode(j) × Age(j) / U(c, l)
 
 **`W(c)` — Class Weight**
 
+The class weight `W` is a positive float supplied per-course in the registrar CSV. The scheduler uses it as-is; how it is derived is left to the operator. A natural starting point for a tiered academic environment is:
+
 ```
-W(c) = tier_weight(c) / √enrollment(c)
+W(c) = tier / sqrt(seats)
 ```
 
-The class weight `W` is supplied directly as a positive float in the course CSV. A grad seminar can be given a weight of `0.775` and a large intro course `0.071`; any positive value is accepted. How the weight is computed (e.g. `tier / sqrt(enrollment)`) is left to the operator — the scheduler uses the value as-is.
+where `tier` encodes academic level (e.g. 1 = lower-division, 2 = upper-division, 3 = graduate) and `seats` is enrollment. The square-root denominator dampens — but does not eliminate — the advantage of large courses: a 200-seat introductory section at tier 1 yields W ≈ 0.07, while a 15-seat graduate seminar at tier 3 yields W ≈ 0.77. Any positive value works; operators can freely encode alternative priority schemes.
 
 **`Mode(j)` — Batch Penalty**
 
@@ -142,7 +144,7 @@ CSE10_SP26_A00,0.069
 CSE150_SP26_A00,0.270
 ```
 
-`weight` is a positive float used directly as `W` in the priority formula. The operator is free to compute it however makes sense (e.g. `tier / sqrt(enrollment)`). If a pod references a course not in the registry, the scheduler defaults to `weight=1.0`, logging a warning.
+`weight` is a positive float used directly as `W` in the priority formula. The operator computes it by whatever means reflect local policy — `tier / sqrt(seats)` is a common starting point for tiered academic environments. If a pod references a course not in the registry, the scheduler defaults to `weight=1.0`, logging a warning.
 
 ---
 
