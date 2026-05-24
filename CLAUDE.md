@@ -41,7 +41,7 @@ This is a **multi-threaded Kubernetes controller** implementing weighted fair-sh
 | pod-watch | Enqueues Pending pods; tracks Running/Completed transitions |
 | node-watch | Feeds `NodeCapacityTracker` with allocatable capacity per lane |
 | cycle (10 s) | `Scheduler.cycle()` scores jobs and dispatches top-K per lane by patching pod tolerations |
-| csv-reload (daily) | Reloads registrar CSV into `CourseRegistry` |
+| csv-reload (30 s poll) | Reloads registrar CSV into `CourseRegistry` when mtime changes |
 
 A background goroutine-style loop (60 s) refreshes `WaitTimeCache` and publishes Kubernetes Events for queued pods.
 

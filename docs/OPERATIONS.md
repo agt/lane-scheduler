@@ -150,7 +150,7 @@ If a pod's course label is absent from the CSV, the scheduler uses tier 1 and 20
 
 ### 4.3 Reloading
 
-The registry is reloaded on a daily schedule (configurable via `LANE_RELOAD_INTERVAL`). Reloads are atomic — the controller never reads a partially-updated registry. To force an immediate reload without restarting the controller, you can restart just the csv-reload thread by redeploying the pod.
+The controller watches the CSV file for changes by comparing its modification time every `LANE_RELOAD_INTERVAL` seconds (default 30 s). A reload is triggered only when the mtime changes, so replacing the file — including a Kubernetes ConfigMap update — is picked up within one check interval. Reloads are atomic; the controller never reads a partially-updated registry.
 
 ---
 
@@ -262,13 +262,13 @@ LANE_WEB_PORT=8080   (default; set to 0 to disable)
 
 Serves a live HTML dashboard at `/` and a JSON API at `/api/snapshot`. See [Section 8.3](#83-web-dashboard-and-json-api).
 
-### 6.4 CSV Reload Interval
+### 6.4 CSV Check Interval
 
 ```
-LANE_RELOAD_INTERVAL=86400   (default: 24 hours, in seconds)
+LANE_RELOAD_INTERVAL=30   (default: 30 seconds)
 ```
 
-Set to a lower value (e.g. `3600`) during the add/drop period of a semester.
+How often the controller stats the course CSV to detect changes. The file is only re-parsed when its mtime has changed, so a short interval is inexpensive. Increase it on high-iops-sensitive storage.
 
 ---
 
@@ -334,7 +334,7 @@ Published 12 queue position event(s)
 **CSV Reload**
 
 ```
-CSV reload: 25 courses
+CSV reloaded (25 courses); mtime changed
 CSV reload failed: [Errno 2] No such file or directory: '/etc/lane-scheduler/courses.csv'
 ```
 
@@ -517,7 +517,7 @@ Full table of all environment variables:
 | `LANE_EPSILON` | `--epsilon` | `0.01` | — | Utilization floor |
 | `LANE_UTIL_WINDOW` | `--util-window` | `300.0` | s | Rolling utilization window |
 | `LANE_COURSE_CSV` | `--course-csv` | `/etc/lane-scheduler/courses.csv` | path | Registrar CSV |
-| `LANE_RELOAD_INTERVAL` | `--reload-interval` | `86400` | s | CSV reload cadence |
+| `LANE_RELOAD_INTERVAL` | `--reload-interval` | `30` | s | How often to check the course CSV for changes |
 | `LANE_INTERACTIVE_MEAN_PCT` | `--interactive-mean-pct` | `0.4` | fraction | Prior mean residency (interactive) |
 | `LANE_INTERACTIVE_STD_PCT` | `--interactive-std-pct` | `0.2` | fraction | Prior std (interactive) |
 | `LANE_BATCH_MEAN_PCT` | `--batch-mean-pct` | `0.7` | fraction | Prior mean residency (batch) |

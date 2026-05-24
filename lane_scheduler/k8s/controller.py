@@ -124,7 +124,7 @@ T_HALF_BATCH        = _env_float("LANE_T_HALF_BATCH",      7200.0)
 EPSILON             = _env_float("LANE_EPSILON",            0.01)
 UTIL_WINDOW         = _env_float("LANE_UTIL_WINDOW",        300.0)
 COURSE_CSV          = os.environ.get("LANE_COURSE_CSV", "/etc/lane-scheduler/courses.csv")
-RELOAD_INTERVAL     = _env_float("LANE_RELOAD_INTERVAL",  86400.0) # daily
+RELOAD_INTERVAL     = _env_float("LANE_RELOAD_INTERVAL",     30.0) # file-change check interval
 
 # Residency distribution parameters (fraction of activeDeadlineSeconds)
 INTERACTIVE_MEAN_PCT = _env_float("LANE_INTERACTIVE_MEAN_PCT", 0.4)
@@ -164,7 +164,7 @@ class LaneSchedulerController:
         - pod_watch_thread   : streams pod events, maintains _pending set
         - node_watch_thread  : streams node events, updates NodeCapacityTracker
         - cycle_thread       : runs scheduler.cycle() every CYCLE_INTERVAL seconds
-        - csv_reload_thread  : reloads the course CSV every RELOAD_INTERVAL seconds
+        - csv_reload_thread  : reloads the course CSV when its mtime changes (checked every RELOAD_INTERVAL seconds)
     """
 
     def __init__(
@@ -225,6 +225,9 @@ class LaneSchedulerController:
         # uid → student_id (namespace) for running pods; kept in sync with _running
         self._running_student: dict[str, str] = {}
         self._running_lock = threading.Lock()
+
+        # Last observed mtime of the course CSV; None means not yet loaded by the loop.
+        self._csv_mtime: Optional[float] = None
 
         # Completion context: uid → (course_id, lane_name, batch, deadline, ctx_created_monotonic)
         # Needed to record residency when a running pod reaches a terminal phase.
@@ -1032,14 +1035,20 @@ class LaneSchedulerController:
         while not self._stop.is_set():
             if self.course_csv and self.course_csv.exists():
                 try:
-                    n = self.registry.load_csv(self.course_csv)
-                    # Re-register any newly loaded courses
-                    for course in self.registry.all_courses():
-                        if not self.scheduler.has_class(course.class_id):
-                            self.scheduler.register_class(course)
-                    logger.info("CSV reload: %d courses", n)
-                except Exception as exc:
-                    logger.warning("CSV reload failed: %s", exc)
+                    mtime = self.course_csv.stat().st_mtime
+                except OSError:
+                    mtime = None
+                if mtime is not None and mtime != self._csv_mtime:
+                    try:
+                        n = self.registry.load_csv(self.course_csv)
+                        # Re-register any newly loaded courses
+                        for course in self.registry.all_courses():
+                            if not self.scheduler.has_class(course.class_id):
+                                self.scheduler.register_class(course)
+                        self._csv_mtime = mtime
+                        logger.info("CSV reloaded (%d courses); mtime changed", n)
+                    except Exception as exc:
+                        logger.warning("CSV reload failed: %s", exc)
             self._stop.wait(self.reload_interval)
 
 
@@ -1058,7 +1067,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--course-csv", default=COURSE_CSV,
                    help="Path to registrar CSV (default: %(default)s)")
     p.add_argument("--reload-interval", type=float, default=RELOAD_INTERVAL,
-                   help="CSV reload interval in seconds (default: %(default)s)")
+                   help="How often to check the course CSV for changes, in seconds (default: %(default)s)")
 
     # --- Scheduling cycle ---
     p.add_argument("--cycle-interval", type=float, default=CYCLE_INTERVAL,
