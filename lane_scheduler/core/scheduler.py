@@ -7,9 +7,9 @@ and within-class deficit round-robin.
 Lane model
 ~~~~~~~~~~
     One lane exists per physical GPU class discovered at controller startup,
-    plus a single CPU lane for all non-GPU pods.  The Lane enum is built
-    dynamically via initialise_lanes(); all other modules import Lane from
-    here after that call has returned.
+    plus a single CPU lane for all non-GPU pods.  Lanes are plain strings:
+    "cpu" for the CPU lane, "gpu-<class>" for each GPU class (e.g. "gpu-small").
+    initialise_lanes() must be called before any Scheduler is constructed.
 
     Batch vs interactive is a *scoring modifier*, not a lane split.
     Batch jobs receive a Mode penalty (default 0.3) so interactive jobs
@@ -18,12 +18,8 @@ Lane model
 
 Startup contract
 ~~~~~~~~~~~~~~~~
-    controller.py MUST call initialise_lanes(gpu_classes) before importing
-    any module that references Lane.  All other modules do:
-
-        from scheduler import Lane, lane_for_gpu_class
-
-    and will receive the populated enum.
+    controller.py MUST call initialise_lanes(gpu_classes) before constructing
+    any Scheduler.  All other modules import lane helpers from here.
 """
 
 from __future__ import annotations
@@ -41,110 +37,80 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Lane enum — built dynamically at startup
+# Lane strings — built dynamically at startup
 # ---------------------------------------------------------------------------
 
-# Populated by initialise_lanes(); referenced as a module-level name so that
-# "from scheduler import Lane" works after initialisation.
-Lane: type[IntEnum] = None  # type: ignore[assignment]
+CPU_LANE = "cpu"
 
-# Derived helpers — rebuilt by initialise_lanes() alongside Lane.
-LANE_NAMES: dict = {}          # Lane member → human-readable string
-GPU_LANES:  frozenset = frozenset()
+# Populated by initialise_lanes().
+Lane:       Optional[frozenset] = None   # all lane strings: {"cpu", "gpu-small", …}
+GPU_LANES:  frozenset           = frozenset()  # Lane minus CPU_LANE
 
-# Internal map: lowercase gpu-class string → Lane member
-_GPU_CLASS_TO_LANE: dict[str, IntEnum] = {}
+# Internal set: known raw gpu-class strings (e.g. "small", "medium")
+_KNOWN_GPU_CLASSES: frozenset = frozenset()
 
 
-def build_lanes(gpu_classes: list[str]) -> type[IntEnum]:
+def initialise_lanes(gpu_classes: list[str]) -> frozenset:
     """
-    Construct and return a fresh Lane IntEnum from a list of gpu-class strings.
+    Build the lane string set from *gpu_classes* and populate all derived
+    module globals.  Must be called before any Scheduler is constructed.
 
-    CPU is always value 0.  GPU lanes are assigned values 1…N in
-    lexicographic order of their class name — this is stable under additions
-    (new classes sort into the sequence) but not renames.  The sort is
-    intentionally lexicographic, not semantic; xsmall < xlarge alphabetically,
-    which differs from size order, but integer values are internal only.
-
-    Duplicate and empty strings are silently dropped.
+    Returns the full lane frozenset for convenience.
+    Duplicate and empty class strings are silently dropped.
     """
-    unique = sorted({c.strip().lower() for c in gpu_classes if c.strip()})
-    members = {"CPU": 0}
-    for i, cls in enumerate(unique, start=1):
-        members[f"GPU_{cls.upper()}"] = i
-    return IntEnum("Lane", members)  # type: ignore[return-value]
+    global Lane, GPU_LANES, _KNOWN_GPU_CLASSES
 
+    unique             = frozenset(c.strip().lower() for c in gpu_classes if c.strip())
+    _KNOWN_GPU_CLASSES = unique
+    GPU_LANES          = frozenset(f"gpu-{c}" for c in unique)
+    Lane               = frozenset([CPU_LANE]) | GPU_LANES
 
-def initialise_lanes(gpu_classes: list[str]) -> type[IntEnum]:
-    """
-    Build the Lane enum from *gpu_classes* and populate all derived module
-    globals.  Must be called exactly once, before any other module imports Lane.
-
-    Returns the constructed enum for convenience.
-    """
-    global Lane, LANE_NAMES, GPU_LANES, _GPU_CLASS_TO_LANE
-
-    Lane = build_lanes(gpu_classes)
-
-    LANE_NAMES = {}
-    for member in Lane:
-        if member.value == 0:
-            LANE_NAMES[member] = "cpu"
-        else:
-            # GPU_XSMALL → "gpu-xsmall"
-            LANE_NAMES[member] = member.name.lower().replace("_", "-", 1)
-
-    GPU_LANES = frozenset(m for m in Lane if m.value != 0)
-
-    _GPU_CLASS_TO_LANE = {
-        member.name[4:].lower(): member   # strip "GPU_" prefix
-        for member in Lane
-        if member.value != 0
-    }
-
-    logger.info(
-        "Lane enum initialised: %s",
-        ", ".join(f"{LANE_NAMES[m]}={m.value}" for m in Lane),
-    )
+    logger.info("Lanes initialised: %s", ", ".join(sorted(Lane)))
     return Lane
 
 
-def lane_for_gpu_class(gpu_class: str, fallback_name: str = "small",
-                       strict: bool = False) -> "Optional[IntEnum]":
+def lane_for_gpu_class(gpu_class: str, strict: bool = False) -> Optional[str]:
     """
-    Return the Lane member for *gpu_class* (case-insensitive).
+    Return the lane string for *gpu_class* (case-insensitive), or None.
 
     If the class is unrecognised:
-      - strict=True  → return None (caller decides what to do; no warning logged)
-      - strict=False → return the Lane for *fallback_name* if it exists,
-                       otherwise the lowest-valued GPU lane, with a warning.
+      - strict=True  → return None silently
+      - strict=False → return None with a warning logged
+
+    Callers that need a runtime fallback (e.g. based on current capacity)
+    should call best_fallback_gpu_lane(lane_capacity) separately.
     """
     if Lane is None:
         raise RuntimeError("initialise_lanes() has not been called")
 
     key = gpu_class.strip().lower()
-    lane = _GPU_CLASS_TO_LANE.get(key)
-    if lane is not None:
-        return lane
+    if key in _KNOWN_GPU_CLASSES:
+        return f"gpu-{key}"
 
-    if strict:
+    if not strict:
+        logger.warning(
+            "Unrecognised gpu-class %r. "
+            "Controller restart required to pick up new GPU classes.",
+            gpu_class,
+        )
+    return None
+
+
+def best_fallback_gpu_lane(lane_capacity: dict) -> Optional[str]:
+    """
+    Return the GPU lane with the most allocatable capacity.
+    Lexically earliest lane name breaks ties.
+    Returns None if no GPU lanes are known.
+    """
+    gpu_lanes = sorted(lane for lane in lane_capacity if lane != CPU_LANE)
+    if not gpu_lanes:
         return None
-
-    fallback = _GPU_CLASS_TO_LANE.get(fallback_name.lower())
-    if fallback is None and GPU_LANES:
-        fallback = min(GPU_LANES, key=lambda m: m.value)
-
-    logger.warning(
-        "Unrecognised gpu-class %r — using lane %s. "
-        "Controller restart required to pick up new GPU classes.",
-        gpu_class, LANE_NAMES.get(fallback, "?"),
-    )
-    return fallback
+    return max(gpu_lanes, key=lambda lane: lane_capacity.get(lane, 0.0))
 
 
 def is_known_gpu_class(gpu_class: str) -> bool:
-    """Return True if gpu_class maps to a lane in the current enum."""
-    return gpu_class.strip().lower() in _GPU_CLASS_TO_LANE
+    """Return True if gpu_class is in the current known set."""
+    return gpu_class.strip().lower() in _KNOWN_GPU_CLASSES
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +202,7 @@ class Job:
     job_id:        str
     class_id:      str
     student_id:    str
-    lane:          "IntEnum"   # Lane member; typed loosely for dynamic enum compat
+    lane:          str
     batch:         bool  = False
     submit_time:   float = field(default_factory=time.monotonic)
     dispatch_time: Optional[float] = field(default=None, repr=False)
@@ -263,12 +229,12 @@ class UtilizationTracker:
         self._lane_capacity = lane_capacity
         self._events: dict[tuple, list] = defaultdict(list)
 
-    def record(self, class_id: str, lane: "IntEnum", units: float,
+    def record(self, class_id: str, lane: str, units: float,
                now: Optional[float] = None) -> None:
         ts = now if now is not None else time.monotonic()
         self._events[(class_id, lane)].append((ts, units))
 
-    def utilization(self, class_id: str, lane: "IntEnum",
+    def utilization(self, class_id: str, lane: str,
                     now: Optional[float] = None) -> float:
         ts     = now if now is not None else time.monotonic()
         cutoff = ts - self._window
@@ -283,7 +249,7 @@ class UtilizationTracker:
         capacity = self._lane_capacity.get(lane, 1.0)
         return total / (capacity * self._window) if capacity > 0 else 0.0
 
-    def reset(self, class_id: str, lane: "IntEnum") -> None:
+    def reset(self, class_id: str, lane: str) -> None:
         self._events.pop((class_id, lane), None)
 
 
@@ -300,17 +266,16 @@ class DeficitTracker:
     def __init__(self) -> None:
         self._deficit: dict[tuple, float] = defaultdict(float)
 
-    def accrue(self, student_id: str, lane: "IntEnum",
-               class_weight: float, dt: float) -> None:
-        self._deficit[(student_id, lane)] += class_weight * dt
+    def accrue(self, student_id: str, lane: str, dt: float) -> None:
+        self._deficit[(student_id, lane)] += dt
 
-    def debit(self, student_id: str, lane: "IntEnum", units: float) -> None:
+    def debit(self, student_id: str, lane: str, units: float) -> None:
         self._deficit[(student_id, lane)] -= units
 
-    def deficit(self, student_id: str, lane: "IntEnum") -> float:
+    def deficit(self, student_id: str, lane: str) -> float:
         return self._deficit[(student_id, lane)]
 
-    def top_student(self, student_ids: set[str], lane: "IntEnum") -> Optional[str]:
+    def top_student(self, student_ids: set[str], lane: str) -> Optional[str]:
         if not student_ids:
             return None
         return max(student_ids, key=lambda s: self._deficit[(s, lane)])
@@ -413,7 +378,7 @@ class Scheduler:
             self._queues[job.lane][job.class_id][job.student_id].append(job)
         logger.debug(
             "Queued job %s [lane=%s student=%s class=%s]",
-            job.job_id, LANE_NAMES.get(job.lane, str(job.lane)),
+            job.job_id, job.lane,
             job.student_id, job.class_id,
         )
 
@@ -467,7 +432,7 @@ class Scheduler:
                     course = self._classes[class_id]
                     for student_id, jobs in list(student_map.items()):
                         if jobs:
-                            self.deficit.accrue(student_id, lane, course.class_weight, dt)
+                            self.deficit.accrue(student_id, lane, dt)
 
                 # Step 2 — one candidate per class
                 candidates: list[tuple[float, Job, CourseClass]] = []
@@ -508,13 +473,13 @@ class Scheduler:
             logger.info(
                 "Dispatched job %s [lane=%s mode=%s score=%.4f "
                 "class=%s student=%s wait=%.1fs]",
-                job.job_id, LANE_NAMES.get(lane, str(lane)), mode, score,
+                job.job_id, lane, mode, score,
                 job.class_id, job.student_id, job.wait_seconds(now),
             )
         return dispatched
 
-    def _scored_candidates(self, lane: "IntEnum",
-                           now: Optional[float] = None) -> list[tuple[float, "Job"]]:
+    def _scored_candidates(self, lane: str,
+                           now: Optional[float] = None) -> list[tuple[float, Job]]:
         """
         Return all per-class top candidates for *lane*, scored and sorted
         descending.  Used by the wait-time snapshot to compute ranks in one
@@ -522,7 +487,7 @@ class Scheduler:
         """
         now = now if now is not None else time.monotonic()
         with self._lock:
-            candidates: list[tuple[float, "Job"]] = []
+            candidates: list[tuple[float, Job]] = []
             for class_id, student_map in self._queues[lane].items():
                 course          = self._classes[class_id]
                 active_students = {s for s, jobs in student_map.items() if jobs}
@@ -536,7 +501,7 @@ class Scheduler:
             candidates.sort(key=lambda x: x[0], reverse=True)
             return candidates
 
-    def queue_rank(self, job_uid: str, lane: "IntEnum",
+    def queue_rank(self, job_uid: str, lane: str,
                    now: Optional[float] = None) -> Optional[int]:
         """
         Return the 1-based position of job_uid in the scored lane queue,
@@ -577,10 +542,10 @@ class Scheduler:
                     for class_id, student_map in self._queues[lane].items()
                 }
                 if counts:
-                    result[LANE_NAMES.get(lane, str(lane))] = counts
+                    result[lane] = counts
         return result
 
-    def class_scores(self, lane: "IntEnum",
+    def class_scores(self, lane: str,
                      now: Optional[float] = None) -> dict[str, float]:
         """Current top-candidate score per class in a lane.  For dashboards."""
         now    = now if now is not None else time.monotonic()

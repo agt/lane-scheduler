@@ -24,8 +24,8 @@ def setUpModule():
 
 
 def _cpu():
-    from lane_scheduler.core.scheduler import Lane
-    return Lane.CPU
+    from lane_scheduler.core.scheduler import CPU_LANE
+    return CPU_LANE
 
 
 def _small():

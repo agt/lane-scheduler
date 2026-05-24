@@ -32,7 +32,7 @@ try:
 except ImportError:
     sys.exit("kubernetes package not found.  Run: pip install kubernetes")
 
-from lane_scheduler.core.scheduler import Job, Lane, SchedulerConfig, Scheduler, initialise_lanes, lane_for_gpu_class, is_known_gpu_class
+from lane_scheduler.core.scheduler import Job, Lane, CPU_LANE, SchedulerConfig, Scheduler, initialise_lanes, lane_for_gpu_class, is_known_gpu_class
 from lane_scheduler.core.course_registry import CourseRegistry
 from lane_scheduler.core.node_capacity import (
     NodeCapacityTracker,
@@ -198,8 +198,9 @@ class LaneSchedulerController:
 
         self.node_tracker = NodeCapacityTracker()
 
+        from lane_scheduler.core.scheduler import Lane as _Lane
         self.scheduler = Scheduler(
-            lane_capacity={lane: 0.0 for lane in Lane},
+            lane_capacity={lane: 0.0 for lane in (_Lane or [])},
             config=sched_config,
         )
 
@@ -453,12 +454,6 @@ class LaneSchedulerController:
         from lane_scheduler.k8s.pod_translator import _resource_units as _ru
         units = _ru(pod, gpu_lane)
 
-        job_stub = type("_J", (), {"batch": batch, "lane": gpu_lane})()
-        from lane_scheduler.k8s.pod_translator import _gpu_lane as _gl
-        lane = _gl(pod)
-        from lane_scheduler.core.scheduler import Lane as _Lane
-        lane = lane if lane is not None else _Lane.CPU
-
         return RunningPod(
             pod_uid                 = uid,
             start_time              = start_time,
@@ -472,10 +467,9 @@ class LaneSchedulerController:
         if rp is None:
             return
         from lane_scheduler.k8s.pod_translator import _gpu_lane, _is_batch
-        from lane_scheduler.core.scheduler import Lane as _Lane, LANE_NAMES
         gpu_lane  = _gpu_lane(pod)
-        lane      = gpu_lane or _Lane.CPU
-        lane_name = LANE_NAMES.get(lane, str(lane))
+        lane      = gpu_lane or CPU_LANE
+        lane_name = lane
         course_id = (
             (pod.get("metadata") or {}).get("labels") or {}
         ).get(LABEL_COURSE, NO_COURSE_LABEL) or NO_COURSE_LABEL
@@ -608,7 +602,7 @@ class LaneSchedulerController:
                 "Enqueued pod %s/%s [course=%s lane=%s]",
                 (pod.get("metadata") or {}).get("namespace", "?"),
                 (pod.get("metadata") or {}).get("name", "?"),
-                course_id, job.lane.name,
+                course_id, job.lane,
             )
 
     def _dequeue(self, uid: str) -> None:
@@ -813,7 +807,7 @@ class LaneSchedulerController:
                         pass
                 logger.debug(
                     "Capacity gate: deferred %s (need=%.1f free=%.1f lane=%s)",
-                    job.job_id, job.resource_units, free, job.lane.name,
+                    job.job_id, job.resource_units, free, job.lane,
                 )
                 continue
 
@@ -857,7 +851,7 @@ class LaneSchedulerController:
             logger.info(
                 "DRY RUN: would patch pod %s/%s to add scheduling-gate toleration "
                 "[course=%s lane=%s wait=%.1fs]",
-                namespace, name, job.class_id, job.lane.name,
+                namespace, name, job.class_id, job.lane,
                 job.wait_seconds(now=time.monotonic()),
             )
             with self._admitted_lock:
@@ -878,7 +872,7 @@ class LaneSchedulerController:
                 self._admit_attempts.pop(uid, None)
             logger.info(
                 "Admitted pod %s/%s [course=%s lane=%s wait=%.1fs]",
-                namespace, name, job.class_id, job.lane.name,
+                namespace, name, job.class_id, job.lane,
                 job.wait_seconds(now=time.monotonic()),
             )
         except client.exceptions.ApiException as exc:
@@ -960,7 +954,7 @@ class LaneSchedulerController:
         Each pod's wait estimate uses a per-course ResidencyProfile blended
         from the cluster-wide prior and course-specific completion observations.
         """
-        from lane_scheduler.core.scheduler import LANE_NAMES, Lane as _Lane
+        from lane_scheduler.core.scheduler import Lane as _Lane
         from lane_scheduler.k8s.pod_translator import _is_batch
 
         now = time.monotonic()
@@ -974,10 +968,10 @@ class LaneSchedulerController:
             }
 
         estimates:       dict[str, WaitEstimate] = {}
-        lane_candidates: dict[object, list]      = {}
+        lane_candidates: dict[str, list]         = {}
 
-        for lane in _Lane:
-            lane_name  = LANE_NAMES.get(lane, str(lane))
+        for lane in (_Lane or []):
+            lane_name  = lane
             running    = list((running_snapshot.get(lane) or {}).values())
             candidates = self.scheduler._scored_candidates(lane, now)
             lane_candidates[lane] = candidates

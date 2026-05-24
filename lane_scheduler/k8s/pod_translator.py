@@ -16,15 +16,15 @@ Label / annotation contract
     dsmlp/batch         : "true" (case-insensitive) → batch mode scoring penalty
                           Absent or any other value → interactive priority.
 
-Resource → Lane mapping
+Resource → lane mapping
 ~~~~~~~~~~~~~~~~~~~~~~~
-    No gpu-class label              → Lane.CPU
-    gpu-class=xsmall                → Lane.GPU_XSMALL
-    gpu-class=small                 → Lane.GPU_SMALL
-    gpu-class=medium                → Lane.GPU_MEDIUM
-    gpu-class=large                 → Lane.GPU_LARGE
-    gpu-class=xlarge                → Lane.GPU_XLARGE
-    gpu-class=<unrecognised>        → Lane.GPU_SMALL  (logged as warning)
+    No gpu-class label              → "cpu"
+    gpu-class=xsmall                → "gpu-xsmall"
+    gpu-class=small                 → "gpu-small"
+    gpu-class=medium                → "gpu-medium"
+    gpu-class=large                 → "gpu-large"
+    gpu-class=xlarge                → "gpu-xlarge"
+    gpu-class=<unrecognised>        → best_fallback_gpu_lane()  (logged as warning)
 
 Resource units
 ~~~~~~~~~~~~~~
@@ -39,7 +39,7 @@ import os
 import time
 from typing import Optional
 
-from lane_scheduler.core.scheduler import Job, Lane, lane_for_gpu_class
+from lane_scheduler.core.scheduler import Job, CPU_LANE, lane_for_gpu_class
 from lane_scheduler.core.node_capacity import (
     INHIBIT_TAINT_KEY, INHIBIT_TAINT_VALUE, INHIBIT_TAINT_EFFECT,
 )
@@ -72,18 +72,12 @@ def _is_batch(pod: dict) -> bool:
     return _labels(pod).get(LABEL_BATCH, "").strip().lower() == "true"
 
 
-def _gpu_lane(pod: dict) -> Optional[object]:
-    """Return the GPU Lane member from the gpu-class label, or None if absent."""
+def _gpu_lane(pod: dict) -> Optional[str]:
+    """Return the GPU lane string from the gpu-class label, or None if absent."""
     gpu_class = _labels(pod).get(LABEL_GPU_CLASS, "").strip()
     if not gpu_class:
         return None
     return lane_for_gpu_class(gpu_class)
-
-
-def _cpu_lane() -> object:
-    """Return Lane.CPU — resolved lazily so the dynamic enum is always current."""
-    from lane_scheduler.core.scheduler import Lane as _Lane
-    return _Lane.CPU
 
 
 def _parse_cpu_millicores(value: str) -> float:
@@ -97,7 +91,7 @@ def _parse_gpu_count(value: str) -> float:
     return float(value.strip())
 
 
-def _resource_units(pod: dict, gpu_lane: Optional[Lane]) -> float:
+def _resource_units(pod: dict, gpu_lane: Optional[str]) -> float:
     """
     Returns a resource scalar for utilization accounting.
         GPU lanes : nvidia.com/gpu count, floor 1.0
@@ -155,7 +149,7 @@ def pod_to_job(pod: dict, submit_time: Optional[float] = None) -> Job:
     course_id = labels.get(LABEL_COURSE, _NO_COURSE_LABEL).strip() or _NO_COURSE_LABEL
     batch     = _is_batch(pod)
     gpu_lane  = _gpu_lane(pod)
-    lane      = gpu_lane if gpu_lane is not None else _cpu_lane()
+    lane      = gpu_lane if gpu_lane is not None else CPU_LANE
     units     = _resource_units(pod, gpu_lane)
 
     job = Job(
@@ -170,7 +164,7 @@ def pod_to_job(pod: dict, submit_time: Optional[float] = None) -> Job:
 
     logger.debug(
         "Translated pod %s → job %s [course=%s lane=%s batch=%s units=%.2f]",
-        _pod_name(pod), uid, course_id, lane.name, batch, units,
+        _pod_name(pod), uid, course_id, lane, batch, units,
     )
     return job
 

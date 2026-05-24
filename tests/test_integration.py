@@ -31,7 +31,7 @@ def setUpModule():
 
 
 def _cpu():
-    from lane_scheduler.core.scheduler import Lane as _L; return _L.CPU
+    from lane_scheduler.core.scheduler import CPU_LANE; return CPU_LANE
 
 def _gpu(cls):
     return lane_for_gpu_class(cls)
@@ -240,10 +240,9 @@ class TestPodToJob(unittest.TestCase):
     def test_student_id_is_namespace(self):
         self.assertEqual(pod_to_job(_make_pod(namespace="alice")).student_id, "alice")
 
-    def test_unrecognised_gpu_class_returns_fallback_lane(self):
-        from lane_scheduler.core.scheduler import GPU_LANES
+    def test_unrecognised_gpu_class_falls_back_to_cpu(self):
         job = pod_to_job(_gpu_pod("supergpu"))
-        self.assertIn(job.lane, GPU_LANES)
+        self.assertEqual(job.lane, _cpu())
 
 
 # ---------------------------------------------------------------------------

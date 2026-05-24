@@ -31,7 +31,7 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 
-from lane_scheduler.core.scheduler import Lane, GPU_LANES, lane_for_gpu_class
+from lane_scheduler.core.scheduler import Lane, GPU_LANES, CPU_LANE, lane_for_gpu_class
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ def _has_inhibit_taint(node: dict) -> bool:
     return False
 
 
-def _gpu_class_lane(node: dict) -> tuple[Optional[object], str]:
+def _gpu_class_lane(node: dict) -> tuple[Optional[str], str]:
     """
     Return (lane, raw_label) for the node's gpu-class label.
 
@@ -109,7 +109,7 @@ def _parse_gpu_count(value: str) -> float:
 @dataclass
 class NodeInfo:
     name:        str
-    lane:        Lane
+    lane:        str
     cpu_cores:   float
     gpu_count:   float
     ready:       bool
@@ -121,8 +121,7 @@ class NodeInfo:
 
     @property
     def capacity(self) -> float:
-        from lane_scheduler.core.scheduler import GPU_LANES as _GPU_LANES
-        return self.gpu_count if self.lane in _GPU_LANES else self.cpu_cores
+        return self.gpu_count if self.lane != CPU_LANE else self.cpu_cores
 
 
 # ---------------------------------------------------------------------------
@@ -192,11 +191,9 @@ class NodeCapacityTracker:
             lane = gpu_lane
         elif gpu_lane is not None and gpu_count == 0:
             logger.warning("Node %s has gpu-class label but zero GPU allocatable", name)
-            from lane_scheduler.core.scheduler import Lane as _Lane
-            lane = _Lane.CPU
+            lane = CPU_LANE
         else:
-            from lane_scheduler.core.scheduler import Lane as _Lane
-            lane = _Lane.CPU
+            lane = CPU_LANE
 
         info = NodeInfo(
             name        = name,
@@ -211,7 +208,7 @@ class NodeCapacityTracker:
 
         logger.info(
             "Node %s upserted [lane=%s cpu=%.1f gpu=%.0f ready=%s schedulable=%s]",
-            name, lane.name, cpu_cores, gpu_count, info.ready, info.schedulable,
+            name, lane, cpu_cores, gpu_count, info.ready, info.schedulable,
         )
 
     def remove(self, node_name: str) -> None:
@@ -227,27 +224,30 @@ class NodeCapacityTracker:
     def lane_capacity(self) -> dict:
         """Aggregate allocatable capacity per lane across all active nodes."""
         from lane_scheduler.core.scheduler import Lane as _Lane
-        totals: dict = {lane: 0.0 for lane in _Lane}
+        totals: dict = {lane: 0.0 for lane in _Lane} if _Lane else {}
         with self._lock:
             for info in self._nodes.values():
                 if info.active:
+                    totals.setdefault(info.lane, 0.0)
                     totals[info.lane] += info.capacity
         return totals
 
     def node_count(self) -> dict:
         from lane_scheduler.core.scheduler import Lane as _Lane
-        counts: dict = {lane: 0 for lane in _Lane}
+        counts: dict = {lane: 0 for lane in _Lane} if _Lane else {}
         with self._lock:
             for info in self._nodes.values():
                 if info.active:
+                    counts.setdefault(info.lane, 0)
                     counts[info.lane] += 1
         return counts
 
     def summary(self) -> str:
+        from lane_scheduler.core.scheduler import Lane as _Lane
         caps   = self.lane_capacity()
         counts = self.node_count()
         parts  = [
-            f"{lane.name}: {counts[lane]} nodes / {caps[lane]:.1f} units"
-            for lane in Lane
+            f"{lane}: {counts.get(lane, 0)} nodes / {caps.get(lane, 0.0):.1f} units"
+            for lane in sorted(_Lane or [])
         ]
         return " | ".join(parts)
