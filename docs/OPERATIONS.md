@@ -219,11 +219,14 @@ The logarithmic form prevents starvation while keeping priority growth bounded. 
 
 Setting `LANE_ALPHA=0` disables aging entirely (pure weighted fair-share with no starvation protection).
 
-### 5.4 Deficit Round-Robin
+### 5.4 Within-Course Student Ordering
 
-Within each course, the student with the highest accumulated deficit (credit minus usage) is selected as the course's representative candidate for each cycle. This enforces within-course fairness and prevents any one student from monopolising a course's allocation.
+Within each course, the student selected as the course's representative candidate for each cycle is determined by two ordered rules:
 
-There are no tuning knobs for the deficit tracker; its behaviour is fully determined by the dispatch order and the W/Mode/Age/U formula.
+1. **Fewest running pods in the lane** — a student who already has a running session is deferred in favour of classmates who have none.
+2. **Oldest pending job** — among students tied on running-pod count, the one whose job has been waiting longest is selected (FIFO tiebreaker).
+
+There are no tuning knobs for this ordering; it is fully determined by the current running-pod snapshot and job submit times.
 
 ### 5.5 Wait-Time Estimation
 
@@ -290,7 +293,7 @@ The controller's ServiceAccount needs a ClusterRole with these rules (see `deplo
 
 ### 7.2 Single-Replica Requirement
 
-The controller maintains in-memory state (deficit trackers, utilization windows, residency statistics). **Do not run more than one replica.** Horizontal scaling is not supported; use a PodDisruptionBudget with `minAvailable: 1` to avoid eviction during node maintenance.
+The controller maintains in-memory state (utilization windows, residency statistics, running-pod snapshots). **Do not run more than one replica.** Horizontal scaling is not supported; use a PodDisruptionBudget with `minAvailable: 1` to avoid eviction during node maintenance.
 
 ### 7.3 Namespace Scope
 
@@ -453,7 +456,7 @@ Startup prints a prominent notice:
 
 ### Caveats
 
-Because pods are never actually admitted, the queue will grow without bound during a dry run. The scoring and deficit state will diverge from what would happen in production over time. Dry-run sessions are best kept short (a few minutes, covering a handful of cycles) unless the intent is queue analysis rather than admission verification.
+Because pods are never actually admitted, the queue will grow without bound during a dry run. Scoring, utilization, and running-pod counts will diverge from what would happen in production over time. Dry-run sessions are best kept short (a few minutes, covering a handful of cycles) unless the intent is queue analysis rather than admission verification.
 
 ---
 
@@ -559,7 +562,7 @@ Enable `LANE_NO_UNKNOWN_GPU_CLASS_EVENTS` if the class is intentionally unmanage
 
 **Uneven fairness across courses**
 
-Verify that all active courses appear in the CSV with correct tier and enrollment. Pods from courses absent from the CSV fall back to inference defaults which may over- or under-weight them. Inspect deficit accumulation by setting `LANE_LOG_LEVEL=DEBUG` and watching cycle log output.
+Verify that all active courses appear in the CSV with correct tier and enrollment. Pods from courses absent from the CSV fall back to inference defaults which may over- or under-weight them. Set `LANE_LOG_LEVEL=DEBUG` and watch cycle log output to see per-job scores and which student is selected as each course's candidate.
 
 **High Kubernetes API error rate**
 

@@ -294,7 +294,7 @@ class Scheduler:
     - Tier-weighted, enrollment-normalized class weights
     - Log-aging wait boost with batch/interactive half-lives
     - Batch mode penalty keeps interactive jobs preferred
-    - Deficit round-robin within each class
+    - Fewest-running-then-oldest-submit student ordering within each class
     - Rolling-window utilization tracking
     """
 
@@ -389,7 +389,7 @@ class Scheduler:
 
         Walks all lanes; intended for handling pod DELETED events so an
         orphan Job doesn't sit in the scheduler queue after the pod is gone.
-        Does not touch utilization or deficit (the job never ran).
+        Does not touch utilization tracking (the job never ran).
         """
         with self._lock:
             for lane in Lane:
