@@ -106,7 +106,7 @@ def record(stats: Stats, job: Job, course: CourseClass) -> None:
     stats.dispatched_by_class[job.class_id] += 1
     stats.wait_by_class[job.class_id].append(wait)
     stats.dispatched_by_lane[job.lane] += 1
-    stats.dispatched_by_tier[course.tier.name] += 1
+    stats.dispatched_by_tier[course.tier] += 1
 
 
 def print_report(stats: Stats, classes: dict[str, CourseClass],

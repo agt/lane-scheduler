@@ -41,7 +41,7 @@ This is a **multi-threaded Kubernetes controller** implementing weighted fair-sh
 | pod-watch | Enqueues Pending pods; tracks Running/Completed transitions |
 | node-watch | Feeds `NodeCapacityTracker` with allocatable capacity per lane |
 | cycle (10 s) | `Scheduler.cycle()` scores jobs and dispatches top-K per lane by patching pod tolerations |
-| csv-reload (daily) | Reloads registrar CSV into `CourseRegistry` |
+| csv-reload (30 s poll) | Reloads registrar CSV into `CourseRegistry` when mtime changes |
 
 A background goroutine-style loop (60 s) refreshes `WaitTimeCache` and publishes Kubernetes Events for queued pods.
 
@@ -59,7 +59,7 @@ Every managed node carries an inhibitory taint (`dsmlp/scheduling-gate=controlle
 P(job, lane) = W(course) × Mode(job) × Age(job) / U(course, lane)
 ```
 
-- **W** = `tier_weight / √enrollment`  (tier weights: intro=1, upper=2, grad=3)
+- **W** = `tier_weight / √enrollment`  (tier_weight = tier value from CSV; conventional: 1 lower-div, 2 upper-div, 3 grad)
 - **Mode** = 1.0 (interactive) or 0.3 (batch)
 - **Age** = `1 + α × log(1 + wait / t_half)`  (logarithmic, prevents starvation)
 - **U** = 5-minute rolling utilization (idle courses score higher)
@@ -87,6 +87,7 @@ All defaults live in `controller.py` lines ~98–127. The most operationally rel
 | `LANE_NODE_GPU_CLASS_LABEL` | `gpu-class` | Node label key used to identify GPU class/lane |
 | `LANE_POD_GPU_CLASS_LABEL` | `gpu-class` | Pod label key used to identify requested GPU class/lane |
 | `LANE_COURSE_LABEL` | `dsmlp/course` | Pod label key used to identify the course |
+| `LANE_BATCH_LABEL` | `dsmlp/batch` | Pod label key used to identify batch-mode jobs |
 | `LANE_INHIBIT_TAINT_KEY` | `dsmlp/scheduling-gate` | Taint key on managed nodes (inhibitory gate) |
 | `LANE_INHIBIT_TAINT_VALUE` | `controller` | Taint value paired with the inhibitory gate key |
 

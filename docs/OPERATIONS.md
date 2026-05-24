@@ -105,7 +105,7 @@ These labels are read from the pod at enqueue time (`pod_translator.py`). They s
 |-----------|-------------|-----------------|----------|--------|
 | Course ID | `dsmlp/course` | `LANE_COURSE_LABEL` | Recommended | e.g. `CSE234_SP26_A00` |
 | GPU class | `gpu-class` | `LANE_POD_GPU_CLASS_LABEL` | No | `xsmall` `small` `medium` `large` `xlarge` |
-| Batch mode | `dsmlp/batch` | — | No | `"true"` |
+| Batch mode | `dsmlp/batch` | `LANE_BATCH_LABEL` | No | `"true"` |
 
 **Course label:** Pods without it are bucketed under `__unlabelled__` and scored using fallback tier/enrollment defaults. They are still scheduled but receive no course-aware fairness treatment.
 
@@ -134,15 +134,15 @@ CSE234_SP26_A00,3,18
 
 Headers are required; column order is flexible. Blank lines and leading/trailing whitespace are tolerated.
 
-**`tier` values:**
+**`tier`** must be a positive integer. It is used directly as the scheduling weight (`tier_weight = tier`). Conventional assignments:
 
-| CSV value | Meaning | Tier weight |
-|-----------|---------|-------------|
-| `1` | Intro / lower-division | 1.0 |
-| `2` | Upper-division | 2.0 |
-| `3` | Graduate | 3.0 |
+| CSV value | Meaning |
+|-----------|---------|
+| `1` | Lower-division / intro |
+| `2` | Upper-division |
+| `3` | Graduate |
 
-Rows with an unrecognised tier value or an unparseable seat count are skipped with a warning logged.
+Any positive integer is accepted — use higher values to give a cohort stronger scheduling priority without a code change. Rows with a non-positive, non-integer, or missing tier value are skipped with a warning logged.
 
 ### 4.2 Unknown Course Fallback
 
@@ -150,7 +150,7 @@ If a pod's course label is absent from the CSV, the scheduler uses tier 1 and 20
 
 ### 4.3 Reloading
 
-The registry is reloaded on a daily schedule (configurable via `LANE_RELOAD_INTERVAL`). Reloads are atomic — the controller never reads a partially-updated registry. To force an immediate reload without restarting the controller, you can restart just the csv-reload thread by redeploying the pod.
+The controller watches the CSV file for changes by comparing its modification time every `LANE_RELOAD_INTERVAL` seconds (default 30 s). A reload is triggered only when the mtime changes, so replacing the file — including a Kubernetes ConfigMap update — is picked up within one check interval. Reloads are atomic; the controller never reads a partially-updated registry.
 
 ---
 
@@ -179,7 +179,7 @@ P(job, lane) = W(course) × Mode(job) × Age(job) / U(course, lane)
 W = tier_weight / sqrt(enrollment)
 ```
 
-Larger courses are naturally penalised so they do not crowd out small graduate sections. Tier weights are fixed at 1 / 2 / 3 for intro / upper / grad.
+Larger courses are naturally penalised so they do not crowd out small graduate sections. The tier weight equals the numeric tier value from the CSV (conventional: 1 lower-div, 2 upper-div, 3 grad; any positive integer accepted).
 
 **Mode** (`scheduler.py:168, 208-209`)
 
@@ -262,13 +262,13 @@ LANE_WEB_PORT=8080   (default; set to 0 to disable)
 
 Serves a live HTML dashboard at `/` and a JSON API at `/api/snapshot`. See [Section 8.3](#83-web-dashboard-and-json-api).
 
-### 6.4 CSV Reload Interval
+### 6.4 CSV Check Interval
 
 ```
-LANE_RELOAD_INTERVAL=86400   (default: 24 hours, in seconds)
+LANE_RELOAD_INTERVAL=30   (default: 30 seconds)
 ```
 
-Set to a lower value (e.g. `3600`) during the add/drop period of a semester.
+How often the controller stats the course CSV to detect changes. The file is only re-parsed when its mtime has changed, so a short interval is inexpensive. Increase it on high-iops-sensitive storage.
 
 ---
 
@@ -334,7 +334,7 @@ Published 12 queue position event(s)
 **CSV Reload**
 
 ```
-CSV reload: 25 courses
+CSV reloaded (25 courses); mtime changed
 CSV reload failed: [Errno 2] No such file or directory: '/etc/lane-scheduler/courses.csv'
 ```
 
@@ -517,7 +517,7 @@ Full table of all environment variables:
 | `LANE_EPSILON` | `--epsilon` | `0.01` | — | Utilization floor |
 | `LANE_UTIL_WINDOW` | `--util-window` | `300.0` | s | Rolling utilization window |
 | `LANE_COURSE_CSV` | `--course-csv` | `/etc/lane-scheduler/courses.csv` | path | Registrar CSV |
-| `LANE_RELOAD_INTERVAL` | `--reload-interval` | `86400` | s | CSV reload cadence |
+| `LANE_RELOAD_INTERVAL` | `--reload-interval` | `30` | s | How often to check the course CSV for changes |
 | `LANE_INTERACTIVE_MEAN_PCT` | `--interactive-mean-pct` | `0.4` | fraction | Prior mean residency (interactive) |
 | `LANE_INTERACTIVE_STD_PCT` | `--interactive-std-pct` | `0.2` | fraction | Prior std (interactive) |
 | `LANE_BATCH_MEAN_PCT` | `--batch-mean-pct` | `0.7` | fraction | Prior mean residency (batch) |
@@ -526,6 +526,7 @@ Full table of all environment variables:
 | `LANE_PRIOR_WEIGHT` | `--prior-weight` | `10.0` | pseudo-count | Bayesian shrinkage toward cluster prior |
 | `LANE_EWMA_ALPHA` | `--ewma-alpha` | `0.1` | (0,1) | EWMA smoothing for residency; higher = faster |
 | `LANE_COURSE_LABEL` | `--course-label` | `dsmlp/course` | label key | Pod label carrying course ID |
+| `LANE_BATCH_LABEL` | `--batch-label` | `dsmlp/batch` | label key | Pod label for batch mode flag |
 | `LANE_POD_GPU_CLASS_LABEL` | `--pod-gpu-class-label` | `gpu-class` | label key | Pod label carrying GPU class |
 | `LANE_NODE_GPU_CLASS_LABEL` | `--node-gpu-class-label` | `gpu-class` | label key | Node label carrying GPU class |
 | `LANE_INHIBIT_TAINT_KEY` | `--inhibit-taint-key` | `dsmlp/scheduling-gate` | taint key | Inhibitory gate taint key |

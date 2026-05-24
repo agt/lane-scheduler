@@ -15,6 +15,7 @@ Label / annotation contract
                           Absent → CPU lane.
     dsmlp/batch         : "true" (case-insensitive) → batch mode scoring penalty
                           Absent or any other value → interactive priority.
+                          Override key with LANE_BATCH_LABEL env var.
 
 Resource → lane mapping
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -47,8 +48,8 @@ from lane_scheduler.core.node_capacity import (
 logger = logging.getLogger(__name__)
 
 # Labels we read
-LABEL_COURSE     = os.environ.get("LANE_COURSE_LABEL", "dsmlp/course")
-LABEL_BATCH      = "dsmlp/batch"
+LABEL_COURSE     = os.environ.get("LANE_COURSE_LABEL",     "dsmlp/course")
+LABEL_BATCH      = os.environ.get("LANE_BATCH_LABEL",      "dsmlp/batch")
 # Label key on pods that identifies the requested GPU class / lane.
 # Override with LANE_POD_GPU_CLASS_LABEL if your cluster uses a different key.
 LABEL_GPU_CLASS  = os.environ.get("LANE_POD_GPU_CLASS_LABEL", "gpu-class")
