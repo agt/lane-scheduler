@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 from lane_scheduler.core.scheduler import (
-    Lane, Tier, initialise_lanes, lane_for_gpu_class,
+    Lane, initialise_lanes, lane_for_gpu_class,
 )
 from lane_scheduler.core.course_registry import CourseRegistry
 from lane_scheduler.k8s.pod_translator import (
@@ -119,7 +119,7 @@ class TestCourseRegistry(unittest.TestCase):
         reg = CourseRegistry()
         self.assertEqual(reg.load_csv(path), 2)
         c = reg.get("CSE101_SP26_A00")
-        self.assertEqual(c.tier, Tier.UPPER_DIV)
+        self.assertEqual(c.tier, 2)
         self.assertEqual(c.enrollment, 55)
 
     def test_all_tier_values(self):
@@ -130,14 +130,14 @@ class TestCourseRegistry(unittest.TestCase):
         ])
         reg = CourseRegistry()
         reg.load_csv(path)
-        self.assertEqual(reg.get("A").tier, Tier.INTRO)
-        self.assertEqual(reg.get("B").tier, Tier.UPPER_DIV)
-        self.assertEqual(reg.get("C").tier, Tier.GRAD)
+        self.assertEqual(reg.get("A").tier, 1)
+        self.assertEqual(reg.get("B").tier, 2)
+        self.assertEqual(reg.get("C").tier, 3)
 
     def test_fallback_on_unknown_course(self):
         reg = CourseRegistry()
         c   = reg.get("UNKNOWN_SP26_A00")
-        self.assertEqual(c.tier, Tier.INTRO)
+        self.assertEqual(c.tier, 1)
         self.assertEqual(c.enrollment, 200)
 
     def test_fallback_cached(self):
@@ -159,7 +159,7 @@ class TestCourseRegistry(unittest.TestCase):
 
     def test_bad_tier_skipped(self):
         path = _write_csv([
-            {"course_id": "CSE101_SP26_A00", "tier": 9, "seats": 55},
+            {"course_id": "CSE101_SP26_A00", "tier": "bad", "seats": 55},
             {"course_id": "CSE234_SP26_A00", "tier": 3, "seats": 18},
         ])
         self.assertEqual(CourseRegistry().load_csv(path), 1)
@@ -406,7 +406,7 @@ class TestBatchModePenalty(unittest.TestCase):
         self.cfg    = SchedulerConfig()
         self.scorer = PriorityScorer(self.cfg)
         from lane_scheduler.core.scheduler import CourseClass
-        self.course = CourseClass("C", Tier.GRAD, 16)
+        self.course = CourseClass("C", 3, 16)
 
     def test_interactive_beats_batch(self):
         si = self.scorer.score(self._job(False), self.course, 0.1, 100.0)

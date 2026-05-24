@@ -25,11 +25,11 @@ import logging
 import threading
 from pathlib import Path
 
-from lane_scheduler.core.scheduler import CourseClass, Tier
+from lane_scheduler.core.scheduler import CourseClass
 
 logger = logging.getLogger(__name__)
 
-_FALLBACK_TIER       = Tier.INTRO
+_FALLBACK_TIER       = 1
 _FALLBACK_ENROLLMENT = 200
 
 
@@ -83,9 +83,10 @@ class CourseRegistry:
                                    course_id, row["seats"])
                     continue
                 try:
-                    tier_int = int(row["tier"].strip())
-                    tier = Tier(tier_int)
-                except (ValueError, KeyError):
+                    tier = int(row["tier"].strip())
+                    if tier <= 0:
+                        raise ValueError("tier must be positive")
+                except ValueError:
                     logger.warning("Bad tier %r for %s — skipping",
                                    row["tier"], course_id)
                     continue
@@ -116,7 +117,7 @@ class CourseRegistry:
 
         logger.warning(
             "Unknown course %r — defaulting to tier=%d enrollment=%d",
-            course_id, _FALLBACK_TIER.value, _FALLBACK_ENROLLMENT,
+            course_id, _FALLBACK_TIER, _FALLBACK_ENROLLMENT,
         )
         synthetic = CourseClass(
             class_id   = course_id,

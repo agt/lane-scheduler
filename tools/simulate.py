@@ -18,7 +18,7 @@ _GPU_CLASSES = ["small", "medium", "large"]
 initialise_lanes(_GPU_CLASSES)
 
 from lane_scheduler.core.scheduler import (  # noqa: E402 — after initialise_lanes
-    CourseClass, Job, CPU_LANE, Scheduler, SchedulerConfig, Tier,
+    CourseClass, Job, CPU_LANE, Scheduler, SchedulerConfig,
 )
 
 
@@ -48,38 +48,35 @@ class SimConfig:
 
 CLASSES = [
     # (class_id, tier, enrollment)
-    ("INTRO-101",    Tier.INTRO,     220),
-    ("INTRO-102",    Tier.INTRO,     180),
-    ("UPPER-201",    Tier.UPPER_DIV,  60),
-    ("UPPER-202",    Tier.UPPER_DIV,  45),
-    ("GRAD-301",     Tier.GRAD,       15),
-    ("GRAD-302",     Tier.GRAD,       10),
+    ("INTRO-101",    1, 220),
+    ("INTRO-102",    1, 180),
+    ("UPPER-201",    2,  60),
+    ("UPPER-202",    2,  45),
+    ("GRAD-301",     3,  15),
+    ("GRAD-302",     3,  10),
 ]
 
-
-def _tier_profiles() -> dict:
-    """Build per-tier submission profiles after Lane is initialised."""
-    return {
-        Tier.INTRO: dict(
-            rate=2.0,
-            lane_probs={"cpu": 0.90, "gpu-small": 0.10},
-            resource_range=(0.5, 2.0),
-            batch_prob=0.0,
-        ),
-        Tier.UPPER_DIV: dict(
-            rate=3.0,
-            lane_probs={"cpu": 0.70, "gpu-small": 0.20, "gpu-medium": 0.10},
-            resource_range=(1.0, 4.0),
-            batch_prob=0.1,
-        ),
-        Tier.GRAD: dict(
-            rate=4.0,
-            lane_probs={"cpu": 0.50, "gpu-small": 0.15,
-                        "gpu-medium": 0.20, "gpu-large": 0.15},
-            resource_range=(2.0, 8.0),
-            batch_prob=0.35,
-        ),
-    }
+_TIER_PROFILES = {
+    1: dict(
+        rate=2.0,
+        lane_probs={"cpu": 0.90, "gpu-small": 0.10},
+        resource_range=(0.5, 2.0),
+        batch_prob=0.0,
+    ),
+    2: dict(
+        rate=3.0,
+        lane_probs={"cpu": 0.70, "gpu-small": 0.20, "gpu-medium": 0.10},
+        resource_range=(1.0, 4.0),
+        batch_prob=0.1,
+    ),
+    3: dict(
+        rate=4.0,
+        lane_probs={"cpu": 0.50, "gpu-small": 0.15,
+                    "gpu-medium": 0.20, "gpu-large": 0.15},
+        resource_range=(2.0, 8.0),
+        batch_prob=0.35,
+    ),
+}
 
 
 def pick_lane(probs: dict, rng: random.Random):
@@ -133,7 +130,7 @@ def print_report(stats: Stats, classes: dict[str, CourseClass],
         avg_wait   = statistics.mean(waits) if waits else 0
         p95_wait   = sorted(waits)[int(0.95 * len(waits))] if waits else 0
 
-        print(f"{class_id:<14} {course.tier.name:<10} {course.enrollment:>6} "
+        print(f"{class_id:<14} {course.tier:<10} {course.enrollment:>6} "
               f"{course.class_weight:>7.4f} {submitted:>7} {dispatched:>10} "
               f"{pct:>9.1f}% {avg_wait:>11.1f} {p95_wait:>11.1f}")
 
@@ -168,15 +165,13 @@ def run(sim_cfg: SimConfig | None = None) -> None:
         courses[class_id] = c
         scheduler.register_class(c)
 
-    profiles = _tier_profiles()
-
     # Pre-generate job submission events
     # Each student submits jobs at a Poisson rate based on their tier profile
     events: list[tuple[float, Job]] = []
     job_counter = 0
 
     for class_id, tier, enrollment in CLASSES:
-        profile = profiles[tier]
+        profile = _TIER_PROFILES[tier]
         rate_per_second = profile["rate"] / 3600.0
 
         for student_idx in range(enrollment):
