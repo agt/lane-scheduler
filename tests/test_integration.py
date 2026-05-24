@@ -20,6 +20,7 @@ from lane_scheduler.core.node_capacity import (
     NodeCapacityTracker, GPU_CLASS_LABEL_KEY,
     INHIBIT_TAINT_KEY, INHIBIT_TAINT_VALUE,
 )
+from lane_scheduler.k8s.pod_translator import SCHEDULING_GATE_NAME
 
 
 # ---------------------------------------------------------------------------
@@ -54,33 +55,39 @@ def _make_pod(
     name="test-pod", namespace="jsmith", uid="uid-001",
     phase="Pending", node_name=None,
     labels=None, tolerations=None, containers=None,
+    scheduling_gates=None,
 ):
     if containers is None:
         containers = [{"name": "c", "resources": {"requests": {"cpu": "2"}}}]
+    # Default: Pending pods without a nodeName carry the lane-scheduler gate.
+    if scheduling_gates is None and phase == "Pending" and node_name is None:
+        scheduling_gates = [{"name": SCHEDULING_GATE_NAME}]
     return {
         "metadata": {"name": name, "namespace": namespace, "uid": uid,
                      "labels": labels or {}},
         "spec":     {"nodeName": node_name, "tolerations": tolerations or [],
-                     "containers": containers},
+                     "containers": containers,
+                     "schedulingGates": scheduling_gates or []},
         "status":   {"phase": phase},
     }
 
 
-def _inhibit_taint():
-    return {"key": INHIBIT_TAINT_KEY, "value": INHIBIT_TAINT_VALUE,
-            "effect": "NoSchedule"}
+def _gpu_class_taint(gpu_class):
+    return {"key": GPU_CLASS_LABEL_KEY, "value": gpu_class, "effect": "NoSchedule"}
 
 
 def _make_node(
     name="node-1", ready=True, unschedulable=False,
-    cpu="32", gpu=None, gpu_class=None, has_inhibit_taint=True,
+    cpu="32", gpu=None, gpu_class=None,
+    # has_inhibit_taint kept for backward compatibility but no longer affects
+    # NodeCapacityTracker (nodes are now identified by gpu-class label).
+    has_inhibit_taint=True,
 ):
     taints = []
-    if has_inhibit_taint:
-        taints.append(_inhibit_taint())
     labels = {}
     if gpu_class:
         labels[GPU_CLASS_LABEL_KEY] = gpu_class
+        taints.append(_gpu_class_taint(gpu_class))
     allocatable = {"cpu": cpu}
     if gpu:
         allocatable["nvidia.com/gpu"] = gpu
@@ -169,20 +176,26 @@ class TestCourseRegistry(unittest.TestCase):
 
 class TestNeedsScheduling(unittest.TestCase):
 
-    def test_pending_needs_scheduling(self):
-        self.assertTrue(needs_scheduling(_make_pod(phase="Pending")))
+    def test_pending_with_gate_needs_scheduling(self):
+        pod = _make_pod(phase="Pending",
+                        scheduling_gates=[{"name": SCHEDULING_GATE_NAME}])
+        self.assertTrue(needs_scheduling(pod))
+
+    def test_pending_without_gate_does_not(self):
+        # Gate already removed (admitted) — should not be re-enqueued.
+        pod = _make_pod(phase="Pending", scheduling_gates=[])
+        self.assertFalse(needs_scheduling(pod))
 
     def test_running_does_not(self):
         self.assertFalse(needs_scheduling(_make_pod(phase="Running")))
 
-    def test_already_admitted_does_not(self):
-        pod = _make_pod(phase="Pending", tolerations=[{
-            "key": INHIBIT_TAINT_KEY, "value": INHIBIT_TAINT_VALUE, "effect": "NoSchedule",
-        }])
-        self.assertFalse(needs_scheduling(pod))
-
     def test_node_assigned_does_not(self):
         self.assertFalse(needs_scheduling(_make_pod(phase="Pending", node_name="n1")))
+
+    def test_other_gate_only_does_not(self):
+        pod = _make_pod(phase="Pending",
+                        scheduling_gates=[{"name": "other-gate"}])
+        self.assertFalse(needs_scheduling(pod))
 
 
 # ---------------------------------------------------------------------------
@@ -257,20 +270,38 @@ class TestPodToJob(unittest.TestCase):
 
 class TestAdmissionPatch(unittest.TestCase):
 
-    def test_adds_toleration(self):
-        patch = admission_patch(_make_pod())
-        keys  = [t["key"] for t in patch["spec"]["tolerations"]]
-        self.assertIn(INHIBIT_TAINT_KEY, keys)
+    def test_adds_gpu_class_toleration(self):
+        pod = _gpu_pod("medium")
+        pod["spec"]["schedulingGates"] = [{"name": SCHEDULING_GATE_NAME}]
+        patch = admission_patch(pod)
+        tols = patch["spec"]["tolerations"]
+        self.assertTrue(
+            any(t.get("key") == GPU_CLASS_LABEL_KEY and t.get("value") == "medium"
+                for t in tols),
+        )
+
+    def test_removes_scheduling_gate(self):
+        pod = _gpu_pod("medium")
+        pod["spec"]["schedulingGates"] = [{"name": SCHEDULING_GATE_NAME}]
+        patch = admission_patch(pod)
+        self.assertIn("schedulingGates", patch["spec"])
+        gate_patch = patch["spec"]["schedulingGates"]
+        self.assertTrue(
+            any(g.get("$patch") == "delete" and g.get("name") == SCHEDULING_GATE_NAME
+                for g in gate_patch),
+        )
 
     def test_preserves_existing_tolerations(self):
-        pod   = _make_pod(tolerations=[{"key": "other", "operator": "Exists"}])
+        pod = _gpu_pod("small")
+        pod["spec"]["tolerations"] = [{"key": "other", "operator": "Exists"}]
+        pod["spec"]["schedulingGates"] = [{"name": SCHEDULING_GATE_NAME}]
         patch = admission_patch(pod)
         self.assertEqual(len(patch["spec"]["tolerations"]), 2)
 
-    def test_idempotent(self):
-        pod = _make_pod(tolerations=[{
-            "key": INHIBIT_TAINT_KEY, "value": INHIBIT_TAINT_VALUE, "effect": "NoSchedule",
-        }])
+    def test_idempotent_when_gate_absent(self):
+        # Gate already removed → nothing to do.
+        pod = _gpu_pod("medium")
+        pod["spec"]["schedulingGates"] = []
         self.assertEqual(admission_patch(pod), {})
 
 
@@ -280,10 +311,11 @@ class TestAdmissionPatch(unittest.TestCase):
 
 class TestNodeCapacityTracker(unittest.TestCase):
 
-    def test_cpu_node(self):
+    def test_cpu_only_node_not_tracked(self):
+        # Nodes without gpu-class label are not in the managed pool.
         t = NodeCapacityTracker()
-        t.upsert(_make_node(cpu="64"))
-        self.assertAlmostEqual(t.lane_capacity()[_cpu()], 64.0)
+        t.upsert(_make_node(cpu="64"))  # no gpu_class → not tracked
+        self.assertAlmostEqual(t.lane_capacity().get(_cpu(), 0.0), 0.0)
 
     def test_each_gpu_class_tracked_independently(self):
         t = NodeCapacityTracker()
@@ -299,37 +331,38 @@ class TestNodeCapacityTracker(unittest.TestCase):
         t.upsert(_make_node(name="s2", gpu="4", gpu_class="small"))
         self.assertAlmostEqual(t.lane_capacity()[_gpu("small")], 8.0)
 
-    def test_unready_excluded(self):
+    def test_unready_gpu_node_excluded(self):
         t = NodeCapacityTracker()
-        t.upsert(_make_node(cpu="64", ready=False))
-        self.assertAlmostEqual(t.lane_capacity()[_cpu()], 0.0)
+        t.upsert(_make_node(gpu="4", gpu_class="medium", ready=False))
+        self.assertAlmostEqual(t.lane_capacity()[_gpu("medium")], 0.0)
 
-    def test_no_inhibit_taint_excluded(self):
+    def test_node_identified_by_gpu_class_label(self):
+        # Nodes are now identified by gpu-class label, not inhibitory taint.
         t = NodeCapacityTracker()
-        t.upsert(_make_node(cpu="64", has_inhibit_taint=False))
-        self.assertAlmostEqual(t.lane_capacity()[_cpu()], 0.0)
+        t.upsert(_make_node(name="gn", gpu="4", gpu_class="medium",
+                            has_inhibit_taint=False))
+        self.assertAlmostEqual(t.lane_capacity()[_gpu("medium")], 4.0)
 
-    def test_remove_node(self):
+    def test_remove_gpu_node(self):
         t = NodeCapacityTracker()
-        t.upsert(_make_node(name="cpu-1", cpu="32"))
-        t.remove("cpu-1")
-        self.assertAlmostEqual(t.lane_capacity()[_cpu()], 0.0)
+        t.upsert(_make_node(name="gn", gpu="4", gpu_class="small"))
+        t.remove("gn")
+        self.assertAlmostEqual(t.lane_capacity()[_gpu("small")], 0.0)
 
     def test_gpu_node_not_counted_in_cpu_lane(self):
         t = NodeCapacityTracker()
         t.upsert(_make_node(name="gn", cpu="32", gpu="4", gpu_class="medium"))
-        self.assertAlmostEqual(t.lane_capacity()[_cpu()], 0.0)
+        self.assertAlmostEqual(t.lane_capacity().get(_cpu(), 0.0), 0.0)
         self.assertAlmostEqual(t.lane_capacity()[_gpu("medium")], 4.0)
 
     def test_node_with_unmanaged_gpu_class_excluded(self):
         """A node labelled with a gpu-class the controller doesn't manage
-        must be excluded from the pool entirely — not misclassified as CPU."""
+        must be excluded from the pool entirely."""
         t = NodeCapacityTracker()
         t.upsert(_make_node(name="unknown-gpu", cpu="32", gpu="4",
                             gpu_class="h200"))
         caps = t.lane_capacity()
-        self.assertAlmostEqual(caps[_cpu()], 0.0)
-        # No GPU lane should pick up its GPUs either.
+        self.assertAlmostEqual(caps.get(_cpu(), 0.0), 0.0)
         for cls in ("xsmall", "small", "medium", "large", "xlarge"):
             self.assertAlmostEqual(caps[_gpu(cls)], 0.0, msg=f"leaked into {cls}")
 
@@ -370,7 +403,8 @@ class TestDeleteClearsSchedulerQueue(unittest.TestCase):
     def test_delete_event_removes_job_from_scheduler(self):
         ctrl = self._build_controller()
         pod = _make_pod(
-            uid="uid-DEL", labels={"dsmlp/course": "CSE101"},
+            uid="uid-DEL",
+            labels={"dsmlp/course": "CSE101", "gpu-class": "medium"},
             phase="Pending",
         )
         ctrl._handle_pod_event({"type": "ADDED", "object": pod})

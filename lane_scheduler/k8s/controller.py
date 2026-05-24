@@ -567,14 +567,25 @@ class LaneSchedulerController:
             return list((self._running.get(lane) or {}).values())
 
     def _enqueue(self, uid: str, pod: dict) -> None:
-        # Reject pods whose gpu-class label is not managed by this controller.
+        # Reject pods whose gpu-class label is absent or not managed by this controller.
         gpu_class = ((pod.get("metadata") or {}).get("labels") or {}).get(
             LABEL_GPU_CLASS, ""
         ).strip()
-        if gpu_class and not is_known_gpu_class(gpu_class):
+        if not gpu_class:
             if uid not in self._ignored_gpu_class:
                 self._ignored_gpu_class.add(uid)
-                logger.info(
+                logger.error(
+                    "Ignoring pod %s/%s — has scheduling gate but no %r label",
+                    (pod.get("metadata") or {}).get("namespace", "?"),
+                    (pod.get("metadata") or {}).get("name", "?"),
+                    LABEL_GPU_CLASS,
+                )
+                self.event_publisher.warn_unknown_gpu_class(uid, pod)
+            return
+        if not is_known_gpu_class(gpu_class):
+            if uid not in self._ignored_gpu_class:
+                self._ignored_gpu_class.add(uid)
+                logger.error(
                     "Ignoring pod %s/%s — gpu-class '%s' is not managed by this controller",
                     (pod.get("metadata") or {}).get("namespace", "?"),
                     (pod.get("metadata") or {}).get("name", "?"),
@@ -868,8 +879,8 @@ class LaneSchedulerController:
 
         if self.dry_run:
             logger.info(
-                "DRY RUN: would patch pod %s/%s to add scheduling-gate toleration "
-                "[course=%s lane=%s wait=%.1fs]",
+                "DRY RUN: would patch pod %s/%s to add gpu-class toleration "
+                "and remove scheduling gate [course=%s lane=%s wait=%.1fs]",
                 namespace, name, job.class_id, job.lane,
                 job.wait_seconds(now=time.monotonic()),
             )
@@ -890,7 +901,8 @@ class LaneSchedulerController:
             with self._admit_attempts_lock:
                 self._admit_attempts.pop(uid, None)
             logger.info(
-                "Admitted pod %s/%s [course=%s lane=%s wait=%.1fs]",
+                "Admitted pod %s/%s — gpu-class toleration added, scheduling gate removed "
+                "[course=%s lane=%s wait=%.1fs]",
                 namespace, name, job.class_id, job.lane,
                 job.wait_seconds(now=time.monotonic()),
             )
@@ -1155,8 +1167,6 @@ def main() -> None:
     _nc.INHIBIT_TAINT_KEY   = args.inhibit_taint_key
     _nc.INHIBIT_TAINT_VALUE = args.inhibit_taint_value
     _nc.GPU_CLASS_LABEL_KEY = args.node_gpu_class_label
-    _pt.INHIBIT_TAINT_KEY   = args.inhibit_taint_key
-    _pt.INHIBIT_TAINT_VALUE = args.inhibit_taint_value
     _pt.LABEL_COURSE        = args.course_label
     _pt.LABEL_BATCH         = args.batch_label
     _pt.LABEL_GPU_CLASS     = args.pod_gpu_class_label

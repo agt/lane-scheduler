@@ -5,20 +5,20 @@ Maintains a live view of schedulable cluster capacity per resource lane by
 watching node ADDED/MODIFIED/DELETED events.
 
 Lane capacity units match pod_translator:
-    CPU lane           : total allocatable CPU cores
     GPU_XSMALL … XLARGE: total allocatable GPU count per gpu-class
 
 Node → Lane classification
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
-    Nodes are classified by a node label whose key is GPU_CLASS_LABEL_KEY
-    (default "gpu-class", overridable via LANE_NODE_GPU_CLASS_LABEL), e.g.:
+    A node is part of the managed GPU pool if it carries a gpu-class label
+    whose key is GPU_CLASS_LABEL_KEY (default "gpu-class", overridable via
+    LANE_NODE_GPU_CLASS_LABEL), e.g.:
         gpu-class=xlarge  →  Lane.GPU_XLARGE
 
-    A node with no gpu-class label but with the inhibitory scheduling-gate
-    taint is treated as a CPU node.
+    Nodes without the gpu-class label are not part of the managed pool and
+    are ignored by this tracker.
 
-    Nodes without the inhibitory scheduling-gate taint are ignored entirely —
-    they are not part of our managed pool.
+    Nodes labelled with an unrecognised gpu-class (one not discovered at
+    controller startup) are also excluded.
 
     Unready or unschedulable nodes are excluded from capacity totals.
 """
@@ -149,8 +149,22 @@ class NodeCapacityTracker:
     def upsert(self, node: dict) -> None:
         name = _node_name(node)
 
-        if not _has_inhibit_taint(node):
-            logger.debug("Node %s: no scheduling-gate taint — not in managed pool", name)
+        gpu_lane, raw_gpu_class = _gpu_class_lane(node)
+
+        # Only manage nodes with a gpu-class label.
+        if not raw_gpu_class:
+            logger.debug("Node %s: no gpu-class label — not in managed GPU pool", name)
+            with self._lock:
+                self._nodes.pop(name, None)
+            return
+
+        # Unknown gpu-class → exclude to avoid mis-routing pods.
+        if gpu_lane is None:
+            logger.warning(
+                "Node %s has unmanaged gpu-class label %r — excluding from pool. "
+                "Restart controller after the class is added to recognise it.",
+                name, raw_gpu_class,
+            )
             with self._lock:
                 self._nodes.pop(name, None)
             return
@@ -173,31 +187,13 @@ class NodeCapacityTracker:
                 logger.warning("Unparseable GPU allocatable on node %s: %r",
                                name, allocatable[_GPU_RESOURCE])
 
-        gpu_lane, raw_gpu_class = _gpu_class_lane(node)
-
-        # Unknown gpu-class label → do not classify as anything; exclude from
-        # the managed pool so we don't mis-route pods to a fallback lane.
-        if raw_gpu_class and gpu_lane is None:
-            logger.warning(
-                "Node %s has unmanaged gpu-class label %r — excluding from pool. "
-                "Restart controller after the class is added to recognise it.",
-                name, raw_gpu_class,
-            )
-            with self._lock:
-                self._nodes.pop(name, None)
-            return
-
-        if gpu_lane is not None and gpu_count > 0:
-            lane = gpu_lane
-        elif gpu_lane is not None and gpu_count == 0:
-            logger.warning("Node %s has gpu-class label but zero GPU allocatable", name)
-            lane = CPU_LANE
-        else:
-            lane = CPU_LANE
+        if gpu_count == 0:
+            logger.warning("Node %s has gpu-class label %r but zero GPU allocatable",
+                           name, raw_gpu_class)
 
         info = NodeInfo(
             name        = name,
-            lane        = lane,
+            lane        = gpu_lane,
             cpu_cores   = cpu_cores,
             gpu_count   = gpu_count,
             ready       = _is_ready(node),
@@ -207,8 +203,8 @@ class NodeCapacityTracker:
             self._nodes[name] = info
 
         logger.info(
-            "Node %s upserted [lane=%s cpu=%.1f gpu=%.0f ready=%s schedulable=%s]",
-            name, lane, cpu_cores, gpu_count, info.ready, info.schedulable,
+            "Node %s upserted [lane=%s gpu=%.0f ready=%s schedulable=%s]",
+            name, gpu_lane, gpu_count, info.ready, info.schedulable,
         )
 
     def remove(self, node_name: str) -> None:

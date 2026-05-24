@@ -302,7 +302,8 @@ class TestControllerDryRun(unittest.TestCase):
                 "name": "dry-pod", "namespace": "ns",
                 "uid": "uid-dry", "labels": {"dsmlp/course": "CSE101"},
             },
-            "spec": {"tolerations": [], "containers": []},
+            "spec": {"tolerations": [], "containers": [],
+                     "schedulingGates": [{"name": "lane-scheduler"}]},
             "status": {},
         }
         return pod, job
@@ -344,7 +345,8 @@ class TestControllerDryRun(unittest.TestCase):
                 "name": "live-pod", "namespace": "ns",
                 "uid": "uid-live", "labels": {"dsmlp/course": "CSE101"},
             },
-            "spec": {"tolerations": [], "containers": []},
+            "spec": {"tolerations": [], "containers": [],
+                     "schedulingGates": [{"name": "lane-scheduler"}]},
             "status": {},
         }
         ctrl._admit_pod(pod, job)
@@ -386,7 +388,8 @@ class TestAdmitBackoff(unittest.TestCase):
                 "name": "retry-pod", "namespace": "ns",
                 "uid": uid, "labels": {"dsmlp/course": "CSE101"},
             },
-            "spec": {"tolerations": [], "containers": []},
+            "spec": {"tolerations": [], "containers": [],
+                     "schedulingGates": [{"name": "lane-scheduler"}]},
             "status": {},
         }
         return pod, job

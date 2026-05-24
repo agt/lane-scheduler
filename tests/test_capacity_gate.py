@@ -23,7 +23,8 @@ from lane_scheduler.core.node_capacity import NodeCapacityTracker, GPU_CLASS_LAB
 from lane_scheduler.core.course_registry import CourseRegistry
 from lane_scheduler.estimation.wait_estimator import WaitTimeCache, RunningPod, ResidencyProfile
 from lane_scheduler.k8s.controller import LaneSchedulerController
-from lane_scheduler.k8s.pod_translator import INHIBIT_TAINT_KEY, INHIBIT_TAINT_VALUE
+from lane_scheduler.core.node_capacity import INHIBIT_TAINT_KEY, INHIBIT_TAINT_VALUE
+from lane_scheduler.k8s.pod_translator import SCHEDULING_GATE_NAME
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +71,7 @@ def _make_pod(uid="uid-001", gpu_class="small", gpu_count="1",
         "spec": {
             "nodeName": None,
             "tolerations": [],
+            "schedulingGates": [{"name": SCHEDULING_GATE_NAME}],
             "containers": [{"name": "c", "resources": {"requests": {
                 "cpu": "2", "nvidia.com/gpu": gpu_count,
             }}}],
@@ -93,9 +95,7 @@ def _make_node(name="node-1", gpu_class="small", gpu_count="4", ready=True):
         "metadata": {"name": name, "labels": {GPU_CLASS_LABEL_KEY: gpu_class}},
         "spec": {
             "unschedulable": False,
-            "taints": [{"key": INHIBIT_TAINT_KEY, "value": INHIBIT_TAINT_VALUE,
-                        "effect": "NoSchedule"},
-                       {"key": GPU_CLASS_LABEL_KEY, "value": gpu_class,
+            "taints": [{"key": GPU_CLASS_LABEL_KEY, "value": gpu_class,
                         "effect": "NoSchedule"}],
         },
         "status": {

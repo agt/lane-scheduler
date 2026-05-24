@@ -3,34 +3,48 @@ Pod Translator
 --------------
 Converts raw Kubernetes pod dicts (as returned by the Python kubernetes client)
 into scheduler domain objects, and produces the patch payload needed to admit
-a pod by adding the inhibitory-taint toleration.
+a pod by removing its scheduling gate and adding the matching GPU-class
+NoSchedule toleration.
+
+Admission gate model
+~~~~~~~~~~~~~~~~~~~~
+    An external mutating admission controller injects a scheduling gate
+    ("lane-scheduler") and a nodeSelector (e.g. gpu-class=medium) onto every
+    pod of interest before it reaches our controller.  The pod is held in the
+    SchedulingGated / Pending state until we:
+
+        a) add the gpu-class=<class>:NoSchedule toleration so the pod can land
+           on tainted GPU nodes, and
+        b) remove the "lane-scheduler" schedulingGate entry.
+
+    After both operations the default Kubernetes scheduler places the pod on a
+    matching node.
 
 Label / annotation contract
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     dsmlp/course        : course identifier, e.g. "CSE234_SP26_A00"
                           Required.  Pod is held under NO_COURSE_LABEL if absent.
     gpu-class           : one of {xsmall, small, medium, large, xlarge}
-                          Present on GPU pods; injected by the existing mutating
-                          admission controller alongside nodeSelector+toleration.
-                          Absent → CPU lane.
+                          Injected by the mutating admission controller.
+                          Pods without this label are rejected with an error Event.
     dsmlp/batch         : "true" (case-insensitive) → batch mode scoring penalty
                           Absent or any other value → interactive priority.
                           Override key with LANE_BATCH_LABEL env var.
 
 Resource → lane mapping
 ~~~~~~~~~~~~~~~~~~~~~~~
-    No gpu-class label              → "cpu"
     gpu-class=xsmall                → "gpu-xsmall"
     gpu-class=small                 → "gpu-small"
     gpu-class=medium                → "gpu-medium"
     gpu-class=large                 → "gpu-large"
     gpu-class=xlarge                → "gpu-xlarge"
-    gpu-class=<unrecognised>        → best_fallback_gpu_lane()  (logged as warning)
+    No gpu-class label / unknown    → rejected; error Event emitted
 
 Resource units
 ~~~~~~~~~~~~~~
-    CPU lane  : total CPU cores requested (millicores normalised), floor 1.0
     GPU lanes : total nvidia.com/gpu count requested, floor 1.0
+    CPU lane  : total CPU cores requested (millicores normalised), floor 1.0
+                (kept for internal translation; CPU pods are rejected in _enqueue)
 """
 
 from __future__ import annotations
@@ -41,9 +55,7 @@ import time
 from typing import Optional
 
 from lane_scheduler.core.scheduler import Job, CPU_LANE, lane_for_gpu_class
-from lane_scheduler.core.node_capacity import (
-    INHIBIT_TAINT_KEY, INHIBIT_TAINT_VALUE, INHIBIT_TAINT_EFFECT,
-)
+from lane_scheduler.core.node_capacity import GPU_CLASS_LABEL_KEY as _GPU_TAINT_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +65,9 @@ LABEL_BATCH      = os.environ.get("LANE_BATCH_LABEL",      "dsmlp/batch")
 # Label key on pods that identifies the requested GPU class / lane.
 # Override with LANE_POD_GPU_CLASS_LABEL if your cluster uses a different key.
 LABEL_GPU_CLASS  = os.environ.get("LANE_POD_GPU_CLASS_LABEL", "gpu-class")
+
+# Name of the scheduling gate injected by the mutating admission controller.
+SCHEDULING_GATE_NAME = "lane-scheduler"
 
 # Fallback course label when pod carries none
 _NO_COURSE_LABEL = "__unlabelled__"
@@ -172,8 +187,8 @@ def pod_to_job(pod: dict, submit_time: Optional[float] = None) -> Job:
 
 def needs_scheduling(pod: dict) -> bool:
     """
-    True if the pod is Pending, not yet node-assigned, and hasn't already
-    received our scheduling-gate toleration.
+    True if the pod is Pending, not yet node-assigned, and still carries
+    the lane-scheduler scheduling gate (i.e. has not been admitted yet).
     """
     phase = (pod.get("status", {}) or {}).get("phase", "")
     if phase != "Pending":
@@ -182,40 +197,52 @@ def needs_scheduling(pod: dict) -> bool:
     if (pod.get("spec", {}) or {}).get("nodeName"):
         return False
 
-    tolerations = (pod.get("spec", {}) or {}).get("tolerations", []) or []
-    for t in tolerations:
-        if (t.get("key") == INHIBIT_TAINT_KEY
-                and t.get("value") == INHIBIT_TAINT_VALUE):
-            return False
-
-    return True
+    gates = (pod.get("spec", {}) or {}).get("schedulingGates", []) or []
+    return any(g.get("name") == SCHEDULING_GATE_NAME for g in gates)
 
 
 def admission_patch(pod: dict) -> dict:
     """
-    Build a strategic-merge patch body that adds the scheduling-gate toleration,
-    allowing the default Kubernetes scheduler to place the pod on a tainted node.
+    Build a strategic-merge patch that admits the pod for Kubernetes scheduling:
 
-    Returns {} if the toleration is already present (idempotent).
+        a) Adds the gpu-class=<class>:NoSchedule toleration so the pod can land
+           on the tainted GPU node matching its nodeSelector.
+        b) Removes the "lane-scheduler" schedulingGate entry so the default
+           Kubernetes scheduler picks up the pod.
+
+    Returns {} if the scheduling gate is already absent (idempotent).
 
     Apply via:
         core_v1.patch_namespaced_pod(name, namespace, body=admission_patch(pod))
     """
-    existing = list((pod.get("spec", {}) or {}).get("tolerations", []) or [])
-    for t in existing:
-        if t.get("key") == INHIBIT_TAINT_KEY:
-            return {}   # already patched
+    gates = (pod.get("spec", {}) or {}).get("schedulingGates", []) or []
+    if not any(g.get("name") == SCHEDULING_GATE_NAME for g in gates):
+        return {}   # gate already removed — nothing to do
 
-    return {
-        "spec": {
-            "tolerations": existing + [{
-                "key":      INHIBIT_TAINT_KEY,
-                "operator": "Equal",
-                "value":    INHIBIT_TAINT_VALUE,
-                "effect":   INHIBIT_TAINT_EFFECT,
-            }]
-        }
-    }
+    gpu_class = _labels(pod).get(LABEL_GPU_CLASS, "").strip()
+    patch: dict = {"spec": {}}
+
+    # a) GPU-class NoSchedule toleration
+    existing_tolerations = list((pod.get("spec", {}) or {}).get("tolerations", []) or [])
+    already_tolerated = any(
+        t.get("key") == _GPU_TAINT_KEY and t.get("value") == gpu_class
+        for t in existing_tolerations
+    )
+    if gpu_class and not already_tolerated:
+        patch["spec"]["tolerations"] = existing_tolerations + [{
+            "key":      _GPU_TAINT_KEY,
+            "operator": "Equal",
+            "value":    gpu_class,
+            "effect":   "NoSchedule",
+        }]
+
+    # b) Remove the lane-scheduler scheduling gate.
+    # Use the $patch:delete directive so other gates (if any) are preserved.
+    patch["spec"]["schedulingGates"] = [
+        {"$patch": "delete", "name": SCHEDULING_GATE_NAME}
+    ]
+
+    return patch
 
 
 NO_COURSE_LABEL = _NO_COURSE_LABEL
