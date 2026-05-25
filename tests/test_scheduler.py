@@ -7,7 +7,7 @@ import unittest
 
 from lane_scheduler.core.scheduler import (
     CourseClass, Job, PriorityScorer,
-    Scheduler, SchedulerConfig, UtilizationTracker,
+    Scheduler, SchedulerConfig,
     initialise_lanes, lane_for_gpu_class, is_known_gpu_class,
 )
 
@@ -111,25 +111,48 @@ class TestPriorityScorer(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# UtilizationTracker tests
+# Running-utilization snapshot tests
 # ---------------------------------------------------------------------------
 
-class TestUtilizationTracker(unittest.TestCase):
+class TestRunningUtilization(unittest.TestCase):
+    """Scheduler.update_running_utilization feeds U(c, lane) for scoring."""
 
-    def test_zero_when_no_events(self):
-        tracker = UtilizationTracker(window=300.0, lane_capacity=CAPACITY())
-        self.assertEqual(tracker.utilization("C", _gpu("small"), now=100.0), 0.0)
+    def setUp(self):
+        self.sched = Scheduler(lane_capacity=CAPACITY())
+        self.sched.register_class(make_course("CSE-100", weight=1.0))
+        self.sched.register_class(make_course("CSE-200", weight=1.0))
 
-    def test_event_contributes_to_utilization(self):
-        tracker = UtilizationTracker(window=300.0, lane_capacity=CAPACITY())
-        tracker.record("C", _gpu("small"), units=50.0, now=100.0)
-        self.assertGreater(tracker.utilization("C", _gpu("small"), now=100.0), 0.0)
+    def test_idle_course_uses_epsilon_floor(self):
+        # No running pods → U=0, EPSILON floor applies; score must be positive.
+        self.sched.update_running_utilization({})
+        j = make_job(class_id="CSE-100", student_id="S1", submit_time=0.0)
+        self.sched.submit(j)
+        dispatched = self.sched.cycle(now=0.0)
+        self.assertEqual(len(dispatched), 1)
 
-    def test_expired_events_are_purged(self):
-        tracker = UtilizationTracker(window=60.0, lane_capacity=CAPACITY())
-        tracker.record("C", _gpu("small"), units=50.0, now=0.0)
-        self.assertGreater(tracker.utilization("C", _gpu("small"), now=0.0), 0.0)
-        self.assertEqual(tracker.utilization("C", _gpu("small"), now=200.0), 0.0)
+    def test_higher_running_units_lowers_score(self):
+        # CSE-100 has more running units → lower U-adjusted score → dispatched after CSE-200.
+        lane = _gpu("small")
+        cap  = CAPACITY()[lane]   # 8.0
+        self.sched.update_running_utilization({
+            lane: {"CSE-100": 6.0, "CSE-200": 1.0}
+        })
+        j1 = make_job(job_id="J1", class_id="CSE-100", student_id="S1", submit_time=0.0, lane=lane)
+        j2 = make_job(job_id="J2", class_id="CSE-200", student_id="S2", submit_time=0.0, lane=lane)
+        self.sched.submit(j1)
+        self.sched.submit(j2)
+        # dispatch_k=8 so both dispatched; CSE-200 (lower util) should rank first.
+        dispatched = self.sched.cycle(now=0.0)
+        self.assertEqual(dispatched[0].class_id, "CSE-200")
+
+    def test_zero_running_units_is_idle(self):
+        # Explicit zero in the map behaves the same as absence (EPSILON floor).
+        lane = _gpu("small")
+        self.sched.update_running_utilization({lane: {"CSE-100": 0.0}})
+        j = make_job(class_id="CSE-100", student_id="S1", submit_time=0.0, lane=lane)
+        self.sched.submit(j)
+        dispatched = self.sched.cycle(now=0.0)
+        self.assertEqual(len(dispatched), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -350,10 +373,6 @@ class TestSchedulerConfigValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             SchedulerConfig(batch_mode_penalty=0.0)
 
-    def test_zero_utilization_window(self):
-        with self.assertRaises(ValueError):
-            SchedulerConfig(utilization_window=0.0)
-
     def test_zero_dispatch_k(self):
         with self.assertRaises(ValueError):
             SchedulerConfig(dispatch_k=0)
@@ -386,16 +405,6 @@ class TestRemoveJob(unittest.TestCase):
         depths = self.s.queue_depths()
         self.assertEqual(sum(sum(cm.values()) for cm in depths.values()), 1)
 
-
-class TestUtilizationPruning(unittest.TestCase):
-    """UtilizationTracker drops empty keys to bound memory."""
-
-    def test_empty_key_pruned_after_expiry(self):
-        u = UtilizationTracker(window=10.0, lane_capacity={_gpu("small"): 100.0})
-        u.record("CSE-100", _gpu("small"), 1.0, now=0.0)
-        # Far future — all events expired
-        u.utilization("CSE-100", _gpu("small"), now=1000.0)
-        self.assertNotIn(("CSE-100", _gpu("small")), u._events)
 
 
 class TestConcurrentSubmitCycle(unittest.TestCase):
