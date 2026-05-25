@@ -64,6 +64,16 @@ class TestEWMA(unittest.TestCase):
             e.update(v)
         self.assertGreater(e.variance, 0.0)
 
+    def test_variance_reference_value(self):
+        # Pinned against manual West-EWVar step-through (α=0.2, inputs [0.2,0.8,0.2,0.8]).
+        # step2: var=0.8*(0+0.2*0.6²)=0.0576  step3: 0.8*(0.0576+0.2*0.12²)=0.048384
+        # step4: 0.8*(0.048384+0.2*0.504²)=0.07934976
+        e = _EWMA(alpha=0.2)
+        for v in (0.2, 0.8, 0.2, 0.8):
+            e.update(v)
+        self.assertAlmostEqual(e.variance, 0.07934976, places=8)
+        self.assertAlmostEqual(e.mean,     0.39680000, places=8)
+
     def test_std_is_sqrt_variance(self):
         e = _EWMA(alpha=0.1)
         for v in (0.1, 0.5, 0.9):
