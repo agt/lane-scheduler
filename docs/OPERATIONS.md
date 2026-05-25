@@ -15,7 +15,7 @@ This guide is for cluster administrators responsible for deploying and operating
 7. [Kubernetes Deployment and RBAC](#7-kubernetes-deployment-and-rbac)
 8. [Observability](#8-observability)
 9. [Scenario: Dry-Run Mode](#9-scenario-dry-run-mode)
-10. [Scenario: No-Event on Unknown GPU Class](#10-scenario-no-event-on-unknown-gpu-class)
+10. [Scenario: Invalid GPU Class Events](#10-scenario-invalid-gpu-class-events)
 11. [Tuning Reference](#11-tuning-reference)
 12. [Troubleshooting](#12-troubleshooting)
 
@@ -24,12 +24,12 @@ This guide is for cluster administrators responsible for deploying and operating
 ## 1. Quick-Start Checklist
 
 ```
-[ ] Taint every managed node with the inhibitory scheduling gate
 [ ] Label each GPU node with its gpu-class
-[ ] Optionally add per-class NoSchedule taints for lane isolation
+[ ] Apply per-class gpu-class=<class>:NoSchedule taints on GPU nodes
+[ ] Deploy the mutating admission controller that injects schedulingGates and gpu-class label
 [ ] Mount the course registry CSV
 [ ] Create the ServiceAccount, ClusterRole, and ClusterRoleBinding (deploy/manifests.yaml)
-[ ] Deploy the controller (single replica)
+[ ] Deploy the lane-scheduler controller (single replica)
 [ ] Verify startup logs show discovered GPU classes and loaded course count
 [ ] Confirm /api/snapshot returns data within two cycle intervals
 ```
@@ -38,29 +38,7 @@ This guide is for cluster administrators responsible for deploying and operating
 
 ## 2. Cluster-Level Labels and Taints
 
-### 2.1 Inhibitory Scheduling Gate (Required on Every Managed Node)
-
-The controller uses an admission-gate pattern. Every node the controller should manage **must** carry this taint:
-
-| Field | Default value | Env var override |
-|-------|---------------|-----------------|
-| Taint key | `dsmlp/scheduling-gate` | `LANE_INHIBIT_TAINT_KEY` |
-| Taint value | `controller` | `LANE_INHIBIT_TAINT_VALUE` |
-| Effect | `NoSchedule` | — |
-
-```bash
-kubectl taint nodes <node-name> dsmlp/scheduling-gate=controller:NoSchedule
-```
-
-**How it works:** Because no student pod carries this toleration at submission time, the default Kubernetes scheduler will not place any pod on these nodes. The lane-scheduler patches the toleration onto a pod only after it wins a scheduling cycle, at which point the default scheduler can act. Nodes *without* this taint are silently excluded from the managed pool (`node_capacity.py:153-156`).
-
-**Removing a node from management:**
-
-```bash
-kubectl taint nodes <node-name> dsmlp/scheduling-gate-
-```
-
-### 2.2 GPU Class Label (Required on Every GPU Node)
+### 2.1 GPU Class Label (Required on Every GPU Node)
 
 The controller discovers lanes dynamically at startup by reading node labels. Every GPU node must be labelled with its hardware class:
 
@@ -73,43 +51,49 @@ The controller discovers lanes dynamically at startup by reading node labels. Ev
 kubectl label nodes <gpu-node> gpu-class=medium
 ```
 
-Lanes are assembled once at startup. Adding a new GPU class to the cluster requires a **controller restart** to pick up the new label. The CPU lane is always present regardless of node labels.
+**How it works:** The controller's `NodeCapacityTracker` identifies a node as part of the managed pool by the presence of this label. Nodes without a `gpu-class` label are silently excluded. Lanes are assembled once at startup; adding a new GPU class to the cluster requires a **controller restart** to pick up the new label.
 
-### 2.3 Per-Class GPU Taint (Recommended for Lane Isolation)
+**Removing a node from management:**
 
-To prevent the default scheduler from bypassing class routing, add a matching NoSchedule taint on each GPU node:
+```bash
+kubectl label nodes <node-name> gpu-class-
+```
+
+### 2.2 Per-Class GPU Taint (Required for Lane Isolation)
+
+Each GPU node must carry a matching `NoSchedule` taint. This prevents the default Kubernetes scheduler from placing a pod on a GPU node until the lane-scheduler has patched the matching toleration onto it:
 
 ```bash
 kubectl taint nodes <gpu-node> gpu-class=medium:NoSchedule
 ```
 
-Without this taint, a pod with the matching toleration could land on any GPU node of any class.
+The lane-scheduler's admission patch adds `tolerations: [{key: gpu-class, value: medium, effect: NoSchedule}]` to an admitted pod, allowing it to land on the correctly tainted node.
 
-### 2.4 Node Eligibility Rules
+### 2.3 Node Eligibility Rules
 
-A node is included in capacity calculations only when **all** of the following are true (`node_capacity.py:58-66, 153-156`):
+A node is included in capacity calculations only when **all** of the following are true:
 
-- Has the inhibitory scheduling-gate taint
+- Has a recognised `gpu-class` label (see §2.1)
 - `status.conditions[Ready] == True`
 - `spec.unschedulable != true`
 
-Nodes failing any condition are tracked but contribute zero capacity until they recover.
+Nodes failing any condition are tracked but contribute zero capacity until they recover. Nodes labelled with an unrecognised `gpu-class` value (one not present at controller startup) are excluded entirely from the pool.
 
 ---
 
 ## 3. Pod Labels
 
-These labels are read from the pod at enqueue time (`pod_translator.py`). They should be injected by a mutating admission webhook or set by the student's workload manifest.
+These labels are read from the pod at enqueue time (`pod_translator.py`). The `gpu-class` label and the scheduling gate are injected automatically by the mutating admission webhook. The course and batch labels should be set by the student's workload manifest.
 
-| Label key | Default key | Env var override | Required | Values |
-|-----------|-------------|-----------------|----------|--------|
-| Course ID | `dsmlp/course` | `LANE_COURSE_LABEL` | Recommended | e.g. `CSE234_SP26_A00` |
-| GPU class | `gpu-class` | `LANE_POD_GPU_CLASS_LABEL` | No | `xsmall` `small` `medium` `large` `xlarge` |
-| Batch mode | `dsmlp/batch` | `LANE_BATCH_LABEL` | No | `"true"` |
+| Label key | Default key | Env var override | Source | Values |
+|-----------|-------------|-----------------|--------|--------|
+| Course ID | `dsmlp/course` | `LANE_COURSE_LABEL` | Student manifest | e.g. `CSE234_SP26_A00` |
+| GPU class | `gpu-class` | `LANE_POD_GPU_CLASS_LABEL` | Injected by webhook | `xsmall` `small` `medium` `large` `xlarge` |
+| Batch mode | `dsmlp/batch` | `LANE_BATCH_LABEL` | Student manifest (optional) | `"true"` |
 
 **Course label:** Pods without it are bucketed under `__unlabelled__` and scored using a fallback weight of 1.0. They are still scheduled but receive no course-aware fairness treatment.
 
-**GPU class label:** Absent → pod is routed to the CPU lane. A value that does not correspond to a lane discovered at startup causes the pod to be ignored (and optionally a Warning event emitted; see [Section 10](#10-scenario-no-event-on-unknown-gpu-class)).
+**GPU class label:** Injected by the mutating admission webhook alongside the scheduling gate. If the label is absent on a gated pod, or its value does not correspond to a lane discovered at startup, the pod is rejected: a Warning Event is emitted and the pod is never admitted. See [Section 10](#10-scenario-invalid-gpu-class-events).
 
 **Batch mode label:** Any value equal to `"true"` (case-insensitive) applies the batch mode penalty to the priority score (default 0.3×). Batch jobs are treated as lower-urgency background work. See [Section 5.3](#53-age-boost).
 
@@ -269,7 +253,7 @@ The controller's ServiceAccount needs a ClusterRole with these rules (see `deplo
 | Resource | Verbs | Purpose |
 |----------|-------|---------|
 | `pods` | `get list watch` | Bootstrap pending queue; stream lifecycle events |
-| `pods` | `patch` | Inject admission toleration onto winning pods |
+| `pods` | `patch` | Add nodeSelector + gpu-class toleration; remove scheduling gate |
 | `nodes` | `get list watch` | Discover lanes and track allocatable capacity |
 | `events` | `create` | Publish queue position and wait estimates to students |
 
@@ -308,7 +292,7 @@ Dispatched job <uid> [lane=gpu-medium mode=interactive score=2.4312 course=CSE23
 
 ```
 Enqueued pod default/jupyter-abc123 [course=CSE234_SP26_A00 lane=gpu-medium]
-Admitted pod default/jupyter-abc123 [course=CSE234_SP26_A00 lane=gpu-medium wait=52.1s]
+Admitted pod default/jupyter-abc123 — gpu-class toleration added, scheduling gate removed [course=CSE234_SP26_A00 lane=gpu-medium wait=52.1s]
 Completion recorded [course=CSE234_SP26_A00 lane=gpu-medium batch=False residency=0.823 n=41]
 ```
 
@@ -344,9 +328,9 @@ Emission cadence:
 - **Interactive pods:** every 60 s for the first 5 minutes, then every 5 minutes.
 - **Batch pods:** at enqueue, then at 25 % / 50 % / 75 % of the first median wait estimate; no further emissions after that.
 
-**Unknown GPU class warning (Warning)**
+**Invalid GPU class warning (Warning)**
 
-Reason: `UnknownGpuClass`. Emitted once per pod when its `gpu-class` label does not correspond to any lane the controller discovered at startup. Suppressible via `--no-unknown-gpu-class-events` (see [Section 10](#10-scenario-no-event-on-unknown-gpu-class)).
+Reason: `UnknownGpuClass`. Emitted once per pod when its `gpu-class` label is absent or does not correspond to any lane the controller discovered at startup. Suppressible via `--no-unknown-gpu-class-events` (see [Section 10](#10-scenario-invalid-gpu-class-events)).
 
 ### 8.3 Web Dashboard and JSON API
 
@@ -401,7 +385,7 @@ The dashboard renders a colour-coded health strip based on these thresholds.
 
 - **Before the first production deployment** — verify the controller discovers the correct lanes, parses the CSV, and scores jobs as expected without touching any running workloads.
 - **After tuning a knob** (e.g. changing `LANE_ALPHA` or `LANE_DISPATCH_K`) — confirm that the admission order matches intuition before committing to the change.
-- **Migrating to a new inhibitory taint key** — check that nodes re-taint correctly and that pods would be admitted in the right order before enabling real patching.
+- **Testing the mutating webhook integration** — confirm that gated pods are detected, lanes are correctly assigned, and the three-part admission patch would be applied in the right order before enabling real patching.
 
 ### How to enable
 
@@ -426,7 +410,7 @@ LANE_DRY_RUN=true
 Log lines emitted in dry-run mode:
 
 ```
-DRY RUN: would patch pod default/jupyter-abc123 with toleration dsmlp/scheduling-gate=controller
+DRY RUN: would patch pod default/jupyter-abc123 to add gpu-class toleration and remove scheduling gate [course=CSE234_SP26_A00 lane=gpu-medium wait=47.1s]
 DRY RUN: would create event for pod default/jupyter-abc123 (reason=SchedulingQueued)
 ```
 
@@ -442,11 +426,20 @@ Because pods are never actually admitted, the queue will grow without bound duri
 
 ---
 
-## 10. Scenario: No-Event on Unknown GPU Class
+## 10. Scenario: Invalid GPU Class Events
 
 ### Background
 
-When the controller encounters a pod whose `gpu-class` label does not correspond to any lane discovered at startup, it ignores the pod (it will never be admitted by this controller). By default it also emits a `Warning` Kubernetes event with reason `UnknownGpuClass`:
+The controller only manages pods that arrive with the `lane-scheduler` scheduling gate **and** a recognised `gpu-class` label. When either condition fails, the pod is rejected immediately with a `Warning` Kubernetes event (reason `UnknownGpuClass`) and never admitted. Two distinct cases trigger this:
+
+**Case A — missing `gpu-class` label.** A gated pod has no `gpu-class` label, which should not happen if the mutating admission webhook is functioning correctly.
+
+```
+Warning  UnknownGpuClass  lane-scheduler
+  Pod has scheduling gate but no gpu-class label — cannot route to any lane.
+```
+
+**Case B — unrecognised `gpu-class` value.** The pod's `gpu-class` label value does not correspond to any GPU class the controller discovered at startup.
 
 ```
 Warning  UnknownGpuClass  lane-scheduler
@@ -454,13 +447,15 @@ Warning  UnknownGpuClass  lane-scheduler
   If this class should be gated, restart the controller after adding the node label.
 ```
 
-### When this becomes problematic
+In both cases the pod is ignored by this controller and will remain SchedulingGated indefinitely (it will never run) unless corrected.
 
-1. **Multiple schedulers coexist.** In a heterogeneous cluster where a second scheduler handles a different set of GPU classes, every pod destined for that scheduler will have an unknown `gpu-class` from this controller's perspective. The warnings are technically correct but noisy and misleading to students.
+### When the warning becomes noisy
 
-2. **Gradual GPU class rollout.** You are adding a new GPU class to the cluster but have not yet tainted the nodes or restarted the controller. Pods arriving during this window will generate warnings that are resolved as soon as you restart.
+1. **Multiple schedulers coexist.** A second scheduler handles a different set of GPU classes; pods destined for it will appear to have an unrecognised `gpu-class` from this controller's perspective.
 
-3. **Intentionally ungated classes.** Some classes are deliberately left outside the scheduling gate (e.g. high-priority research nodes) and will never be managed. Permanent warning events add noise to the event stream and confuse students.
+2. **Gradual GPU class rollout.** A new GPU class is being added but the nodes have not yet been labelled or the controller has not been restarted. Pods arriving during this window generate warnings until the controller is restarted.
+
+3. **Intentionally ungated classes.** Some classes are deliberately left outside the scheduling gate (e.g. high-priority research nodes) and will never be managed by this controller.
 
 ### How to suppress
 
@@ -474,19 +469,20 @@ LANE_NO_UNKNOWN_GPU_CLASS_EVENTS=true
 
 | Behaviour | Default | With flag |
 |-----------|---------|-----------|
-| Pod is ignored (not scheduled) | Yes | Yes (unchanged) |
+| Pod is ignored (not admitted) | Yes | Yes (unchanged) |
 | Warning event emitted | Yes | No |
-| Log message emitted | Yes | Yes (unchanged) |
+| Error log message emitted | Yes | Yes (unchanged) |
 
-The flag suppresses only the Kubernetes Event. The controller still logs the situation at WARNING level:
+The flag suppresses only the Kubernetes Event. The controller still logs the situation at ERROR level:
 
 ```
-WARNING Ignoring pod default/jupyter-xyz [gpu-class=xlarge not managed by this controller]
+ERROR Ignoring pod default/jupyter-xyz — has scheduling gate but no 'gpu-class' label
+ERROR Ignoring pod default/jupyter-xyz — gpu-class 'xlarge' is not managed by this controller
 ```
 
 ### Recommended practice
 
-Keep the flag **off** (default) for single-scheduler clusters. Turn it **on** when you have intentionally partitioned GPU classes across multiple schedulers or when you have confirmed that the unlabelled classes will never be managed by this controller. This preserves log-level visibility while eliminating student-facing noise.
+Keep the flag **off** (default). Case A (missing label) always indicates a webhook misconfiguration and should surface as a visible event. Case B warnings are appropriate for single-scheduler clusters; suppress them only when GPU classes are intentionally partitioned across multiple schedulers.
 
 ---
 
@@ -517,8 +513,6 @@ Full table of all environment variables:
 | `LANE_BATCH_LABEL` | `--batch-label` | `dsmlp/batch` | label key | Pod label for batch mode flag |
 | `LANE_POD_GPU_CLASS_LABEL` | `--pod-gpu-class-label` | `gpu-class` | label key | Pod label carrying GPU class |
 | `LANE_NODE_GPU_CLASS_LABEL` | `--node-gpu-class-label` | `gpu-class` | label key | Node label carrying GPU class |
-| `LANE_INHIBIT_TAINT_KEY` | `--inhibit-taint-key` | `dsmlp/scheduling-gate` | taint key | Inhibitory gate taint key |
-| `LANE_INHIBIT_TAINT_VALUE` | `--inhibit-taint-value` | `controller` | taint value | Inhibitory gate taint value |
 | `KUBECONFIG` | `--kubeconfig` | — | path | Omit for in-cluster credentials |
 | `LANE_LOG_LEVEL` | `--log-level` | `INFO` | level | DEBUG INFO WARNING ERROR |
 | `LANE_DRY_RUN` | `--dry-run` | `""` (off) | bool | Log-only mode; no patches or events |
@@ -528,16 +522,16 @@ Full table of all environment variables:
 
 ## 12. Troubleshooting
 
-**Pods remain Pending indefinitely**
+**Pods remain SchedulingGated indefinitely**
 
-1. Confirm every node has the inhibitory taint (`kubectl describe node <node> | grep Taints`).
-2. Check the pod has the expected `gpu-class` label and it matches a discovered lane.
+1. Confirm the pod has the `lane-scheduler` scheduling gate (`kubectl get pod <pod> -o jsonpath='{.spec.schedulingGates}'`). If absent, the mutating webhook did not fire — check webhook logs and configuration.
+2. Check the pod has the `gpu-class` label and its value matches a GPU class discovered at startup (`kubectl describe pod <pod> | grep gpu-class`).
 3. Confirm the controller is running and the cycle thread is active (`kubectl logs -n lane-scheduler <pod>`).
 4. Check `/api/snapshot` — if `pending_count > 0` and `running_units < capacity_units`, a scoring or dispatch issue is likely.
 
-**Unknown GPU class warnings flooding events**
+**GPU class Warning events flooding the event stream**
 
-Enable `LANE_NO_UNKNOWN_GPU_CLASS_EVENTS` if the class is intentionally unmanaged. If the class *should* be managed, label the nodes (`kubectl label nodes <node> gpu-class=<class>`) and restart the controller.
+Enable `LANE_NO_UNKNOWN_GPU_CLASS_EVENTS` if the class is intentionally unmanaged. If the class *should* be managed, label and taint the nodes (`kubectl label nodes <node> gpu-class=<class> && kubectl taint nodes <node> gpu-class=<class>:NoSchedule`) and restart the controller.
 
 **Wait estimates are stale or null**
 

@@ -31,11 +31,14 @@ digraph lane_scheduler {
     // ─────────────────────────────────────────────────────────────
 
     // ═════════════════════════════════════════════════════════════
-    // 1 · KUBERNETES — PENDING PODS
+    // 1 · KUBERNETES — SCHEDULINGGATED PODS
+    //     An external mutating admission controller has injected
+    //     schedulingGates: [{name: "lane-scheduler"}] and the
+    //     gpu-class label onto every pod before it reaches us.
     // ═════════════════════════════════════════════════════════════
 
     subgraph cluster_pending {
-        label     = "Kubernetes API — Pending Pods"
+        label     = "Kubernetes API — SchedulingGated Pods\n(spec.schedulingGates: [{name: \"lane-scheduler\"}])"
         style     = dashed
         color     = gray60
         fontcolor = gray40
@@ -43,20 +46,17 @@ digraph lane_scheduler {
 
         node [shape=note]
 
-        p_cse101a [label="CSE101\njsmith · cpu"
-                   style=filled fillcolor="#fffde7"]
-
         p_cse250  [label="CSE250\nkwong · gpu-small"
                    style=filled fillcolor="#fffde7"]
 
         p_cse310  [label="★ CSE310\nrgarcia · gpu-medium"
                    style=filled fillcolor="#ffe0b2" penwidth=2.5 color="#bf360c"]
 
-        p_cse101b [label="CSE101\ncmartinez · cpu"
+        p_cse234  [label="CSE234\npatel · gpu-large"
                    style=filled fillcolor="#fffde7"]
 
         // invisible rank-enforcing spine
-        p_cse101a -> p_cse250 -> p_cse310 -> p_cse101b [style=invis]
+        p_cse250 -> p_cse310 -> p_cse234 [style=invis]
     }
 
 
@@ -64,16 +64,15 @@ digraph lane_scheduler {
     // 2 · POD WATCH THREAD
     // ═════════════════════════════════════════════════════════════
 
-    watch [label="Pod Watch Thread\ndetects ADDED / MODIFIED events\ntranslates pod → Job domain object\nsubmits to per-lane queue"
+    watch [label="Pod Watch Thread\ndetects pods whose schedulingGate = lane-scheduler\ntranslates pod → Job domain object\nsubmits to per-lane queue"
            shape=rectangle style="filled,rounded"
            fillcolor="#f5f5f5" penwidth=1.5
-           width=3.5]
+           width=3.8]
 
-    p_cse101a -> watch [style=dashed color=gray60]
-    p_cse250  -> watch [style=dashed color=gray60]
-    p_cse310  -> watch [color="#bf360c" penwidth=2.5
-                        label="  ① pod detected\n  (Pending phase)"]
-    p_cse101b -> watch [style=dashed color=gray60]
+    p_cse250 -> watch [style=dashed color=gray60]
+    p_cse310 -> watch [color="#bf360c" penwidth=2.5
+                       label="  ① pod detected\n  (SchedulingGated)"]
+    p_cse234 -> watch [style=dashed color=gray60]
 
 
     // ═════════════════════════════════════════════════════════════
@@ -86,16 +85,6 @@ digraph lane_scheduler {
         fillcolor = "#e8eaf6"
         fontsize  = 11
         color    = "#7986cb"
-
-        subgraph cluster_q_cpu {
-            label     = "cpu lane"
-            style     = filled
-            fillcolor = white
-
-            q_cpu [shape=record style=filled fillcolor="#fffde7"
-                   label="{ CSE101 | 6 pending | W = 0.07 }\
-                        |{ CSE250 | 1 pending | W = 0.27 }"]
-        }
 
         subgraph cluster_q_gs {
             label     = "gpu-small lane"
@@ -117,12 +106,21 @@ digraph lane_scheduler {
                   label="{ ★ CSE310 · rgarcia | rank \#1 | W = 0.77 }\
                        |{   CSE250           | rank \#2 | W = 0.27 }"]
         }
+
+        subgraph cluster_q_gl {
+            label     = "gpu-large lane"
+            style     = filled
+            fillcolor = white
+
+            q_gl [shape=record style=filled fillcolor="#fffde7"
+                  label="{ CSE234 | 2 pending | W = 0.77 }"]
+        }
     }
 
-    watch -> q_cpu [style=dashed color=gray60]
     watch -> q_gs  [style=dashed color=gray60]
     watch -> q_gm  [color="#bf360c" penwidth=2.5
                     label="  ② enqueued as Job\n  in gpu-medium lane"]
+    watch -> q_gl  [style=dashed color=gray60]
 
 
     // ═════════════════════════════════════════════════════════════
@@ -152,12 +150,15 @@ gpu-medium: 6 − 5 − 0 = 1 unit free  ✓\n\
                  width=4.5]
 
         admit [label="_admit_pod()\n\
-PATCH pod spec.tolerations:\n\
-  key: dsmlp/scheduling-gate\n\
-  value: controller\n\
-  effect: NoSchedule"
+PATCH pod spec:\n\
+  nodeSelector:   {gpu-class: medium}\n\
+  tolerations:    [{key: gpu-class\n\
+                    value: medium\n\
+                    effect: NoSchedule}]\n\
+  schedulingGates: [{$patch: delete\n\
+                     name: lane-scheduler}]"
                shape=box style="filled,rounded" fillcolor=white
-               width=3.5]
+               width=3.8]
 
         scorer -> capgate [color="#bf360c" penwidth=2.5
                            label="  ④ capacity\n  check"]
@@ -167,13 +168,16 @@ PATCH pod spec.tolerations:\n\
 
     q_gm  -> scorer [color="#bf360c" penwidth=2.5
                      label="  ③ scored in\n  cycle"]
-    q_cpu -> scorer [style=dashed color=gray60
+    q_gs  -> scorer [style=dashed color=gray60
                      lhead=cluster_cycle]
-    q_gs  -> scorer [style=dashed color=gray60]
+    q_gl  -> scorer [style=dashed color=gray60]
 
 
     // ═════════════════════════════════════════════════════════════
     // 5 · CLUSTER NODES
+    //     GPU nodes carry gpu-class=<class>:NoSchedule taints.
+    //     The admission patch adds the matching toleration so the
+    //     default Kubernetes scheduler can place the pod.
     // ═════════════════════════════════════════════════════════════
 
     subgraph cluster_nodes {
@@ -183,20 +187,8 @@ PATCH pod spec.tolerations:\n\
         fontsize  = 11
         color     = "#558b2f"
 
-        subgraph cluster_n_cpu {
-            label     = "CPU Nodes  (×4 · 32 cores each)"
-            style     = filled
-            fillcolor = white
-
-            n_cpu [shape=record style=filled fillcolor="#e3f2fd"
-                   label="{ CSE101 · jsmith      | 2 cores | RUNNING }\
-                        |{ CSE101 · abrown      | 2 cores | RUNNING }\
-                        |{ CSE250 · lchen       | 4 cores | RUNNING }\
-                        |{ (remaining capacity) |         |         }"]
-        }
-
         subgraph cluster_n_gs {
-            label     = "GPU-Small Nodes  (×2 · 4 GPU each)"
+            label     = "GPU-Small Nodes  (×2 · 4 GPU each)\ntaint: gpu-class=small:NoSchedule"
             style     = filled
             fillcolor = white
 
@@ -208,7 +200,7 @@ PATCH pod spec.tolerations:\n\
         }
 
         subgraph cluster_n_gm {
-            label     = "GPU-Medium Nodes  (×3 · 2 GPU each)"
+            label     = "GPU-Medium Nodes  (×3 · 2 GPU each)\ntaint: gpu-class=medium:NoSchedule"
             style     = filled
             fillcolor = "#fff8f0"
 
@@ -221,14 +213,12 @@ PATCH pod spec.tolerations:\n\
     }
 
     admit -> n_gm [color="#bf360c" penwidth=2.5
-                   label="  ⑥ toleration patched;\n  k8s default scheduler\n  places pod on node"]
-    admit -> n_cpu [style=invis]  // force horizontal alignment of node clusters
+                   label="  ⑥ gate removed +\n  nodeSelector + toleration\n  patched; k8s default\n  scheduler places pod"]
 
     // Dashed feedback: running pods feed back into the capacity gate
     n_gm -> capgate [style=dashed color=gray50 dir=back constraint=false
                      label="running units\nreported each cycle"]
     n_gs -> capgate [style=dashed color=gray50 dir=back constraint=false]
-    n_cpu -> capgate [style=dashed color=gray50 dir=back constraint=false]
 
 
     // ═════════════════════════════════════════════════════════════
@@ -246,7 +236,7 @@ PATCH pod spec.tolerations:\n\
                      shape=note style=filled fillcolor="#ffe0b2"
                      color="#bf360c" penwidth=2]
 
-        leg_pending  [label="Other pending job"
+        leg_pending  [label="Other SchedulingGated pod"
                       shape=note style=filled fillcolor="#fffde7"]
 
         leg_running  [label="Running pod on node"
