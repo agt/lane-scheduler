@@ -233,6 +233,50 @@ class ResidencyStats:
             acc = self._strata.get(key)
         return acc.n if acc else 0
 
+    # ------------------------------------------------------------------
+    # Persistence helpers
+    # ------------------------------------------------------------------
+
+    def seed(
+        self,
+        course_id: str,
+        lane_name: str,
+        batch:     bool,
+        ewma_mean: float,
+        ewma_var:  float,
+        n:         int,
+    ) -> None:
+        """
+        Restore an EWMA accumulator from persisted state.
+
+        Only takes effect if no live observations have been recorded for this
+        stratum yet, making it safe to call at startup before the pod-watch
+        loop runs.  Silently ignored if the stratum already has data.
+        """
+        if n <= 0:
+            return
+        key = _StratumKey(course_id=course_id, lane_name=lane_name, batch=batch)
+        acc = _EWMA(alpha=self._ewma_alpha, n=n, mean=ewma_mean, var=ewma_var)
+        with self._lock:
+            if key not in self._strata:
+                self._strata[key] = acc
+
+    def dump(self) -> list[tuple]:
+        """
+        Return current EWMA state for all strata that have at least one
+        observation, as a list of (course_id, lane_name, batch, ewma_mean,
+        ewma_var, n) tuples suitable for ResidencyStore.save().
+        """
+        result = []
+        with self._lock:
+            for key, acc in self._strata.items():
+                if acc.n > 0:
+                    result.append(
+                        (key.course_id, key.lane_name, key.batch,
+                         acc.mean, acc.var, acc.n)
+                    )
+        return result
+
     def all_profiles(self) -> dict[tuple, ResidencyProfile]:
         """
         Return current posterior profiles for all strata that have at least

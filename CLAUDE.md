@@ -96,6 +96,8 @@ All defaults live in `controller.py` lines ~98–127. The most operationally rel
 | `LANE_SCHEDULING_GATE_NAME` | `lane-scheduler` | Name of the scheduling gate injected by the mutating webhook |
 | `LANE_COURSE_LABEL` | `dsmlp/course` | Pod label key used to identify the course |
 | `LANE_BATCH_LABEL` | `dsmlp/batch` | Pod label key used to identify batch-mode jobs |
+| `LANE_RESIDENCY_DB` | *(disabled)* | Path to SQLite DB for persisting learned per-(course, lane, batch) EWMA residency parameters across restarts; omit to disable |
+| `LANE_DB_PERSIST_INTERVAL` | 300 s | How often the controller flushes residency state to the DB |
 
 ### Package layout
 
@@ -111,7 +113,8 @@ lane_scheduler/
     event_publisher.py  # Kubernetes Events for queued pods (emission schedule)
   estimation/
     wait_estimator.py   # Truncated-normal model; bisection; WaitTimeCache
-    residency_stats.py  # Welford online stats; Bayesian shrinkage
+    residency_stats.py  # EWMA online stats; Bayesian shrinkage; seed()/dump() for persistence
+    residency_store.py  # SQLite-backed persistence for EWMA residency parameters
 tools/
   simulate.py           # Offline fairness simulator
 tests/                  # 200+ tests; mirrors core/ + estimation/ + k8s/ structure

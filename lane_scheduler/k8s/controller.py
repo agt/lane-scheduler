@@ -54,6 +54,7 @@ from lane_scheduler.estimation.wait_estimator import (
 )
 from lane_scheduler.k8s.event_publisher import EventPublisher
 from lane_scheduler.estimation.residency_stats import ResidencyStats
+from lane_scheduler.estimation.residency_store import ResidencyStore
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,8 @@ T_HALF_BATCH        = _env_float("LANE_T_HALF_BATCH",      7200.0)
 UTIL_WINDOW         = _env_float("LANE_UTIL_WINDOW",        300.0)
 COURSE_CSV          = os.environ.get("LANE_COURSE_CSV", "/etc/lane-scheduler/courses.csv")
 RELOAD_INTERVAL     = _env_float("LANE_RELOAD_INTERVAL",     30.0) # file-change check interval
+RESIDENCY_DB        = os.environ.get("LANE_RESIDENCY_DB", "")      # empty = disabled
+DB_PERSIST_INTERVAL = _env_float("LANE_DB_PERSIST_INTERVAL", 300.0)
 
 # Residency distribution parameters (fraction of activeDeadlineSeconds)
 INTERACTIVE_MEAN_PCT = _env_float("LANE_INTERACTIVE_MEAN_PCT", 0.4)
@@ -179,6 +182,8 @@ class LaneSchedulerController:
         cycle_interval:      float = CYCLE_INTERVAL,
         reload_interval:     float = RELOAD_INTERVAL,
         wait_cache_interval: float = WAIT_CACHE_INTERVAL,
+        residency_store:     Optional[ResidencyStore] = None,
+        db_persist_interval: float = DB_PERSIST_INTERVAL,
         web_port:                     int   = 0,
         dry_run:                      bool  = False,
         no_unknown_gpu_class_events:  bool  = False,
@@ -262,6 +267,16 @@ class LaneSchedulerController:
             ewma_alpha        = ewma_alpha,
         )
 
+        self.residency_store     = residency_store
+        self._db_persist_interval = db_persist_interval
+        if residency_store is not None:
+            rows = residency_store.load()
+            for course_id, lane_name, batch, mean, var, n in rows:
+                self.residency_stats.seed(course_id, lane_name, batch, mean, var, n)
+            logger.info(
+                "Seeded %d residency strata from DB at %s", len(rows), residency_store.path
+            )
+
         # Background wait-time cache
         self.wait_cache = WaitTimeCache(
             snapshot_fn = self._build_wait_snapshot,
@@ -292,6 +307,10 @@ class LaneSchedulerController:
             threading.Thread(target=self._cycle_loop,        name="cycle",        daemon=True),
             threading.Thread(target=self._csv_reload_loop,   name="csv-reload",   daemon=True),
         ]
+        if self.residency_store is not None:
+            self._threads.append(
+                threading.Thread(target=self._db_persist_loop, name="db-persist", daemon=True)
+            )
         for t in self._threads:
             t.start()
 
@@ -1063,6 +1082,27 @@ class LaneSchedulerController:
                         logger.warning("CSV reload failed: %s", exc)
             self._stop.wait(self.reload_interval)
 
+    # ------------------------------------------------------------------
+    # Residency DB persistence
+    # ------------------------------------------------------------------
+
+    def _db_persist_loop(self) -> None:
+        # _stop.wait() returns True when the event fires, False on timeout.
+        # Loop until stop is signalled, then do a final flush before exiting.
+        while not self._stop.wait(self._db_persist_interval):
+            self._persist_residency_to_db()
+        self._persist_residency_to_db()
+
+    def _persist_residency_to_db(self) -> None:
+        if self.residency_store is None:
+            return
+        try:
+            rows = self.residency_stats.dump()
+            self.residency_store.save(rows)
+            logger.info("Persisted %d residency strata to DB", len(rows))
+        except Exception as exc:
+            logger.warning("Residency DB persist failed: %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -1114,6 +1154,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # --- Wait-time cache ---
     p.add_argument("--wait-cache-interval", type=float, default=WAIT_CACHE_INTERVAL,
                    help="Wait-time cache refresh interval in seconds (default: %(default)s)")
+
+    # --- Residency DB ---
+    p.add_argument("--residency-db", default=RESIDENCY_DB,
+                   help="Path to SQLite DB for persisting learned residency parameters "
+                        "(omit or empty to disable; also set via LANE_RESIDENCY_DB)")
+    p.add_argument("--db-persist-interval", type=float, default=DB_PERSIST_INTERVAL,
+                   help="How often to flush residency state to the DB, in seconds "
+                        "(default: %(default)s; also set via LANE_DB_PERSIST_INTERVAL)")
 
     # --- Kubernetes label/taint wiring ---
     p.add_argument("--course-label", default=LABEL_COURSE,
@@ -1230,6 +1278,18 @@ def main() -> None:
         args.batch_mean_pct * 100,       args.batch_std_pct * 100,
     )
 
+    residency_store: Optional[ResidencyStore] = None
+    if args.residency_db:
+        db_path = Path(args.residency_db)
+        try:
+            residency_store = ResidencyStore(db_path)
+            logger.info("Residency store opened at %s", db_path)
+        except Exception as exc:
+            logger.warning(
+                "Failed to open residency DB at %s: %s — continuing without persistence",
+                db_path, exc,
+            )
+
     controller = LaneSchedulerController(
         core_v1                      = core_v1,
         registry                     = registry,
@@ -1241,6 +1301,8 @@ def main() -> None:
         cycle_interval               = args.cycle_interval,
         reload_interval              = args.reload_interval,
         wait_cache_interval          = args.wait_cache_interval,
+        residency_store              = residency_store,
+        db_persist_interval          = args.db_persist_interval,
         web_port                     = args.web_port,
         dry_run                      = args.dry_run,
         no_unknown_gpu_class_events  = args.no_unknown_gpu_class_events,
