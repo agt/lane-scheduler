@@ -47,7 +47,7 @@ A background goroutine-style loop (60 s) refreshes `WaitTimeCache` and publishes
 
 ### Admission gate pattern
 
-Every managed node carries an inhibitory taint (`dsmlp/scheduling-gate=controller:NoSchedule`). The controller **patches** admitted pods with the matching toleration; only then does the default Kubernetes scheduler place them. GPU nodes additionally carry `gpu-class=<class>:NoSchedule` taints so lane routing is enforced at the node level.
+Pods arrive in `SchedulingGated` state with a `schedulingGates: [{name: "lane-scheduler"}]` entry injected by an external mutating admission controller. GPU nodes carry `gpu-class=<class>:NoSchedule` taints. When admitting a pod the controller patches it to: (a) add a `nodeSelector` entry (`gpu-class=<class>`), (b) add the matching `gpu-class=<class>:NoSchedule` toleration, and (c) remove the scheduling gate. Only then does the default Kubernetes scheduler place the pod.
 
 ### Lane model
 
@@ -84,12 +84,10 @@ All defaults live in `controller.py` lines ~98–127. The most operationally rel
 | `LANE_PRIOR_WEIGHT` | 10.0 | Bayesian pseudo-count for residency convergence |
 | `LANE_EWMA_ALPHA` | 0.1 | EWMA smoothing factor for per-class residency; higher = faster adaptation to recent data |
 | `LANE_COURSE_CSV` | `/etc/lane-scheduler/courses.csv` | Registrar CSV path |
-| `LANE_NODE_GPU_CLASS_LABEL` | `gpu-class` | Node label key used to identify GPU class/lane |
-| `LANE_POD_GPU_CLASS_LABEL` | `gpu-class` | Pod label key used to identify requested GPU class/lane |
+| `LANE_GPU_CLASS_LABEL` | `gpu-class` | Label key on both pods and nodes identifying the GPU class/lane |
+| `LANE_SCHEDULING_GATE_NAME` | `lane-scheduler` | Name of the scheduling gate injected by the mutating webhook |
 | `LANE_COURSE_LABEL` | `dsmlp/course` | Pod label key used to identify the course |
 | `LANE_BATCH_LABEL` | `dsmlp/batch` | Pod label key used to identify batch-mode jobs |
-| `LANE_INHIBIT_TAINT_KEY` | `dsmlp/scheduling-gate` | Taint key on managed nodes (inhibitory gate) |
-| `LANE_INHIBIT_TAINT_VALUE` | `controller` | Taint value paired with the inhibitory gate key |
 
 ### Package layout
 

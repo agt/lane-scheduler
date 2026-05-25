@@ -16,11 +16,11 @@ This scheduler addresses that by:
 - Providing students with real-time queue position and estimated wait time via Kubernetes Events visible in `kubectl describe pod`
 - Adapting wait-time estimates over time using course-specific completion data, so estimates improve as the term progresses
 
-The scheduler is implemented as a Kubernetes controller. It does not replace the default Kubernetes scheduler; instead it acts as a gating layer, holding pods in a Pending state via node taints until they reach the top of the priority queue, then patching in a toleration that allows the default scheduler to place them normally.
+The scheduler is implemented as a Kubernetes controller. It does not replace the default Kubernetes scheduler; instead it acts as a gating layer. Pods of interest arrive in a SchedulingGated state — held by a `lane-scheduler` scheduling gate injected by an external mutating admission controller. When a pod reaches the top of the priority queue, the controller patches in the matching GPU-class `nodeSelector` and `NoSchedule` toleration and removes the scheduling gate, allowing the default scheduler to place the pod normally.
 
 ### Scheduling Model
 
-The system operates as a set of independent finite-capacity multi-server queues (lanes), one per GPU hardware class plus one for CPU workloads. Each lane accepts a multi-class open workload of heterogeneous jobs; jobs are held in a pre-admission gate and released in discrete scheduling cycles. The service discipline within each lane is a dynamic non-preemptive priority rule: at each cycle, queued jobs are scored and the top-*K* are admitted subject to a capacity constraint.
+The system operates as a set of independent finite-capacity multi-server queues (lanes), one per GPU hardware class. Only pods that arrive bearing the `lane-scheduler` scheduling gate are managed; pods without a recognised `gpu-class` label are rejected with an error Event. Each lane accepts a multi-class open workload of heterogeneous jobs; jobs are held in the SchedulingGated state and released in discrete scheduling cycles. The service discipline within each lane is a dynamic non-preemptive priority rule: at each cycle, queued jobs are scored and the top-*K* are admitted subject to a capacity constraint.
 
 The per-job priority score is P(*j*, *l*) = W(*c*) · M(*j*) · A(*j*) / U(*c*, *l*), where W(*c*) is a static operator-assigned class weight, M(*j*) ∈ {0.3, 1.0} is a batch/interactive mode multiplier, A(*j*) = 1 + α log(1 + *t*_w / *t*_½) is a logarithmic age boost parameterised by wait time *t*_w and configurable half-life *t*_½, and U(*c*, *l*) is the rolling-window resource utilisation of class *c* in lane *l* over a recent time window. The utilisation denominator gives the discipline its fairness character: a class currently consuming a large share of lane capacity scores lower than an equally weighted idle class, producing a weighted max-min allocation across active classes analogous to Generalised Processor Sharing (GPS), but approximated in periodic discrete cycles rather than fluid flow. Logarithmic aging is preferred over linear aging to bound runaway priority elevation while still guaranteeing finite waiting — a job's score grows without bound but at a rate that decreases with wait time, suppressing the synchronised burst discharges that arise when many long-waiting jobs simultaneously reach a linear threshold.
 
@@ -40,12 +40,13 @@ Within each class the scheduler applies a secondary max-min fairness rule: among
 │     • record completions → ResidencyStats                   │
 │                                                             │
 │  node-watch thread ──► NodeCapacityTracker                  │
-│     • maintain lane capacities from node taints             │
+│     • maintain lane capacities from node labels             │
 │                                                             │
 │  cycle thread (10s) ──► Scheduler.cycle()                   │
 │     • score queued jobs                                      │
 │     • dispatch top-K per lane                               │
-│     • patch admitted pods with toleration                   │
+│     • patch admitted pods (nodeSelector + toleration +      │
+│       scheduling gate removal)                              │
 │                                                             │
 │  wait-cache thread (60s) ──► _build_wait_snapshot()         │
 │     • compute WaitEstimate for every queued pod             │
@@ -77,18 +78,17 @@ Within each class the scheduler applies a secondary max-min fairness rule: among
 
 ### Resource Lanes
 
-The cluster's resources are divided into independent scheduling lanes, one per GPU class plus one for CPU-only workloads:
+The cluster's resources are divided into independent scheduling lanes, one per GPU hardware class:
 
 ```
-Lane.CPU          — all non-GPU pods
-Lane.GPU_XSMALL   — nodes tainted gpu-class=xsmall
-Lane.GPU_SMALL    — nodes tainted gpu-class=small
-Lane.GPU_MEDIUM   — nodes tainted gpu-class=medium
-Lane.GPU_LARGE    — nodes tainted gpu-class=large
-Lane.GPU_XLARGE   — nodes tainted gpu-class=xlarge
+Lane.GPU_XSMALL   — nodes labelled/tainted gpu-class=xsmall
+Lane.GPU_SMALL    — nodes labelled/tainted gpu-class=small
+Lane.GPU_MEDIUM   — nodes labelled/tainted gpu-class=medium
+Lane.GPU_LARGE    — nodes labelled/tainted gpu-class=large
+Lane.GPU_XLARGE   — nodes labelled/tainted gpu-class=xlarge
 ```
 
-Lanes are discovered dynamically at controller startup by scanning node taints, so adding a new GPU class requires only a controller restart rather than a code change. Each lane maintains independent utilization accounting and a separate priority queue.
+Only pods bearing the `lane-scheduler` scheduling gate are managed. A gated pod without a `gpu-class` label, or with an unrecognised class, is rejected immediately with a Warning Event and ignored. Lanes are discovered dynamically at controller startup by scanning node labels, so adding a new GPU class requires only a controller restart rather than a code change. Each lane maintains independent utilization accounting and a separate priority queue.
 
 ### Priority Score
 
@@ -150,19 +150,24 @@ CSE150_SP26_A00,0.270
 
 ## Kubernetes Integration
 
-### Taint/Toleration Gate
+### Scheduling Gate Pattern
 
-All managed nodes carry an inhibitory taint:
+An external mutating admission controller (outside this project's scope) injects two things onto every GPU pod before it reaches the lane scheduler:
 
-```
-dsmlp/scheduling-gate=controller:NoSchedule
-```
+1. A scheduling gate: `spec.schedulingGates: [{name: "lane-scheduler"}]` — this places the pod in the SchedulingGated / Pending state so the default Kubernetes scheduler ignores it.
+2. The `gpu-class` label (e.g. `gpu-class: medium`) — used to route the pod to the correct lane.
 
-Pods submitted by students remain Pending until the controller selects them. At that point the controller patches the pod with a matching toleration, and the default Kubernetes scheduler takes over placement. This design keeps the controller simple — it only decides *when* to admit a pod, not *where* to place it.
+The lane scheduler watches for pods with this gate. When a pod wins a scheduling cycle, the controller issues a single PATCH that:
+
+- Adds `spec.nodeSelector: {gpu-class: <class>}` to target the correct GPU nodes.
+- Adds a `gpu-class=<class>:NoSchedule` toleration to satisfy the node taint.
+- Removes the `lane-scheduler` scheduling gate, releasing the pod to the default Kubernetes scheduler.
+
+This design keeps the lane scheduler simple — it decides *when* and *to which lane* to admit a pod; the default scheduler handles *where* exactly to place it within that lane.
 
 ### GPU Class Routing
 
-An existing mutating admission controller (outside this project's scope) automatically adds `nodeSelector` and `gpu-class` tolerations to GPU pods based on their `gpu-class` label. This controller reads the same label to determine which lane a pod belongs to.
+GPU nodes are identified by their `gpu-class` node label and carry a matching `gpu-class=<class>:NoSchedule` taint. Pods without a `gpu-class` label, or with a class not present on any known node, are rejected with a Warning Event and never admitted.
 
 ### Pod Identity
 
@@ -170,9 +175,9 @@ An existing mutating admission controller (outside this project's scope) automat
 |---|---|
 | Student (scheduling entity) | Pod namespace (one namespace per student) |
 | Course | `dsmlp/course` label |
-| Lane | `gpu-class` label (absent → CPU lane) |
+| Lane | `gpu-class` label (absent or unknown → Warning Event, pod ignored) |
 | Batch mode | `dsmlp/batch=true` label |
-| Resource units | `resources.requests` (CPU cores or GPU count) |
+| Resource units | `resources.requests` (GPU count, floor 1.0) |
 
 ---
 
@@ -276,18 +281,15 @@ All tuning parameters are configurable via environment variables or CLI flags.
 
 ### Prerequisites
 
-- Kubernetes cluster with nodes tainted `dsmlp/scheduling-gate=controller:NoSchedule`
-- GPU nodes additionally tainted `gpu-class=<class>:NoSchedule` and labelled accordingly
+- Kubernetes cluster with GPU nodes labelled and tainted by `gpu-class`
 - One namespace per student
-- Existing mutating admission controller injecting `gpu-class` nodeSelector/tolerations
+- Mutating admission controller that injects `schedulingGates: [{name: "lane-scheduler"}]` and the `gpu-class` label onto GPU pods
 
 ### Node Setup
 
 ```bash
-# Taint all managed nodes
-kubectl taint nodes <node> dsmlp/scheduling-gate=controller:NoSchedule
-
-# Label GPU nodes by class
+# Label and taint each GPU node with its hardware class
+kubectl label nodes <gpu-node> gpu-class=medium
 kubectl taint nodes <gpu-node> gpu-class=medium:NoSchedule
 ```
 
@@ -310,23 +312,24 @@ The `manifests.yaml` includes RBAC (ServiceAccount, ClusterRole, ClusterRoleBind
 
 ### Pod Labels
 
-Students must label their pods:
+The mutating admission controller injects the scheduling gate and `gpu-class` label automatically. Student workload manifests should supply:
 
 ```yaml
 metadata:
   labels:
-    dsmlp/course: CSE234_SP26_A00      # required
-    gpu-class: medium                   # required for GPU pods
-    dsmlp/batch: "true"                 # optional, default interactive
+    dsmlp/course: CSE234_SP26_A00      # required for fair scheduling weight
+    dsmlp/batch: "true"                 # optional; absent = interactive
 ```
+
+The `gpu-class` label is injected by the mutating webhook and must not be set manually by students.
 
 ---
 
 ## Design Decisions
 
-**Why not a custom Kubernetes scheduler?** Custom schedulers must handle all scheduling decisions including node affinity, resource fitting, and pod topology. Using taints as a gate lets us focus purely on fairness policy while delegating placement to the well-tested default scheduler.
+**Why not a custom Kubernetes scheduler?** Custom schedulers must handle all scheduling decisions including node affinity, resource fitting, and pod topology. Using scheduling gates lets us focus purely on fairness policy while delegating placement to the well-tested default scheduler.
 
-**Why dynamic Lane enum?** GPU hardware classes are managed by a separate infrastructure team and change independently of the scheduler codebase. Building lanes from node taints at startup means a new GPU class requires only a controller restart rather than a code change and redeployment.
+**Why dynamic Lane enum?** GPU hardware classes are managed by a separate infrastructure team and change independently of the scheduler codebase. Building lanes from node labels at startup means a new GPU class requires only a controller restart rather than a code change and redeployment.
 
 **Why Bayesian shrinkage rather than pure course data?** Course sections may have few completions early in a semester, or may never accumulate enough data if they are small. The prior ensures estimates are always reasonable, while the shrinkage ensures the system learns when data is available. The `prior_weight` parameter controls the trade-off explicitly.
 
