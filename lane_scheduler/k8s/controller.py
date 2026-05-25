@@ -137,6 +137,7 @@ BATCH_STD_PCT        = _env_float("LANE_BATCH_STD_PCT",        0.15)
 WAIT_CACHE_INTERVAL  = _env_float("LANE_WAIT_CACHE_INTERVAL",  60.0)  # seconds
 PRIOR_WEIGHT         = _env_float("LANE_PRIOR_WEIGHT",          10.0)  # pseudo-count
 EWMA_ALPHA           = _env_float("LANE_EWMA_ALPHA",             0.1)  # residency EWMA smoothing factor
+DEFAULT_ACTIVE_DEADLINE = _env_int("LANE_DEFAULT_ACTIVE_DEADLINE_SECONDS", 86400)  # fallback for pods with no activeDeadlineSeconds
 NO_UNKNOWN_GPU_CLASS_EVENTS = os.environ.get(
     "LANE_NO_UNKNOWN_GPU_CLASS_EVENTS", ""
 ).lower() in ("1", "true", "yes")
@@ -187,6 +188,7 @@ class LaneSchedulerController:
         web_port:                     int   = 0,
         dry_run:                      bool  = False,
         no_unknown_gpu_class_events:  bool  = False,
+        default_active_deadline:      int   = DEFAULT_ACTIVE_DEADLINE,
     ):
         self.core_v1            = core_v1
         self.registry           = registry
@@ -197,6 +199,7 @@ class LaneSchedulerController:
         self.web_port           = web_port
         self.dry_run            = dry_run
         self.no_unknown_gpu_class_events = no_unknown_gpu_class_events
+        self._default_active_deadline    = default_active_deadline
 
         if dry_run:
             logger.warning("DRY RUN mode enabled — pods will not be patched and events will not be created")
@@ -450,15 +453,15 @@ class LaneSchedulerController:
     def _running_pod_from_pod(self, uid: str, pod: dict) -> Optional[RunningPod]:
         """
         Build a RunningPod from a Kubernetes pod dict.
-        Returns None if required fields are missing.
+        Returns None if required fields (start time, lane) are missing.
+        Pods without activeDeadlineSeconds are assumed to have a lifetime of
+        self._default_active_deadline seconds.
         """
         from lane_scheduler.k8s.pod_translator import _is_batch, _resource_units, _gpu_lane
         spec   = pod.get("spec")   or {}
         status = pod.get("status") or {}
 
-        deadline = spec.get("activeDeadlineSeconds")
-        if not deadline:
-            return None   # unmetered pod — skip
+        deadline = spec.get("activeDeadlineSeconds") or self._default_active_deadline
 
         # start_time from status.startTime (ISO8601); convert to monotonic offset
         start_str = status.get("startTime")
@@ -499,7 +502,7 @@ class LaneSchedulerController:
         ).get(LABEL_COURSE, NO_COURSE_LABEL) or NO_COURSE_LABEL
         student_id = (pod.get("metadata") or {}).get("namespace", "")
         batch     = _is_batch(pod)
-        deadline  = float((pod.get("spec") or {}).get("activeDeadlineSeconds") or 0)
+        deadline  = float((pod.get("spec") or {}).get("activeDeadlineSeconds") or self._default_active_deadline)
 
         with self._running_lock:
             if lane not in self._running:
@@ -1162,6 +1165,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--db-persist-interval", type=float, default=DB_PERSIST_INTERVAL,
                    help="How often to flush residency state to the DB, in seconds "
                         "(default: %(default)s; also set via LANE_DB_PERSIST_INTERVAL)")
+    p.add_argument("--default-active-deadline-seconds", type=int, default=DEFAULT_ACTIVE_DEADLINE,
+                   help="Default activeDeadlineSeconds applied to pods that have none set "
+                        "(default: %(default)s; also set via LANE_DEFAULT_ACTIVE_DEADLINE_SECONDS)")
 
     # --- Kubernetes label/taint wiring ---
     p.add_argument("--course-label", default=LABEL_COURSE,
@@ -1306,6 +1312,7 @@ def main() -> None:
         web_port                     = args.web_port,
         dry_run                      = args.dry_run,
         no_unknown_gpu_class_events  = args.no_unknown_gpu_class_events,
+        default_active_deadline      = args.default_active_deadline_seconds,
     )
 
     # Graceful shutdown on SIGTERM (Kubernetes) and SIGINT (local Ctrl-C)
