@@ -117,12 +117,13 @@ def is_known_gpu_class(gpu_class: str) -> bool:
 # Tuning defaults
 # ---------------------------------------------------------------------------
 
+EPSILON = 0.01  # utilization floor to prevent div-by-zero; not operator-tunable
+
 DEFAULTS = dict(
     alpha              = 1.0,    # urgency scaling factor
     t_half_interactive = 600.0,  # 10 min — interactive job aging half-life (s)
     t_half_batch       = 7200.0, # 2 hr  — batch job aging half-life (s)
     batch_mode_penalty = 0.3,    # batch jobs score at 30% of interactive baseline
-    epsilon            = 0.01,   # utilization floor to prevent div-by-zero
     utilization_window = 300.0,  # rolling utilization window (s)
     dispatch_k         = 8,      # max jobs dispatched per lane per cycle
 )
@@ -138,7 +139,6 @@ class SchedulerConfig:
     t_half_interactive: float = DEFAULTS["t_half_interactive"]
     t_half_batch:       float = DEFAULTS["t_half_batch"]
     batch_mode_penalty: float = DEFAULTS["batch_mode_penalty"]
-    epsilon:            float = DEFAULTS["epsilon"]
     utilization_window: float = DEFAULTS["utilization_window"]
     dispatch_k:         int   = DEFAULTS["dispatch_k"]
 
@@ -151,8 +151,6 @@ class SchedulerConfig:
             raise ValueError(f"t_half_batch must be > 0, got {self.t_half_batch}")
         if self.batch_mode_penalty <= 0:
             raise ValueError(f"batch_mode_penalty must be > 0, got {self.batch_mode_penalty}")
-        if self.epsilon <= 0:
-            raise ValueError(f"epsilon must be > 0, got {self.epsilon}")
         if self.utilization_window <= 0:
             raise ValueError(f"utilization_window must be > 0, got {self.utilization_window}")
         if self.dispatch_k <= 0:
@@ -256,7 +254,7 @@ class PriorityScorer:
         P(j, l) = W(c) × Mode(j) × Age(j) / U(c, l)
         Higher score → higher priority.
         """
-        u = max(utilization, self.config.epsilon)
+        u = max(utilization, EPSILON)
         return (course.class_weight
                 * self.config.mode_weight(job.batch)
                 * self.age_boost(job, now)
