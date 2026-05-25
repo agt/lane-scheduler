@@ -123,7 +123,6 @@ DISPATCH_K          = _env_int(  "LANE_DISPATCH_K",         8)
 ALPHA               = _env_float("LANE_ALPHA",              1.0)
 T_HALF_INTERACTIVE  = _env_float("LANE_T_HALF_INTERACTIVE", 600.0)
 T_HALF_BATCH        = _env_float("LANE_T_HALF_BATCH",      7200.0)
-UTIL_WINDOW         = _env_float("LANE_UTIL_WINDOW",        300.0)
 COURSE_CSV          = os.environ.get("LANE_COURSE_CSV", "/etc/lane-scheduler/courses.csv")
 RELOAD_INTERVAL     = _env_float("LANE_RELOAD_INTERVAL",     30.0) # file-change check interval
 RESIDENCY_DB        = os.environ.get("LANE_RESIDENCY_DB", "")      # empty = disabled
@@ -232,6 +231,8 @@ class LaneSchedulerController:
         self._running: dict[object, dict[str, RunningPod]] = {}
         # uid → student_id (namespace) for running pods; kept in sync with _running
         self._running_student: dict[str, str] = {}
+        # uid → class_id for running pods; kept in sync with _running
+        self._running_class: dict[str, str] = {}
         self._running_lock = threading.Lock()
 
         # Last observed mtime of the course CSV; None means not yet loaded by the loop.
@@ -516,6 +517,7 @@ class LaneSchedulerController:
                 self._running[lane] = {}
             self._running[lane][uid] = rp
             self._running_student[uid] = student_id
+            self._running_class[uid] = course_id
 
         with self._running_ctx_lock:
             self._running_ctx[uid] = (
@@ -527,6 +529,7 @@ class LaneSchedulerController:
             for lane_dict in self._running.values():
                 lane_dict.pop(uid, None)
             self._running_student.pop(uid, None)
+            self._running_class.pop(uid, None)
         with self._running_ctx_lock:
             self._running_ctx.pop(uid, None)
 
@@ -799,24 +802,29 @@ class LaneSchedulerController:
 
         now       = time.monotonic()
 
-        # Snapshot running units and student counts in one lock acquisition so
-        # both views are consistent and unaffected by concurrent pod-watch events.
+        # Snapshot running units, student counts, and per-class utilization in
+        # one lock acquisition so all views are consistent.
         with self._running_lock:
             running_units: dict = {
                 lane: sum(rp.resource_units for rp in pods.values())
                 for lane, pods in self._running.items()
             }
             running_counts: dict = {}
+            running_util: dict = {}
             for lane, pods in self._running.items():
                 counts: dict = {}
-                for uid in pods:
-                    sid = self._running_student.get(uid, "")
+                util_by_class: dict = {}
+                for uid, rp in pods.items():
+                    sid      = self._running_student.get(uid, "")
+                    class_id = self._running_class.get(uid, NO_COURSE_LABEL)
                     counts[sid] = counts.get(sid, 0) + 1
+                    util_by_class[class_id] = util_by_class.get(class_id, 0.0) + rp.resource_units
                 running_counts[lane] = counts
+                running_util[lane]   = util_by_class
 
-        # Push student running counts so the scheduler can apply the
-        # minimum-running-then-oldest-job prioritization rule.
+        # Push running snapshots so the scheduler can apply priority rules.
         self.scheduler.update_running_counts(running_counts)
+        self.scheduler.update_running_utilization(running_util)
 
         # Snapshot admitted-but-not-running units; augmented in the loop below
         # so jobs committed earlier in the same cycle are visible to later ones.
@@ -1143,8 +1151,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Interactive aging half-life in seconds (default: %(default)s)")
     p.add_argument("--t-half-batch", type=float, default=T_HALF_BATCH,
                    help="Batch aging half-life in seconds (default: %(default)s)")
-    p.add_argument("--util-window", type=float, default=UTIL_WINDOW,
-                   help="Utilization rolling window in seconds (default: %(default)s)")
 
     # --- Residency priors ---
     p.add_argument("--interactive-mean-pct", type=float, default=INTERACTIVE_MEAN_PCT,
@@ -1269,7 +1275,6 @@ def main() -> None:
         alpha               = args.alpha,
         t_half_interactive  = args.t_half_interactive,
         t_half_batch        = args.t_half_batch,
-        utilization_window  = args.util_window,
         dispatch_k          = args.dispatch_k,
     )
 
