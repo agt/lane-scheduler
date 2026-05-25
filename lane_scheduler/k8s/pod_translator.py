@@ -9,13 +9,15 @@ NoSchedule toleration.
 Admission gate model
 ~~~~~~~~~~~~~~~~~~~~
     An external mutating admission controller injects a scheduling gate
-    ("lane-scheduler") and a nodeSelector (e.g. gpu-class=medium) onto every
-    pod of interest before it reaches our controller.  The pod is held in the
-    SchedulingGated / Pending state until we:
+    ("lane-scheduler") and the gpu-class label onto every pod of interest
+    before it reaches our controller.  The pod is held in the SchedulingGated /
+    Pending state until we:
 
-        a) add the gpu-class=<class>:NoSchedule toleration so the pod can land
+        a) add a nodeSelector entry (gpu-class=<class>) so the default
+           scheduler targets only the correct GPU nodes,
+        b) add the gpu-class=<class>:NoSchedule toleration so the pod can land
            on tainted GPU nodes, and
-        b) remove the "lane-scheduler" schedulingGate entry.
+        c) remove the "lane-scheduler" schedulingGate entry.
 
     After both operations the default Kubernetes scheduler places the pod on a
     matching node.
@@ -205,9 +207,11 @@ def admission_patch(pod: dict) -> dict:
     """
     Build a strategic-merge patch that admits the pod for Kubernetes scheduling:
 
-        a) Adds the gpu-class=<class>:NoSchedule toleration so the pod can land
-           on the tainted GPU node matching its nodeSelector.
-        b) Removes the "lane-scheduler" schedulingGate entry so the default
+        a) Adds a nodeSelector entry (gpu-class=<class>) so the default
+           scheduler targets only nodes in the correct GPU lane.
+        b) Adds the gpu-class=<class>:NoSchedule toleration so the pod can
+           land on the tainted GPU node.
+        c) Removes the "lane-scheduler" schedulingGate entry so the default
            Kubernetes scheduler picks up the pod.
 
     Returns {} if the scheduling gate is already absent (idempotent).
@@ -222,7 +226,12 @@ def admission_patch(pod: dict) -> dict:
     gpu_class = _labels(pod).get(LABEL_GPU_CLASS, "").strip()
     patch: dict = {"spec": {}}
 
-    # a) GPU-class NoSchedule toleration
+    # a) nodeSelector: direct the default scheduler to the right GPU lane.
+    existing_node_selector = dict((pod.get("spec", {}) or {}).get("nodeSelector", {}) or {})
+    if gpu_class and existing_node_selector.get(_GPU_TAINT_KEY) != gpu_class:
+        patch["spec"]["nodeSelector"] = {**existing_node_selector, _GPU_TAINT_KEY: gpu_class}
+
+    # b) GPU-class NoSchedule toleration
     existing_tolerations = list((pod.get("spec", {}) or {}).get("tolerations", []) or [])
     already_tolerated = any(
         t.get("key") == _GPU_TAINT_KEY and t.get("value") == gpu_class
@@ -236,7 +245,7 @@ def admission_patch(pod: dict) -> dict:
             "effect":   "NoSchedule",
         }]
 
-    # b) Remove the lane-scheduler scheduling gate.
+    # c) Remove the lane-scheduler scheduling gate.
     # Use the $patch:delete directive so other gates (if any) are preserved.
     patch["spec"]["schedulingGates"] = [
         {"$patch": "delete", "name": SCHEDULING_GATE_NAME}

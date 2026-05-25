@@ -270,10 +270,27 @@ class TestPodToJob(unittest.TestCase):
 
 class TestAdmissionPatch(unittest.TestCase):
 
-    def test_adds_gpu_class_toleration(self):
-        pod = _gpu_pod("medium")
+    def _gated_gpu_pod(self, gpu_class):
+        pod = _gpu_pod(gpu_class)
         pod["spec"]["schedulingGates"] = [{"name": SCHEDULING_GATE_NAME}]
+        return pod
+
+    def test_adds_node_selector(self):
+        patch = admission_patch(self._gated_gpu_pod("medium"))
+        self.assertEqual(
+            patch["spec"]["nodeSelector"].get(GPU_CLASS_LABEL_KEY), "medium"
+        )
+
+    def test_preserves_existing_node_selector_entries(self):
+        pod = self._gated_gpu_pod("small")
+        pod["spec"]["nodeSelector"] = {"other-key": "other-val"}
         patch = admission_patch(pod)
+        ns = patch["spec"]["nodeSelector"]
+        self.assertEqual(ns.get("other-key"), "other-val")
+        self.assertEqual(ns.get(GPU_CLASS_LABEL_KEY), "small")
+
+    def test_adds_gpu_class_toleration(self):
+        patch = admission_patch(self._gated_gpu_pod("medium"))
         tols = patch["spec"]["tolerations"]
         self.assertTrue(
             any(t.get("key") == GPU_CLASS_LABEL_KEY and t.get("value") == "medium"
@@ -281,10 +298,7 @@ class TestAdmissionPatch(unittest.TestCase):
         )
 
     def test_removes_scheduling_gate(self):
-        pod = _gpu_pod("medium")
-        pod["spec"]["schedulingGates"] = [{"name": SCHEDULING_GATE_NAME}]
-        patch = admission_patch(pod)
-        self.assertIn("schedulingGates", patch["spec"])
+        patch = admission_patch(self._gated_gpu_pod("medium"))
         gate_patch = patch["spec"]["schedulingGates"]
         self.assertTrue(
             any(g.get("$patch") == "delete" and g.get("name") == SCHEDULING_GATE_NAME
@@ -292,14 +306,12 @@ class TestAdmissionPatch(unittest.TestCase):
         )
 
     def test_preserves_existing_tolerations(self):
-        pod = _gpu_pod("small")
+        pod = self._gated_gpu_pod("small")
         pod["spec"]["tolerations"] = [{"key": "other", "operator": "Exists"}]
-        pod["spec"]["schedulingGates"] = [{"name": SCHEDULING_GATE_NAME}]
         patch = admission_patch(pod)
         self.assertEqual(len(patch["spec"]["tolerations"]), 2)
 
     def test_idempotent_when_gate_absent(self):
-        # Gate already removed → nothing to do.
         pod = _gpu_pod("medium")
         pod["spec"]["schedulingGates"] = []
         self.assertEqual(admission_patch(pod), {})
