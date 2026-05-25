@@ -122,7 +122,6 @@ DISPATCH_K          = _env_int(  "LANE_DISPATCH_K",         8)
 ALPHA               = _env_float("LANE_ALPHA",              1.0)
 T_HALF_INTERACTIVE  = _env_float("LANE_T_HALF_INTERACTIVE", 600.0)
 T_HALF_BATCH        = _env_float("LANE_T_HALF_BATCH",      7200.0)
-EPSILON             = _env_float("LANE_EPSILON",            0.01)
 UTIL_WINDOW         = _env_float("LANE_UTIL_WINDOW",        300.0)
 COURSE_CSV          = os.environ.get("LANE_COURSE_CSV", "/etc/lane-scheduler/courses.csv")
 RELOAD_INTERVAL     = _env_float("LANE_RELOAD_INTERVAL",     30.0) # file-change check interval
@@ -1095,8 +1094,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Interactive aging half-life in seconds (default: %(default)s)")
     p.add_argument("--t-half-batch", type=float, default=T_HALF_BATCH,
                    help="Batch aging half-life in seconds (default: %(default)s)")
-    p.add_argument("--epsilon", type=float, default=EPSILON,
-                   help="Utilization floor epsilon (default: %(default)s)")
     p.add_argument("--util-window", type=float, default=UTIL_WINDOW,
                    help="Utilization rolling window in seconds (default: %(default)s)")
 
@@ -1212,7 +1209,6 @@ def main() -> None:
         alpha               = args.alpha,
         t_half_interactive  = args.t_half_interactive,
         t_half_batch        = args.t_half_batch,
-        epsilon             = args.epsilon,
         utilization_window  = args.util_window,
         dispatch_k          = args.dispatch_k,
     )

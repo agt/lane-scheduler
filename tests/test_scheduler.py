@@ -349,14 +349,6 @@ class TestSchedulerConfigValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             SchedulerConfig(alpha=-0.1)
 
-    def test_zero_epsilon(self):
-        with self.assertRaises(ValueError):
-            SchedulerConfig(epsilon=0.0)
-
-    def test_negative_epsilon(self):
-        with self.assertRaises(ValueError):
-            SchedulerConfig(epsilon=-1.0)
-
     def test_zero_t_half_interactive(self):
         with self.assertRaises(ValueError):
             SchedulerConfig(t_half_interactive=0.0)
