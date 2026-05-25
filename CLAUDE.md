@@ -26,6 +26,14 @@ python tools/simulate.py
 docker build -t lane-scheduler .
 ```
 
+**Regenerate docs diagrams** (run whenever `docs/scheduler-flow.dot` changes):
+```bash
+dot -Tsvg docs/scheduler-flow.dot -o docs/scheduler-flow.svg
+dot -Tpng docs/scheduler-flow.dot -o docs/scheduler-flow.png
+```
+
+Requires Graphviz (`apt-get install -y graphviz` or `brew install graphviz`). Commit both output files alongside any `.dot` change.
+
 There is no separate lint or format step configured.
 
 ## Architecture
