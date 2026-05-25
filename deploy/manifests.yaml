@@ -67,10 +67,10 @@ metadata:
   namespace: lane-scheduler
 data:
   courses.csv: |
-    course_id,level,seats
-    CSE101_SP26_A00,lower,210
-    CSE150_SP26_A00,upper,55
-    CSE234_SP26_A00,graduate,18
+    course_id,weight
+    CSE101_SP26_A00,0.071
+    CSE150_SP26_A00,0.270
+    CSE234_SP26_A00,0.775
 
 ---
 # ============================================================

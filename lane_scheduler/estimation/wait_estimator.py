@@ -213,6 +213,11 @@ def _bisect_wait(
     f_max = f(t_max)
     if f_max < 0:
         # Even by the deadline ceiling we don't expect enough slots
+        logger.debug(
+            "_bisect_wait saturated at t_max=%.0fs "
+            "(target_slots=%.2f z_adjust=%.4f)",
+            t_max, target_slots, z_adjust,
+        )
         return t_max
 
     # Check if target already met at t=0 (queue rank <= already-freeing pods)
@@ -346,6 +351,8 @@ class WaitTimeCache:
     # ------------------------------------------------------------------
 
     def start(self) -> None:
+        if self._thread.is_alive():
+            return
         self._thread.start()
         logger.info("WaitTimeCache started (interval=%.0fs)", self._interval)
 

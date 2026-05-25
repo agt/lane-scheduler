@@ -1082,10 +1082,9 @@ class LaneSchedulerController:
                 if mtime is not None and mtime != self._csv_mtime:
                     try:
                         n = self.registry.load_csv(self.course_csv)
-                        # Re-register any newly loaded courses
+                        # Re-register all courses so weight edits propagate to existing entries.
                         for course in self.registry.all_courses():
-                            if not self.scheduler.has_class(course.class_id):
-                                self.scheduler.register_class(course)
+                            self.scheduler.register_class(course)
                         self._csv_mtime = mtime
                         logger.info("CSV reloaded (%d courses); mtime changed", n)
                     except Exception as exc:

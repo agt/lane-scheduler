@@ -30,7 +30,7 @@ import logging
 from dataclasses import dataclass, field
 from collections import defaultdict
 
-from typing import Optional
+from typing import Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -336,6 +336,22 @@ class Scheduler:
                       if running_in_lane.get(s, 0) == min_running]
         return min(candidates, key=lambda s: student_map[s][0].submit_time)
 
+    def _iter_top_candidates(
+        self, lane: str, now: float
+    ) -> Iterator[tuple[str, float, Job, CourseClass]]:
+        """Yield (class_id, score, job, course) for the top student of each active
+        class in *lane*.  Must be called while holding self._lock."""
+        for class_id, student_map in self._queues[lane].items():
+            course          = self._classes[class_id]
+            active_students = {s for s, jobs in student_map.items() if jobs}
+            if not active_students:
+                continue
+            student_id = self._top_student(active_students, lane, student_map)
+            job        = student_map[student_id][0]
+            util       = self.util.utilization(class_id, lane, now)
+            score      = self.scorer.score(job, course, util, now)
+            yield class_id, score, job, course
+
     def register_class(self, course: CourseClass) -> None:
         with self._lock:
             self._classes[course.class_id] = course
@@ -401,17 +417,10 @@ class Scheduler:
                     continue
 
                 # Step 1 — one candidate per class
-                candidates: list[tuple[float, Job, CourseClass]] = []
-                for class_id, student_map in lane_queue.items():
-                    course          = self._classes[class_id]
-                    active_students = {s for s, jobs in student_map.items() if jobs}
-                    if not active_students:
-                        continue
-                    student_id = self._top_student(active_students, lane, student_map)
-                    job        = student_map[student_id][0]
-                    util       = self.util.utilization(class_id, lane, now)
-                    score      = self.scorer.score(job, course, util, now)
-                    candidates.append((score, job, course))
+                candidates: list[tuple[float, Job, CourseClass]] = [
+                    (score, job, course)
+                    for _, score, job, course in self._iter_top_candidates(lane, now)
+                ]
 
                 if not candidates:
                     continue
@@ -449,21 +458,18 @@ class Scheduler:
         Return all per-class top candidates for *lane*, scored and sorted
         descending.  Used by the wait-time snapshot to compute ranks in one
         pass rather than calling queue_rank() per pod (O(Q) vs O(Q²)).
+
+        Acquires self._lock for the full scoring pass; callers on other threads
+        (e.g. the wait-cache background thread) will contend with cycle() at
+        the per-lane granularity.
         """
         now = now if now is not None else time.monotonic()
         with self._lock:
-            candidates: list[tuple[float, Job]] = []
-            for class_id, student_map in self._queues[lane].items():
-                course          = self._classes[class_id]
-                active_students = {s for s, jobs in student_map.items() if jobs}
-                if not active_students:
-                    continue
-                student_id = self._top_student(active_students, lane, student_map)
-                job        = student_map[student_id][0]
-                util       = self.util.utilization(class_id, lane, now)
-                score      = self.scorer.score(job, course, util, now)
-                candidates.append((score, job))
-            candidates.sort(key=lambda x: x[0], reverse=True)
+            candidates = sorted(
+                ((score, job)
+                 for _, score, job, _ in self._iter_top_candidates(lane, now)),
+                key=lambda x: x[0], reverse=True,
+            )
             return candidates
 
     def queue_rank(self, job_uid: str, lane: str,
@@ -478,20 +484,11 @@ class Scheduler:
         """
         now = now if now is not None else time.monotonic()
         with self._lock:
-            candidates: list[tuple[float, str]] = []   # (score, job_uid)
-
-            for class_id, student_map in self._queues[lane].items():
-                course          = self._classes[class_id]
-                active_students = {s for s, jobs in student_map.items() if jobs}
-                if not active_students:
-                    continue
-                student_id = self._top_student(active_students, lane, student_map)
-                job        = student_map[student_id][0]
-                util       = self.util.utilization(class_id, lane, now)
-                score      = self.scorer.score(job, course, util, now)
-                candidates.append((score, job.job_id))
-
-            candidates.sort(key=lambda x: x[0], reverse=True)
+            candidates = sorted(
+                ((score, job.job_id)
+                 for _, score, job, _ in self._iter_top_candidates(lane, now)),
+                key=lambda x: x[0], reverse=True,
+            )
             for rank, (_, uid) in enumerate(candidates, start=1):
                 if uid == job_uid:
                     return rank
@@ -513,16 +510,9 @@ class Scheduler:
     def class_scores(self, lane: str,
                      now: Optional[float] = None) -> dict[str, float]:
         """Current top-candidate score per class in a lane.  For dashboards."""
-        now    = now if now is not None else time.monotonic()
-        scores = {}
+        now = now if now is not None else time.monotonic()
         with self._lock:
-            for class_id, student_map in self._queues[lane].items():
-                course  = self._classes[class_id]
-                active  = {s for s, jobs in student_map.items() if jobs}
-                if not active:
-                    continue
-                student_id = self._top_student(active, lane, student_map)
-                job        = student_map[student_id][0]
-                util       = self.util.utilization(class_id, lane, now)
-                scores[class_id] = self.scorer.score(job, course, util, now)
-        return scores
+            return {
+                class_id: score
+                for class_id, score, _, _ in self._iter_top_candidates(lane, now)
+            }

@@ -238,7 +238,7 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
     cache_age = ctrl.wait_cache.snapshot_age()
 
     return {
-        "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "system": {
             "cycle_interval_s":      ctrl.cycle_interval,
             "wait_cache_age_s":      round(cache_age, 1) if cache_age is not None else None,
