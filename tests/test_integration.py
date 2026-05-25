@@ -169,6 +169,46 @@ class TestCourseRegistry(unittest.TestCase):
         ])
         self.assertEqual(CourseRegistry().load_csv(path), 1)
 
+    def test_glob_star_matches(self):
+        path = _write_csv([{"course_id": "RITS_*", "weight": 0.5}])
+        reg = CourseRegistry()
+        self.assertEqual(reg.load_csv(path), 1)
+        c = reg.get("RITS_CS101_SP26_A00")
+        self.assertAlmostEqual(c.class_weight, 0.5)
+        self.assertEqual(c.class_id, "RITS_CS101_SP26_A00")
+
+    def test_exact_beats_glob(self):
+        path = _write_csv([
+            {"course_id": "RITS_CS101_SP26_A00", "weight": 0.9},
+            {"course_id": "RITS_*", "weight": 0.5},
+        ])
+        reg = CourseRegistry()
+        reg.load_csv(path)
+        self.assertAlmostEqual(reg.get("RITS_CS101_SP26_A00").class_weight, 0.9)
+
+    def test_first_glob_wins(self):
+        path = _write_csv([
+            {"course_id": "RITS_CS*", "weight": 0.3},
+            {"course_id": "RITS_*",   "weight": 0.7},
+        ])
+        reg = CourseRegistry()
+        reg.load_csv(path)
+        self.assertAlmostEqual(reg.get("RITS_CS101_SP26_A00").class_weight, 0.3)
+
+    def test_glob_no_match_falls_back(self):
+        path = _write_csv([{"course_id": "RITS_*", "weight": 0.5}])
+        reg = CourseRegistry()
+        reg.load_csv(path)
+        self.assertAlmostEqual(reg.get("OTHER_101_SP26_A00").class_weight, 1.0)
+
+    def test_glob_cached(self):
+        path = _write_csv([{"course_id": "RITS_*", "weight": 0.5}])
+        reg = CourseRegistry()
+        reg.load_csv(path)
+        first  = reg.get("RITS_CS101_SP26_A00")
+        second = reg.get("RITS_CS101_SP26_A00")
+        self.assertIs(first, second)
+
 
 # ---------------------------------------------------------------------------
 # needs_scheduling
