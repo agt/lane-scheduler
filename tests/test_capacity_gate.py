@@ -391,5 +391,77 @@ class TestCapacityGate(unittest.TestCase):
         self.assertEqual(_queue_depth(ctrl.scheduler, lane), 1)
 
 
+    # ------------------------------------------------------------------
+    # Default activeDeadlineSeconds for pods without one set
+    # ------------------------------------------------------------------
+
+    def test_running_pod_no_deadline_uses_default(self):
+        """Pod with no activeDeadlineSeconds is tracked with the 86400s default."""
+        ctrl, _ = _build_controller(self.csv_path, gpu_class="small", gpu_count=4)
+
+        lane = _gpu("small")
+        running_pod = {
+            "metadata": {"uid": "p1", "name": "pod-p1", "namespace": "ns",
+                         "labels": {"dsmlp/course": "CSE234_SP26_A00",
+                                    GPU_CLASS_LABEL_KEY: "small"}},
+            "spec": {"nodeName": "node-1", "tolerations": [],
+                     "containers": [{"name": "c", "resources": {
+                         "requests": {"cpu": "2", "nvidia.com/gpu": "1"}
+                     }}]},
+            "status": {"phase": "Running",
+                       "startTime": "2026-01-01T00:00:00Z"},
+        }
+        ctrl._handle_pod_event({"type": "MODIFIED", "object": running_pod})
+
+        with ctrl._running_lock:
+            tracked = ctrl._running.get(lane, {}).get("p1")
+        self.assertIsNotNone(tracked, "pod should be tracked even without activeDeadlineSeconds")
+        self.assertEqual(tracked.active_deadline_seconds, 86400)
+
+    def test_running_pod_no_deadline_custom_default(self):
+        """Custom default_active_deadline is used for pods without activeDeadlineSeconds."""
+        from lane_scheduler.estimation.wait_estimator import ResidencyProfile
+        from lane_scheduler.core.course_registry import CourseRegistry
+        from lane_scheduler.core.scheduler import SchedulerConfig
+        from lane_scheduler.k8s.controller import LaneSchedulerController
+        from unittest.mock import MagicMock
+
+        core_v1 = MagicMock()
+        registry = CourseRegistry()
+        registry.load_csv(self.csv_path)
+        residency_profiles = {
+            "interactive": ResidencyProfile(mean_pct=0.4, std_pct=0.2),
+            "batch":       ResidencyProfile(mean_pct=0.7, std_pct=0.15),
+        }
+        ctrl = LaneSchedulerController(
+            core_v1=core_v1,
+            registry=registry,
+            sched_config=SchedulerConfig(),
+            residency_profiles=residency_profiles,
+            default_active_deadline=7200,
+        )
+        ctrl.node_tracker.upsert(_make_node(gpu_class="small", gpu_count="4"))
+        ctrl.scheduler.set_lane_capacity(ctrl.node_tracker.lane_capacity())
+
+        lane = _gpu("small")
+        running_pod = {
+            "metadata": {"uid": "p2", "name": "pod-p2", "namespace": "ns",
+                         "labels": {"dsmlp/course": "CSE234_SP26_A00",
+                                    GPU_CLASS_LABEL_KEY: "small"}},
+            "spec": {"nodeName": "node-1", "tolerations": [],
+                     "containers": [{"name": "c", "resources": {
+                         "requests": {"cpu": "2", "nvidia.com/gpu": "1"}
+                     }}]},
+            "status": {"phase": "Running",
+                       "startTime": "2026-01-01T00:00:00Z"},
+        }
+        ctrl._handle_pod_event({"type": "MODIFIED", "object": running_pod})
+
+        with ctrl._running_lock:
+            tracked = ctrl._running.get(lane, {}).get("p2")
+        self.assertIsNotNone(tracked, "pod should be tracked with custom default")
+        self.assertEqual(tracked.active_deadline_seconds, 7200)
+
+
 if __name__ == "__main__":
     unittest.main()
