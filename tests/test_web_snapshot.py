@@ -56,7 +56,7 @@ def _make_controller(cycle_interval=10.0):
 
 def _register(ctrl, class_id, weight=1.0):
     course = CourseClass(class_id=class_id, class_weight=weight)
-    ctrl.registry._courses[class_id] = course
+    ctrl.registry._exact[class_id] = course
     ctrl.scheduler.register_class(course)
     return course
 
