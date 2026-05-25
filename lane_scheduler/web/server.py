@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # Dashboard HTML (self-contained — no external CDN dependencies)
 # ---------------------------------------------------------------------------
 
-_DASHBOARD_HTML = b"""\
+_DASHBOARD_HTML = """\
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -260,7 +260,7 @@ def _make_handler(controller: "LaneSchedulerController"):
         def do_GET(self) -> None:
             path = self.path.split("?", 1)[0]
             if path in ("/", "/index.html"):
-                self._serve(200, "text/html; charset=utf-8", _DASHBOARD_HTML)
+                self._serve(200, "text/html; charset=utf-8", _DASHBOARD_HTML.encode("utf-8"))
             elif path == "/api/snapshot":
                 self._serve_snapshot()
             else:
