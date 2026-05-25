@@ -31,9 +31,6 @@ def setUpModule():
     initialise_lanes(["xsmall", "small", "medium", "large", "xlarge"])
 
 
-def _cpu():
-    from lane_scheduler.core.scheduler import CPU_LANE; return CPU_LANE
-
 def _gpu(cls):
     return lane_for_gpu_class(cls)
 
@@ -244,23 +241,13 @@ class TestNeedsScheduling(unittest.TestCase):
 
 class TestPodToJob(unittest.TestCase):
 
-    def test_cpu_pod(self):
-        pod = _make_pod(
-            labels={"dsmlp/course": "CSE101_SP26_A00"},
-            containers=[{"name": "c", "resources": {"requests": {"cpu": "4"}}}],
-        )
-        job = pod_to_job(pod, submit_time=0.0)
-        self.assertEqual(job.lane, _cpu())
-        self.assertAlmostEqual(job.resource_units, 4.0)
-        self.assertFalse(job.batch)
-
     def test_each_gpu_class_maps_to_distinct_lane(self):
-        from lane_scheduler.core.scheduler import GPU_LANES
+        from lane_scheduler.core.scheduler import Lane
         lanes = {cls: pod_to_job(_gpu_pod(cls)).lane
                  for cls in ("xsmall", "small", "medium", "large", "xlarge")}
         self.assertEqual(len(set(lanes.values())), 5)
         for cls, lane in lanes.items():
-            self.assertIn(lane, GPU_LANES)
+            self.assertIn(lane, Lane)
 
     def test_gpu_class_matches_lane_for_gpu_class(self):
         for cls in ("xsmall", "small", "medium", "large", "xlarge"):
@@ -272,23 +259,13 @@ class TestPodToJob(unittest.TestCase):
     def test_batch_flag_unset_for_interactive(self):
         self.assertFalse(pod_to_job(_gpu_pod("large", batch=False)).batch)
 
-    def test_batch_on_cpu_pod(self):
-        pod = _make_pod(labels={"dsmlp/batch": "true"})
-        job = pod_to_job(pod)
-        self.assertEqual(job.lane, _cpu())
-        self.assertTrue(job.batch)
-
     def test_gpu_count_is_resource_units(self):
         self.assertAlmostEqual(pod_to_job(_gpu_pod("large", gpu_count="3")).resource_units, 3.0)
 
     def test_no_course_label(self):
-        self.assertEqual(pod_to_job(_make_pod(labels={})).class_id, NO_COURSE_LABEL)
-
-    def test_millicore_cpu_floor(self):
-        pod = _make_pod(
-            containers=[{"name": "c", "resources": {"requests": {"cpu": "500m"}}}]
-        )
-        self.assertAlmostEqual(pod_to_job(pod).resource_units, 1.0)
+        pod = _gpu_pod("small")
+        del pod["metadata"]["labels"]["dsmlp/course"]
+        self.assertEqual(pod_to_job(pod).class_id, NO_COURSE_LABEL)
 
     def test_batch_label_case_insensitive(self):
         for val in ("true", "True", "TRUE"):
@@ -297,11 +274,13 @@ class TestPodToJob(unittest.TestCase):
             self.assertTrue(pod_to_job(pod).batch)
 
     def test_student_id_is_namespace(self):
-        self.assertEqual(pod_to_job(_make_pod(namespace="alice")).student_id, "alice")
+        pod = _gpu_pod("small")
+        pod["metadata"]["namespace"] = "alice"
+        self.assertEqual(pod_to_job(pod).student_id, "alice")
 
-    def test_unrecognised_gpu_class_falls_back_to_cpu(self):
-        job = pod_to_job(_gpu_pod("supergpu"))
-        self.assertEqual(job.lane, _cpu())
+    def test_unrecognised_gpu_class_raises(self):
+        with self.assertRaises(ValueError):
+            pod_to_job(_gpu_pod("supergpu"))
 
 
 # ---------------------------------------------------------------------------
@@ -363,11 +342,11 @@ class TestAdmissionPatch(unittest.TestCase):
 
 class TestNodeCapacityTracker(unittest.TestCase):
 
-    def test_cpu_only_node_not_tracked(self):
-        # Nodes without gpu-class label are not in the managed pool.
+    def test_node_without_gpu_class_label_ignored(self):
         t = NodeCapacityTracker()
         t.upsert(_make_node(cpu="64"))  # no gpu_class → not tracked
-        self.assertAlmostEqual(t.lane_capacity().get(_cpu(), 0.0), 0.0)
+        for v in t.lane_capacity().values():
+            self.assertAlmostEqual(v, 0.0)
 
     def test_each_gpu_class_tracked_independently(self):
         t = NodeCapacityTracker()
@@ -401,10 +380,9 @@ class TestNodeCapacityTracker(unittest.TestCase):
         t.remove("gn")
         self.assertAlmostEqual(t.lane_capacity()[_gpu("small")], 0.0)
 
-    def test_gpu_node_not_counted_in_cpu_lane(self):
+    def test_gpu_node_capacity_is_gpu_count(self):
         t = NodeCapacityTracker()
         t.upsert(_make_node(name="gn", cpu="32", gpu="4", gpu_class="medium"))
-        self.assertAlmostEqual(t.lane_capacity().get(_cpu(), 0.0), 0.0)
         self.assertAlmostEqual(t.lane_capacity()[_gpu("medium")], 4.0)
 
     def test_node_with_unmanaged_gpu_class_excluded(self):
@@ -414,7 +392,6 @@ class TestNodeCapacityTracker(unittest.TestCase):
         t.upsert(_make_node(name="unknown-gpu", cpu="32", gpu="4",
                             gpu_class="h200"))
         caps = t.lane_capacity()
-        self.assertAlmostEqual(caps.get(_cpu(), 0.0), 0.0)
         for cls in ("xsmall", "small", "medium", "large", "xlarge"):
             self.assertAlmostEqual(caps[_gpu(cls)], 0.0, msg=f"leaked into {cls}")
 

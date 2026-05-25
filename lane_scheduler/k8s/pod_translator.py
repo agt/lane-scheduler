@@ -40,13 +40,12 @@ Resource → lane mapping
     gpu-class=medium                → "gpu-medium"
     gpu-class=large                 → "gpu-large"
     gpu-class=xlarge                → "gpu-xlarge"
-    No gpu-class label / unknown    → rejected; error Event emitted
+    No gpu-class label / unknown    → rejected; error Event emitted; ValueError
+                                      raised by pod_to_job()
 
 Resource units
 ~~~~~~~~~~~~~~
     GPU lanes : total nvidia.com/gpu count requested, floor 1.0
-    CPU lane  : total CPU cores requested (millicores normalised), floor 1.0
-                (kept for internal translation; CPU pods are rejected in _enqueue)
 """
 
 from __future__ import annotations
@@ -56,7 +55,7 @@ import os
 import time
 from typing import Optional
 
-from lane_scheduler.core.scheduler import Job, CPU_LANE, lane_for_gpu_class
+from lane_scheduler.core.scheduler import Job, lane_for_gpu_class
 from lane_scheduler.core.node_capacity import GPU_CLASS_LABEL_KEY as _GPU_TAINT_KEY
 
 logger = logging.getLogger(__name__)
@@ -98,13 +97,6 @@ def _gpu_lane(pod: dict) -> Optional[str]:
     return lane_for_gpu_class(gpu_class)
 
 
-def _parse_cpu_millicores(value: str) -> float:
-    value = value.strip()
-    if value.endswith("m"):
-        return float(value[:-1])
-    return float(value) * 1000.0
-
-
 def _parse_gpu_count(value: str) -> float:
     return float(value.strip())
 
@@ -113,30 +105,21 @@ def _resource_units(pod: dict, gpu_lane: Optional[str]) -> float:
     """
     Returns a resource scalar for utilization accounting.
         GPU lanes : nvidia.com/gpu count, floor 1.0
-        CPU lane  : CPU cores, floor 1.0
+        Unknown lane (gpu_lane=None): returns 1.0
     """
+    if gpu_lane is None:
+        return 1.0
     containers = pod.get("spec", {}).get("containers", []) or []
-    total_cpu_mc = 0.0
-    total_gpu    = 0.0
-
+    total_gpu  = 0.0
     for container in containers:
         requests = (container.get("resources", {}) or {}).get("requests", {}) or {}
-        if "cpu" in requests:
-            try:
-                total_cpu_mc += _parse_cpu_millicores(requests["cpu"])
-            except ValueError:
-                logger.debug("Unparseable CPU request %r in pod %s",
-                             requests["cpu"], _pod_name(pod))
         if _GPU_RESOURCE in requests:
             try:
                 total_gpu += _parse_gpu_count(requests[_GPU_RESOURCE])
             except ValueError:
                 logger.debug("Unparseable GPU request %r in pod %s",
                              requests[_GPU_RESOURCE], _pod_name(pod))
-
-    if gpu_lane is not None:
-        return max(total_gpu, 1.0)
-    return max(total_cpu_mc / 1000.0, 1.0)
+    return max(total_gpu, 1.0)
 
 
 def _pod_name(pod: dict) -> str:
@@ -155,9 +138,11 @@ def pod_to_job(pod: dict, submit_time: Optional[float] = None) -> Job:
         student_id  = pod namespace          (one namespace per student)
         class_id    = dsmlp/course label
         job_id      = pod UID
-        lane        = gpu-class label → GPU lane, or CPU if absent
+        lane        = gpu-class label → GPU lane string
         batch       = dsmlp/batch == "true"
-        resource_units = GPU count (GPU lanes) or CPU cores (CPU lane)
+        resource_units = nvidia.com/gpu count requested, floor 1.0
+
+    Raises ValueError if the pod has no recognised gpu-class label.
     """
     meta      = pod.get("metadata", {}) or {}
     namespace = meta.get("namespace", "unknown")
@@ -167,8 +152,14 @@ def pod_to_job(pod: dict, submit_time: Optional[float] = None) -> Job:
     course_id = labels.get(LABEL_COURSE, _NO_COURSE_LABEL).strip() or _NO_COURSE_LABEL
     batch     = _is_batch(pod)
     gpu_lane  = _gpu_lane(pod)
-    lane      = gpu_lane if gpu_lane is not None else CPU_LANE
-    units     = _resource_units(pod, gpu_lane)
+    if gpu_lane is None:
+        gpu_class = labels.get(LABEL_GPU_CLASS, "").strip()
+        raise ValueError(
+            f"Pod {_pod_name(pod)} has no recognised gpu-class label "
+            f"(got {gpu_class!r}); cannot assign to a lane"
+        )
+    lane  = gpu_lane
+    units = _resource_units(pod, gpu_lane)
 
     job = Job(
         job_id         = uid,

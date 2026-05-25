@@ -32,7 +32,7 @@ try:
 except ImportError:
     sys.exit("kubernetes package not found.  Run: pip install kubernetes")
 
-from lane_scheduler.core.scheduler import Job, Lane, CPU_LANE, SchedulerConfig, Scheduler, initialise_lanes, lane_for_gpu_class, is_known_gpu_class
+from lane_scheduler.core.scheduler import Job, Lane, SchedulerConfig, Scheduler, initialise_lanes, lane_for_gpu_class, is_known_gpu_class
 from lane_scheduler.core.course_registry import CourseRegistry
 from lane_scheduler.core.node_capacity import (
     NodeCapacityTracker,
@@ -94,7 +94,7 @@ def discover_gpu_classes(core_v1: "client.CoreV1Api") -> list[str]:
     else:
         logger.warning(
             "No %r labels found on any node — "
-            "only the CPU lane will be available until a controller restart.",
+            "no GPU lanes will be available until a controller restart.",
             GPU_CLASS_LABEL_KEY,
         )
     return classes
@@ -494,8 +494,15 @@ class LaneSchedulerController:
         if rp is None:
             return
         from lane_scheduler.k8s.pod_translator import _gpu_lane, _is_batch
-        gpu_lane  = _gpu_lane(pod)
-        lane      = gpu_lane or CPU_LANE
+        gpu_lane = _gpu_lane(pod)
+        if gpu_lane is None:
+            logger.warning(
+                "Running pod %s has no recognised gpu-class label; "
+                "skipping utilization tracking",
+                uid,
+            )
+            return
+        lane      = gpu_lane
         lane_name = lane
         course_id = (
             (pod.get("metadata") or {}).get("labels") or {}

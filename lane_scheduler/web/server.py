@@ -149,9 +149,7 @@ function renderLanes(lanes) {
       ? Math.min(100, (ln.running_units / ln.capacity_units * 100)).toFixed(0)
       : 0;
     const cls = barCls(ln.running_units, ln.capacity_units);
-    const capLabel = ln.name === 'cpu'
-      ? ln.capacity_units + ' cores'
-      : ln.capacity_units + ' GPUs';
+    const capLabel = ln.capacity_units + ' GPUs';
     const runLabel = ln.running_units + ' / ' + ln.capacity_units
                    + ' (' + pct + '%)';
     return '<tr>'

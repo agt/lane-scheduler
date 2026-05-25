@@ -23,11 +23,6 @@ def setUpModule():
     initialise_lanes(["small"])
 
 
-def _cpu():
-    from lane_scheduler.core.scheduler import CPU_LANE
-    return CPU_LANE
-
-
 def _small():
     return lane_for_gpu_class("small")
 
@@ -100,11 +95,10 @@ class TestBuildSnapshotStructure(unittest.TestCase):
         snap = build_snapshot(ctrl)
         self.assertEqual(snap["system"]["cycle_interval_s"], 30.0)
 
-    def test_lanes_list_has_cpu_and_gpu(self):
+    def test_lanes_list_has_gpu_lanes(self):
         from lane_scheduler.web.snapshot import build_snapshot
         snap = build_snapshot(self.ctrl)
         names = {ln["name"] for ln in snap["lanes"]}
-        self.assertIn("cpu", names)
         self.assertIn("gpu-small", names)
 
     def test_lane_row_keys(self):
@@ -146,27 +140,27 @@ class TestBuildSnapshotWithJobs(unittest.TestCase):
 
     def test_queued_course_appears(self):
         from lane_scheduler.web.snapshot import build_snapshot
-        _submit(self.ctrl, "CSE101", _cpu(), job_id="J1", student_id="s1")
+        _submit(self.ctrl, "CSE101", _small(), job_id="J1", student_id="s1")
         snap = build_snapshot(self.ctrl)
         course_ids = {c["course_id"] for c in snap["courses"]}
         self.assertIn("CSE101", course_ids)
 
     def test_queued_count_matches(self):
         from lane_scheduler.web.snapshot import build_snapshot
-        _submit(self.ctrl, "CSE101", _cpu(), job_id="J1", student_id="s1")
-        _submit(self.ctrl, "CSE101", _cpu(), job_id="J2", student_id="s2")
+        _submit(self.ctrl, "CSE101", _small(), job_id="J1", student_id="s1")
+        _submit(self.ctrl, "CSE101", _small(), job_id="J2", student_id="s2")
         snap = build_snapshot(self.ctrl)
         cse101 = next(c for c in snap["courses"] if c["course_id"] == "CSE101")
-        cpu_lane = next(l for l in cse101["lanes"] if l["lane_name"] == "cpu")
-        self.assertEqual(cpu_lane["queued_count"], 2)
+        small_lane = next(l for l in cse101["lanes"] if l["lane_name"] == "gpu-small")
+        self.assertEqual(small_lane["queued_count"], 2)
 
     def test_lane_queued_count_matches(self):
         from lane_scheduler.web.snapshot import build_snapshot
-        _submit(self.ctrl, "CSE101", _cpu(), job_id="J1", student_id="s1")
-        _submit(self.ctrl, "CSE250", _cpu(), job_id="J2", student_id="s2")
+        _submit(self.ctrl, "CSE101", _small(), job_id="J1", student_id="s1")
+        _submit(self.ctrl, "CSE250", _small(), job_id="J2", student_id="s2")
         snap = build_snapshot(self.ctrl)
-        cpu_row = next(r for r in snap["lanes"] if r["name"] == "cpu")
-        self.assertEqual(cpu_row["queued_count"], 2)
+        small_row = next(r for r in snap["lanes"] if r["name"] == "gpu-small")
+        self.assertEqual(small_row["queued_count"], 2)
 
     def test_course_metadata(self):
         from lane_scheduler.web.snapshot import build_snapshot
@@ -177,30 +171,30 @@ class TestBuildSnapshotWithJobs(unittest.TestCase):
 
     def test_tail_wait_absent_for_single_job(self):
         from lane_scheduler.web.snapshot import build_snapshot
-        _submit(self.ctrl, "CSE101", _cpu(), job_id="J1", student_id="s1")
+        _submit(self.ctrl, "CSE101", _small(), job_id="J1", student_id="s1")
         snap = build_snapshot(self.ctrl)
         cse101 = next(c for c in snap["courses"] if c["course_id"] == "CSE101")
-        cpu_lane = next(l for l in cse101["lanes"] if l["lane_name"] == "cpu")
-        self.assertEqual(cpu_lane["queued_count"], 1)
-        self.assertIsNone(cpu_lane["tail_wait"])
+        small_lane = next(l for l in cse101["lanes"] if l["lane_name"] == "gpu-small")
+        self.assertEqual(small_lane["queued_count"], 1)
+        self.assertIsNone(small_lane["tail_wait"])
 
     def test_tail_wait_present_for_multiple_jobs(self):
         from lane_scheduler.web.snapshot import build_snapshot
-        _submit(self.ctrl, "CSE101", _cpu(), job_id="J1", student_id="s1")
-        _submit(self.ctrl, "CSE101", _cpu(), job_id="J2", student_id="s2")
+        _submit(self.ctrl, "CSE101", _small(), job_id="J1", student_id="s1")
+        _submit(self.ctrl, "CSE101", _small(), job_id="J2", student_id="s2")
         snap = build_snapshot(self.ctrl)
         cse101 = next(c for c in snap["courses"] if c["course_id"] == "CSE101")
-        cpu_lane = next(l for l in cse101["lanes"] if l["lane_name"] == "cpu")
-        self.assertEqual(cpu_lane["queued_count"], 2)
+        small_lane = next(l for l in cse101["lanes"] if l["lane_name"] == "gpu-small")
+        self.assertEqual(small_lane["queued_count"], 2)
         # tail_wait may be None if no running pods to base estimate on,
         # but the dict key must be present
-        self.assertIn("tail_wait", cpu_lane)
+        self.assertIn("tail_wait", small_lane)
 
     def test_sorted_by_queued_descending(self):
         from lane_scheduler.web.snapshot import build_snapshot
-        _submit(self.ctrl, "CSE250", _cpu(), job_id="J1", student_id="s1")
-        _submit(self.ctrl, "CSE101", _cpu(), job_id="J2", student_id="s2")
-        _submit(self.ctrl, "CSE101", _cpu(), job_id="J3", student_id="s3")
+        _submit(self.ctrl, "CSE250", _small(), job_id="J1", student_id="s1")
+        _submit(self.ctrl, "CSE101", _small(), job_id="J2", student_id="s2")
+        _submit(self.ctrl, "CSE101", _small(), job_id="J3", student_id="s3")
         snap = build_snapshot(self.ctrl)
         queued = [
             sum(l["queued_count"] for l in c["lanes"])
@@ -218,7 +212,7 @@ class TestNoPrivateIdentifiers(unittest.TestCase):
 
     def test_no_student_ids(self):
         from lane_scheduler.web.snapshot import build_snapshot
-        _submit(self.ctrl, "CSE101", _cpu(), job_id="pod-uid-abc", student_id="alice")
+        _submit(self.ctrl, "CSE101", _small(), job_id="pod-uid-abc", student_id="alice")
         snap = build_snapshot(self.ctrl)
         dump = str(snap)
         self.assertNotIn("alice", dump)
@@ -231,9 +225,9 @@ class TestNoPrivateIdentifiers(unittest.TestCase):
         course = CourseClass(class_id=NO_COURSE_LABEL, class_weight=1.0)
         ctrl.scheduler._classes[NO_COURSE_LABEL] = course
         job = Job(job_id="J-unlabelled", class_id=NO_COURSE_LABEL,
-                  student_id="s1", lane=_cpu())
+                  student_id="s1", lane=_small())
         job.submit_time = time.monotonic()
-        ctrl.scheduler._queues[_cpu()][NO_COURSE_LABEL]["s1"].append(job)
+        ctrl.scheduler._queues[_small()][NO_COURSE_LABEL]["s1"].append(job)
         snap = build_snapshot(ctrl)
         course_ids = {c["course_id"] for c in snap["courses"]}
         self.assertNotIn(NO_COURSE_LABEL, course_ids)
@@ -249,7 +243,7 @@ class TestWaitCacheAllEstimates(unittest.TestCase):
     def test_populated_cache(self):
         from lane_scheduler.estimation.wait_estimator import WaitEstimate
         est = WaitEstimate(median_seconds=60.0, p20_seconds=30.0,
-                           p80_seconds=120.0, queue_rank=1, lane_name="cpu")
+                           p80_seconds=120.0, queue_rank=1, lane_name="gpu-small")
         cache = WaitTimeCache(snapshot_fn=lambda: {"uid-1": est})
         # Manually inject into cache to avoid background thread timing
         from lane_scheduler.estimation.wait_estimator import CacheEntry
@@ -262,7 +256,7 @@ class TestWaitCacheAllEstimates(unittest.TestCase):
     def test_returns_copy(self):
         from lane_scheduler.estimation.wait_estimator import WaitEstimate, CacheEntry
         est = WaitEstimate(median_seconds=60.0, p20_seconds=30.0,
-                           p80_seconds=120.0, queue_rank=1, lane_name="cpu")
+                           p80_seconds=120.0, queue_rank=1, lane_name="gpu-small")
         cache = WaitTimeCache(snapshot_fn=lambda: {})
         cache._cache = {"uid-1": CacheEntry(estimate=est, computed_at=time.monotonic())}
         r1 = cache.all_estimates()
@@ -296,7 +290,7 @@ class TestControllerDryRun(unittest.TestCase):
 
     def _make_pod_and_job(self, ctrl):
         _register(ctrl, "CSE101")
-        job = _submit(ctrl, "CSE101", _cpu(), job_id="uid-dry", student_id="s1")
+        job = _submit(ctrl, "CSE101", _small(), job_id="uid-dry", student_id="s1")
         pod = {
             "metadata": {
                 "name": "dry-pod", "namespace": "ns",
@@ -339,7 +333,7 @@ class TestControllerDryRun(unittest.TestCase):
             web_port=0,
         )
         _register(ctrl, "CSE101")
-        job = _submit(ctrl, "CSE101", _cpu(), job_id="uid-live", student_id="s1")
+        job = _submit(ctrl, "CSE101", _small(), job_id="uid-live", student_id="s1")
         pod = {
             "metadata": {
                 "name": "live-pod", "namespace": "ns",
@@ -382,7 +376,7 @@ class TestAdmitBackoff(unittest.TestCase):
 
     def _make_pod_job(self, ctrl, uid="uid-retry"):
         _register(ctrl, "CSE101")
-        job = _submit(ctrl, "CSE101", _cpu(), job_id=uid, student_id="s1")
+        job = _submit(ctrl, "CSE101", _small(), job_id=uid, student_id="s1")
         pod = {
             "metadata": {
                 "name": "retry-pod", "namespace": "ns",

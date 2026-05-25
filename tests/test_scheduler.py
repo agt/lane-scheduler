@@ -20,11 +20,9 @@ def setUpModule():
 
 # Convenience aliases resolved after setUpModule() — accessed via functions
 # rather than module-level names so they're evaluated lazily after init.
-def _cpu():        from lane_scheduler.core.scheduler import CPU_LANE; return CPU_LANE
 def _gpu(cls):     return lane_for_gpu_class(cls)
 
 CAPACITY = lambda: {
-    _cpu():        100.0,
     _gpu("xsmall"):  4.0,
     _gpu("small"):   8.0,
     _gpu("medium"):  8.0,
@@ -44,8 +42,7 @@ def make_course(class_id="TEST-101", weight=1.0):
 def make_job(job_id="J001", class_id="TEST-101", student_id="S001",
              lane=None, submit_time=0.0, resource_units=1.0, batch=False):
     if lane is None:
-        from lane_scheduler.core.scheduler import CPU_LANE
-        lane = CPU_LANE
+        lane = _gpu("small")
     j = Job(job_id=job_id, class_id=class_id, student_id=student_id,
             lane=lane, batch=batch, resource_units=resource_units)
     j.submit_time = submit_time
@@ -121,18 +118,18 @@ class TestUtilizationTracker(unittest.TestCase):
 
     def test_zero_when_no_events(self):
         tracker = UtilizationTracker(window=300.0, lane_capacity=CAPACITY())
-        self.assertEqual(tracker.utilization("C", _cpu(), now=100.0), 0.0)
+        self.assertEqual(tracker.utilization("C", _gpu("small"), now=100.0), 0.0)
 
     def test_event_contributes_to_utilization(self):
         tracker = UtilizationTracker(window=300.0, lane_capacity=CAPACITY())
-        tracker.record("C", _cpu(), units=50.0, now=100.0)
-        self.assertGreater(tracker.utilization("C", _cpu(), now=100.0), 0.0)
+        tracker.record("C", _gpu("small"), units=50.0, now=100.0)
+        self.assertGreater(tracker.utilization("C", _gpu("small"), now=100.0), 0.0)
 
     def test_expired_events_are_purged(self):
         tracker = UtilizationTracker(window=60.0, lane_capacity=CAPACITY())
-        tracker.record("C", _cpu(), units=50.0, now=0.0)
-        self.assertGreater(tracker.utilization("C", _cpu(), now=0.0), 0.0)
-        self.assertEqual(tracker.utilization("C", _cpu(), now=200.0), 0.0)
+        tracker.record("C", _gpu("small"), units=50.0, now=0.0)
+        self.assertGreater(tracker.utilization("C", _gpu("small"), now=0.0), 0.0)
+        self.assertEqual(tracker.utilization("C", _gpu("small"), now=200.0), 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -159,43 +156,42 @@ class TestStudentPrioritization(unittest.TestCase):
         sched = self._sched_with_counts({})
         sm = self._student_map([("S1", 100.0), ("S2", 50.0), ("S3", 75.0)])
         # all have 0 running; S2 submitted earliest
-        result = sched._top_student(set(sm), _cpu(), sm)
+        result = sched._top_student(set(sm), _gpu("small"), sm)
         self.assertEqual(result, "S2")
 
     def test_fewest_running_wins_over_older_submit(self):
-        sched = self._sched_with_counts({_cpu(): {"S1": 2, "S2": 1, "S3": 0}})
+        sched = self._sched_with_counts({_gpu("small"): {"S1": 2, "S2": 1, "S3": 0}})
         # S1 has oldest job but most running; S3 has fewest running
         sm = self._student_map([("S1", 10.0), ("S2", 20.0), ("S3", 30.0)])
-        result = sched._top_student(set(sm), _cpu(), sm)
+        result = sched._top_student(set(sm), _gpu("small"), sm)
         self.assertEqual(result, "S3")
 
     def test_tie_in_running_broken_by_submit_time(self):
-        sched = self._sched_with_counts({_cpu(): {"S1": 1, "S2": 1, "S3": 0, "S4": 0}})
+        sched = self._sched_with_counts({_gpu("small"): {"S1": 1, "S2": 1, "S3": 0, "S4": 0}})
         sm = self._student_map([("S1", 10.0), ("S2", 20.0), ("S3", 40.0), ("S4", 30.0)])
         # S3 and S4 tied at 0 running; S4 submitted earlier
-        result = sched._top_student({"S3", "S4"}, _cpu(), sm)
+        result = sched._top_student({"S3", "S4"}, _gpu("small"), sm)
         self.assertEqual(result, "S4")
 
     def test_single_student_always_selected(self):
-        sched = self._sched_with_counts({_cpu(): {"S1": 5}})
+        sched = self._sched_with_counts({_gpu("small"): {"S1": 5}})
         sm = self._student_map([("S1", 100.0)])
-        result = sched._top_student({"S1"}, _cpu(), sm)
+        result = sched._top_student({"S1"}, _gpu("small"), sm)
         self.assertEqual(result, "S1")
 
     def test_unknown_student_treated_as_zero_running(self):
         # S2 appears in running_counts with 1; S1 has no entry → 0 running
-        sched = self._sched_with_counts({_cpu(): {"S2": 1}})
+        sched = self._sched_with_counts({_gpu("small"): {"S2": 1}})
         sm = self._student_map([("S1", 200.0), ("S2", 10.0)])
-        result = sched._top_student(set(sm), _cpu(), sm)
+        result = sched._top_student(set(sm), _gpu("small"), sm)
         self.assertEqual(result, "S1")
 
     def test_different_lane_counts_not_mixed(self):
-        # S1 has 3 running in gpu-small but 0 in cpu; S2 has 0 in both
-        gpu = _gpu("small")
-        sched = self._sched_with_counts({gpu: {"S1": 3}})
+        # S1 has 3 running in gpu-small but 0 in gpu-medium; S2 has 0 in both
+        sched = self._sched_with_counts({_gpu("small"): {"S1": 3}})
         sm = self._student_map([("S1", 10.0), ("S2", 20.0)])
-        # Both have 0 running in cpu; S1 wins on submit time
-        result = sched._top_student(set(sm), _cpu(), sm)
+        # Both have 0 running in gpu-medium; S1 wins on submit time
+        result = sched._top_student(set(sm), _gpu("medium"), sm)
         self.assertEqual(result, "S1")
 
     def test_cycle_respects_running_counts(self):
@@ -210,7 +206,7 @@ class TestStudentPrioritization(unittest.TestCase):
         sched.submit(j1)
         sched.submit(j2)
 
-        sched.update_running_counts({_cpu(): {"S1": 1}})
+        sched.update_running_counts({_gpu("small"): {"S1": 1}})
         dispatched = sched.cycle(now=100.0)
 
         self.assertEqual(len(dispatched), 1)
@@ -235,7 +231,7 @@ class TestScheduler(unittest.TestCase):
 
     def _submit_n(self, class_id, n, lane=None, t=0.0):
         if lane is None:
-            lane = _cpu()
+            lane = _gpu("small")
         for i in range(n):
             j = make_job(
                 job_id=f"{class_id}-J{i}",
@@ -272,11 +268,11 @@ class TestScheduler(unittest.TestCase):
             scorer.score(fresh_job, course, 0.1, now=7200.0),
         )
 
-    def test_queue_depths_cpu(self):
+    def test_queue_depths_gpu_small(self):
         self._submit_n("INTRO-101", 3)
         depths = self.sched.queue_depths()
-        self.assertIn("cpu", depths)
-        self.assertEqual(depths["cpu"]["INTRO-101"], 3)
+        self.assertIn("gpu-small", depths)
+        self.assertEqual(depths["gpu-small"]["INTRO-101"], 3)
 
     def test_queue_depths_gpu(self):
         self._submit_n("GRAD-301", 2, lane=_gpu("medium"))
@@ -295,7 +291,6 @@ class TestDynamicLane(unittest.TestCase):
         for cls in ("xsmall", "small", "medium", "large", "xlarge"):
             lane = lane_for_gpu_class(cls)
             self.assertIsNotNone(lane)
-            self.assertNotEqual(lane, _cpu())
 
     def test_case_insensitive(self):
         self.assertEqual(lane_for_gpu_class("Medium"), lane_for_gpu_class("medium"))
@@ -308,12 +303,6 @@ class TestDynamicLane(unittest.TestCase):
     def test_unknown_class_non_strict_returns_none(self):
         lane = lane_for_gpu_class("supergpu")
         self.assertIsNone(lane)
-
-    def test_gpu_lanes_distinct_from_cpu(self):
-        from lane_scheduler.core.scheduler import GPU_LANES
-        self.assertNotIn(_cpu(), GPU_LANES)
-        for cls in ("xsmall", "small", "medium", "large", "xlarge"):
-            self.assertIn(lane_for_gpu_class(cls), GPU_LANES)
 
     def test_lane_strings_have_expected_format(self):
         for cls in ("xsmall", "small", "medium", "large", "xlarge"):
@@ -402,11 +391,11 @@ class TestUtilizationPruning(unittest.TestCase):
     """UtilizationTracker drops empty keys to bound memory."""
 
     def test_empty_key_pruned_after_expiry(self):
-        u = UtilizationTracker(window=10.0, lane_capacity={_cpu(): 100.0})
-        u.record("CSE-100", _cpu(), 1.0, now=0.0)
+        u = UtilizationTracker(window=10.0, lane_capacity={_gpu("small"): 100.0})
+        u.record("CSE-100", _gpu("small"), 1.0, now=0.0)
         # Far future — all events expired
-        u.utilization("CSE-100", _cpu(), now=1000.0)
-        self.assertNotIn(("CSE-100", _cpu()), u._events)
+        u.utilization("CSE-100", _gpu("small"), now=1000.0)
+        self.assertNotIn(("CSE-100", _gpu("small")), u._events)
 
 
 class TestConcurrentSubmitCycle(unittest.TestCase):
