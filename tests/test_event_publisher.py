@@ -24,7 +24,7 @@ from lane_scheduler.estimation.wait_estimator import WaitEstimate
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _est(uid="uid-1", rank=1, lane="cpu") -> WaitEstimate:
+def _est(uid="uid-1", rank=1, lane="gpu-medium") -> WaitEstimate:
     return WaitEstimate(
         median_seconds = 60.0 * rank,
         p20_seconds    = 30.0 * rank,
@@ -176,7 +176,7 @@ class TestPublishDue(unittest.TestCase):
         job  = _mock_job(uid, "CSE101")
         import lane_scheduler.core.scheduler as _sched
         _sched.initialise_lanes(["medium"])
-        lane = _sched.CPU_LANE
+        lane = "gpu-medium"
         return pub, core_v1, uid, est, now, job, lane
 
     def test_event_created_when_due(self):
@@ -249,7 +249,7 @@ class TestPublishDue(unittest.TestCase):
         body = kwargs.get("body") or args[1]
         msg  = body["message"]
         self.assertIn("#2", msg)
-        self.assertIn("cpu", msg)
+        self.assertIn("gpu-medium", msg)
         self.assertIn("Estimated wait", msg)
 
     def test_event_name_unique_per_emit(self):
@@ -272,7 +272,7 @@ class TestPublishDue(unittest.TestCase):
         pub, core_v1 = _make_publisher()
         import lane_scheduler.core.scheduler as _sched
         _sched.initialise_lanes(["medium"])
-        lane = _sched.CPU_LANE
+        lane = "gpu-medium"
         now  = time.monotonic()
         uids = [f"uid-{i}" for i in range(4)]
         for uid in uids:
@@ -301,12 +301,12 @@ class TestFormatMessage(unittest.TestCase):
         self.assertIn("gpu-medium", msg)
 
     def test_includes_class_rank_when_provided(self):
-        est = _est(rank=5, lane="cpu")
+        est = _est(rank=5, lane="gpu-medium")
         msg = _format_message(est, class_rank_val=2)
         self.assertIn("#2 within course", msg)
 
     def test_omits_class_rank_when_none(self):
-        est = _est(rank=1, lane="cpu")
+        est = _est(rank=1, lane="gpu-medium")
         msg = _format_message(est, class_rank_val=None)
         self.assertNotIn("within course", msg)
 
@@ -452,12 +452,12 @@ class TestBatchPublishDue(unittest.TestCase):
         pub     = EventPublisher(core_v1)
         import lane_scheduler.core.scheduler as _sched
         _sched.initialise_lanes(["medium"])
-        lane    = _sched.CPU_LANE
+        lane    = "gpu-medium"
         uid     = "bu-1"
         job     = _mock_job(uid, "CSE234")
         median  = 4000.0
         est     = WaitEstimate(median_seconds=median, p20_seconds=2000.0,
-                               p80_seconds=6000.0, queue_rank=1, lane_name="cpu")
+                               p80_seconds=6000.0, queue_rank=1, lane_name="gpu-medium")
 
         pub.register(uid, self._batch_pod(uid=uid))
         enqueued_at = pub._schedules[uid].enqueued_at
@@ -493,7 +493,7 @@ class TestBatchPublishDue(unittest.TestCase):
         pub     = EventPublisher(core_v1)
         import lane_scheduler.core.scheduler as _sched
         _sched.initialise_lanes(["medium"])
-        lane    = _sched.CPU_LANE
+        lane    = "gpu-medium"
         uid     = "bu-2"
         job     = _mock_job(uid, "CSE234")
 
@@ -503,7 +503,7 @@ class TestBatchPublishDue(unittest.TestCase):
 
         # Emit 0 with original median
         self._run_publish(pub, uid,
-            WaitEstimate(original_median, 2000.0, 6000.0, 1, "cpu"),
+            WaitEstimate(original_median, 2000.0, 6000.0, 1, "gpu-medium"),
             enqueued_at, lane, job)
 
         # Record the anchored milestone time for emit 1
@@ -512,7 +512,7 @@ class TestBatchPublishDue(unittest.TestCase):
 
         # Emit 1 with a very different median — milestone should be unchanged
         self._run_publish(pub, uid,
-            WaitEstimate(99999.0, 0.0, 99999.0, 1, "cpu"),
+            WaitEstimate(99999.0, 0.0, 99999.0, 1, "gpu-medium"),
             milestone_1, lane, job)
 
         self.assertAlmostEqual(milestone_1,
@@ -541,7 +541,7 @@ class TestDryRun(unittest.TestCase):
         pub.register(uid, pod)
         lane = MagicMock()
         job = _mock_job(uid, "CSE101")
-        est = WaitEstimate(120.0, 60.0, 240.0, 1, "cpu")
+        est = WaitEstimate(120.0, 60.0, 240.0, 1, "gpu-medium")
         now = pub._schedules[uid].next_emit_at  # already due
         return pub, core_v1, uid, est, now, job, lane
 
@@ -651,7 +651,7 @@ class TestWarnUnknownGpuClass(unittest.TestCase):
         pub.register(uid, pod)
         lane = MagicMock()
         job  = _mock_job(uid, "CSE101")
-        est  = WaitEstimate(60.0, 30.0, 120.0, 1, "cpu")
+        est  = WaitEstimate(60.0, 30.0, 120.0, 1, "gpu-medium")
         now  = pub._schedules[uid].next_emit_at
         pub.publish_due(
             estimates        = {uid: est},

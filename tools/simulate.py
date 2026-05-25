@@ -18,7 +18,7 @@ _GPU_CLASSES = ["small", "medium", "large"]
 initialise_lanes(_GPU_CLASSES)
 
 from lane_scheduler.core.scheduler import (  # noqa: E402 — after initialise_lanes
-    CourseClass, Job, CPU_LANE, Scheduler, SchedulerConfig,
+    CourseClass, Job, Scheduler, SchedulerConfig,
 )
 
 
@@ -35,10 +35,9 @@ class SimConfig:
 
     # Lane capacities (arbitrary resource units)
     lane_capacity: dict = field(default_factory=lambda: {
-        "cpu":         200.0,
-        "gpu-small":    20.0,
-        "gpu-medium":   10.0,
-        "gpu-large":     5.0,
+        "gpu-small":  20.0,
+        "gpu-medium": 10.0,
+        "gpu-large":   5.0,
     })
 
 
@@ -62,20 +61,19 @@ CLASSES = [
 _TIER_PROFILES = {
     1: dict(
         rate=2.0,
-        lane_probs={"cpu": 0.90, "gpu-small": 0.10},
+        lane_probs={"gpu-small": 1.0},
         resource_range=(0.5, 2.0),
         batch_prob=0.0,
     ),
     2: dict(
         rate=3.0,
-        lane_probs={"cpu": 0.70, "gpu-small": 0.20, "gpu-medium": 0.10},
+        lane_probs={"gpu-small": 0.67, "gpu-medium": 0.33},
         resource_range=(1.0, 4.0),
         batch_prob=0.1,
     ),
     3: dict(
         rate=4.0,
-        lane_probs={"cpu": 0.50, "gpu-small": 0.15,
-                    "gpu-medium": 0.20, "gpu-large": 0.15},
+        lane_probs={"gpu-small": 0.30, "gpu-medium": 0.40, "gpu-large": 0.30},
         resource_range=(2.0, 8.0),
         batch_prob=0.35,
     ),
@@ -89,7 +87,7 @@ def pick_lane(probs: dict, rng: random.Random):
         cumulative += p
         if r < cumulative:
             return lane
-    return CPU_LANE
+    return next(reversed(probs))  # floating-point fallback
 
 
 # ---------------------------------------------------------------------------

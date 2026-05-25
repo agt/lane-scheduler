@@ -6,9 +6,8 @@ and within-class fair scheduling via minimum-running-then-oldest-job ordering.
 
 Lane model
 ~~~~~~~~~~
-    One lane exists per physical GPU class discovered at controller startup,
-    plus a single CPU lane for all non-GPU pods.  Lanes are plain strings:
-    "cpu" for the CPU lane, "gpu-<class>" for each GPU class (e.g. "gpu-small").
+    One lane exists per physical GPU class discovered at controller startup.
+    Lanes are plain strings: "gpu-<class>" for each GPU class (e.g. "gpu-small").
     initialise_lanes() must be called before any Scheduler is constructed.
 
     Batch vs interactive is a *scoring modifier*, not a lane split.
@@ -40,11 +39,8 @@ logger = logging.getLogger(__name__)
 # Lane strings — built dynamically at startup
 # ---------------------------------------------------------------------------
 
-CPU_LANE = "cpu"
-
 # Populated by initialise_lanes().
-Lane:       Optional[frozenset] = None   # all lane strings: {"cpu", "gpu-small", …}
-GPU_LANES:  frozenset           = frozenset()  # Lane minus CPU_LANE
+Lane: Optional[frozenset] = None   # all lane strings: {"gpu-small", …}
 
 # Internal set: known raw gpu-class strings (e.g. "small", "medium")
 _KNOWN_GPU_CLASSES: frozenset = frozenset()
@@ -58,12 +54,11 @@ def initialise_lanes(gpu_classes: list[str]) -> frozenset:
     Returns the full lane frozenset for convenience.
     Duplicate and empty class strings are silently dropped.
     """
-    global Lane, GPU_LANES, _KNOWN_GPU_CLASSES
+    global Lane, _KNOWN_GPU_CLASSES
 
     unique             = frozenset(c.strip().lower() for c in gpu_classes if c.strip())
     _KNOWN_GPU_CLASSES = unique
-    GPU_LANES          = frozenset(f"gpu-{c}" for c in unique)
-    Lane               = frozenset([CPU_LANE]) | GPU_LANES
+    Lane               = frozenset(f"gpu-{c}" for c in unique)
 
     logger.info("Lanes initialised: %s", ", ".join(sorted(Lane)))
     return Lane
@@ -102,7 +97,7 @@ def best_fallback_gpu_lane(lane_capacity: dict) -> Optional[str]:
     Lexically earliest lane name breaks ties.
     Returns None if no GPU lanes are known.
     """
-    gpu_lanes = sorted(lane for lane in lane_capacity if lane != CPU_LANE)
+    gpu_lanes = sorted(lane_capacity)
     if not gpu_lanes:
         return None
     return max(gpu_lanes, key=lambda lane: lane_capacity.get(lane, 0.0))
@@ -268,7 +263,7 @@ class PriorityScorer:
 class Scheduler:
     """
     Priority scheduler with:
-    - Per-lane independent queues (one per GPU class + CPU)
+    - Per-lane independent queues (one per GPU class)
     - Per-class scheduling weights supplied externally (from course CSV)
     - Log-aging wait boost with batch/interactive half-lives
     - Batch mode penalty keeps interactive jobs preferred

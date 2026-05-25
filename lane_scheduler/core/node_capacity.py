@@ -31,7 +31,7 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 
-from lane_scheduler.core.scheduler import Lane, GPU_LANES, CPU_LANE, lane_for_gpu_class
+from lane_scheduler.core.scheduler import Lane, lane_for_gpu_class
 
 logger = logging.getLogger(__name__)
 
@@ -91,13 +91,6 @@ def _gpu_class_lane(node: dict) -> tuple[Optional[str], str]:
     return None, ""
 
 
-def _parse_cpu_cores(value: str) -> float:
-    value = value.strip()
-    if value.endswith("m"):
-        return float(value[:-1]) / 1000.0
-    return float(value)
-
-
 def _parse_gpu_count(value: str) -> float:
     return float(value.strip())
 
@@ -110,7 +103,6 @@ def _parse_gpu_count(value: str) -> float:
 class NodeInfo:
     name:        str
     lane:        str
-    cpu_cores:   float
     gpu_count:   float
     ready:       bool
     schedulable: bool
@@ -121,7 +113,7 @@ class NodeInfo:
 
     @property
     def capacity(self) -> float:
-        return self.gpu_count if self.lane != CPU_LANE else self.cpu_cores
+        return self.gpu_count
 
 
 # ---------------------------------------------------------------------------
@@ -171,14 +163,6 @@ class NodeCapacityTracker:
 
         allocatable = (node.get("status", {}) or {}).get("allocatable", {}) or {}
 
-        cpu_cores = 0.0
-        if "cpu" in allocatable:
-            try:
-                cpu_cores = _parse_cpu_cores(allocatable["cpu"])
-            except ValueError:
-                logger.warning("Unparseable CPU allocatable on node %s: %r",
-                               name, allocatable["cpu"])
-
         gpu_count = 0.0
         if _GPU_RESOURCE in allocatable:
             try:
@@ -194,7 +178,6 @@ class NodeCapacityTracker:
         info = NodeInfo(
             name        = name,
             lane        = gpu_lane,
-            cpu_cores   = cpu_cores,
             gpu_count   = gpu_count,
             ready       = _is_ready(node),
             schedulable = _is_schedulable(node),
