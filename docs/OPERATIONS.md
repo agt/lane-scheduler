@@ -44,7 +44,7 @@ The controller discovers lanes dynamically at startup by reading node labels. Ev
 
 | Field | Default value | Env var override |
 |-------|---------------|-----------------|
-| Label key | `gpu-class` | `LANE_NODE_GPU_CLASS_LABEL` |
+| Label key | `gpu-class` | `LANE_GPU_CLASS_LABEL` |
 | Label values | `xsmall` `small` `medium` `large` `xlarge` | — |
 
 ```bash
@@ -88,7 +88,7 @@ These labels are read from the pod at enqueue time (`pod_translator.py`). The `g
 | Label key | Default key | Env var override | Source | Values |
 |-----------|-------------|-----------------|--------|--------|
 | Course ID | `dsmlp/course` | `LANE_COURSE_LABEL` | Student manifest | e.g. `CSE234_SP26_A00` |
-| GPU class | `gpu-class` | `LANE_POD_GPU_CLASS_LABEL` | Injected by webhook | `xsmall` `small` `medium` `large` `xlarge` |
+| GPU class | `gpu-class` | `LANE_GPU_CLASS_LABEL` | Injected by webhook | `xsmall` `small` `medium` `large` `xlarge` |
 | Batch mode | `dsmlp/batch` | `LANE_BATCH_LABEL` | Student manifest (optional) | `"true"` |
 
 **Course label:** Pods without it are bucketed under `__unlabelled__` and scored using a fallback weight of 1.0. They are still scheduled but receive no course-aware fairness treatment.
@@ -511,8 +511,8 @@ Full table of all environment variables:
 | `LANE_EWMA_ALPHA` | `--ewma-alpha` | `0.1` | (0,1) | EWMA smoothing for residency; higher = faster |
 | `LANE_COURSE_LABEL` | `--course-label` | `dsmlp/course` | label key | Pod label carrying course ID |
 | `LANE_BATCH_LABEL` | `--batch-label` | `dsmlp/batch` | label key | Pod label for batch mode flag |
-| `LANE_POD_GPU_CLASS_LABEL` | `--pod-gpu-class-label` | `gpu-class` | label key | Pod label carrying GPU class |
-| `LANE_NODE_GPU_CLASS_LABEL` | `--node-gpu-class-label` | `gpu-class` | label key | Node label carrying GPU class |
+| `LANE_GPU_CLASS_LABEL` | `--gpu-class-label` | `gpu-class` | label key | Label key on pods and nodes identifying GPU class |
+| `LANE_SCHEDULING_GATE_NAME` | `--scheduling-gate-name` | `lane-scheduler` | gate name | Scheduling gate injected by the mutating webhook |
 | `KUBECONFIG` | `--kubeconfig` | — | path | Omit for in-cluster credentials |
 | `LANE_LOG_LEVEL` | `--log-level` | `INFO` | level | DEBUG INFO WARNING ERROR |
 | `LANE_DRY_RUN` | `--dry-run` | `""` (off) | bool | Log-only mode; no patches or events |

@@ -66,10 +66,10 @@ LABEL_COURSE     = os.environ.get("LANE_COURSE_LABEL",     "dsmlp/course")
 LABEL_BATCH      = os.environ.get("LANE_BATCH_LABEL",      "dsmlp/batch")
 # Label key on pods that identifies the requested GPU class / lane.
 # Override with LANE_POD_GPU_CLASS_LABEL if your cluster uses a different key.
-LABEL_GPU_CLASS  = os.environ.get("LANE_POD_GPU_CLASS_LABEL", "gpu-class")
+LABEL_GPU_CLASS  = os.environ.get("LANE_GPU_CLASS_LABEL", "gpu-class")
 
 # Name of the scheduling gate injected by the mutating admission controller.
-SCHEDULING_GATE_NAME = "lane-scheduler"
+SCHEDULING_GATE_NAME = os.environ.get("LANE_SCHEDULING_GATE_NAME", "lane-scheduler")
 
 # Fallback course label when pod carries none
 _NO_COURSE_LABEL = "__unlabelled__"

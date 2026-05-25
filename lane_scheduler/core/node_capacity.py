@@ -11,7 +11,7 @@ Node → Lane classification
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
     A node is part of the managed GPU pool if it carries a gpu-class label
     whose key is GPU_CLASS_LABEL_KEY (default "gpu-class", overridable via
-    LANE_NODE_GPU_CLASS_LABEL), e.g.:
+    LANE_GPU_CLASS_LABEL), e.g.:
         gpu-class=xlarge  →  Lane.GPU_XLARGE
 
     Nodes without the gpu-class label are not part of the managed pool and
@@ -40,9 +40,9 @@ INHIBIT_TAINT_KEY    = os.environ.get("LANE_INHIBIT_TAINT_KEY",   "dsmlp/schedul
 INHIBIT_TAINT_VALUE  = os.environ.get("LANE_INHIBIT_TAINT_VALUE", "controller")
 INHIBIT_TAINT_EFFECT = "NoSchedule"
 
-# Label key on nodes that identifies the GPU class / lane.
-# Override with LANE_NODE_GPU_CLASS_LABEL if your cluster uses a different key.
-GPU_CLASS_LABEL_KEY = os.environ.get("LANE_NODE_GPU_CLASS_LABEL", "gpu-class")
+# Label key on both nodes and pods that identifies the GPU class / lane.
+# Override with LANE_GPU_CLASS_LABEL if your cluster uses a different key.
+GPU_CLASS_LABEL_KEY = os.environ.get("LANE_GPU_CLASS_LABEL", "gpu-class")
 
 _GPU_RESOURCE = "nvidia.com/gpu"
 

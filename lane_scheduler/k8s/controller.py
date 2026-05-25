@@ -43,6 +43,7 @@ from lane_scheduler.k8s.pod_translator import (
     LABEL_COURSE,
     LABEL_BATCH,
     LABEL_GPU_CLASS,
+    SCHEDULING_GATE_NAME,
     admission_patch,
     needs_scheduling,
     pod_to_job,
@@ -1122,10 +1123,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Pod label key for course identifier (default: %(default)s)")
     p.add_argument("--batch-label", default=LABEL_BATCH,
                    help="Pod label key for batch mode flag (default: %(default)s)")
-    p.add_argument("--pod-gpu-class-label", default=LABEL_GPU_CLASS,
-                   help="Pod label key for requested GPU class (default: %(default)s)")
-    p.add_argument("--node-gpu-class-label", default=GPU_CLASS_LABEL_KEY,
-                   help="Node label key for GPU class (default: %(default)s)")
+    p.add_argument("--gpu-class-label", default=LABEL_GPU_CLASS,
+                   help="Label key on both pods and nodes identifying the GPU class (default: %(default)s)")
+    p.add_argument("--scheduling-gate-name", default=SCHEDULING_GATE_NAME,
+                   help="Name of the scheduling gate injected by the mutating webhook (default: %(default)s)")
     p.add_argument("--inhibit-taint-key", default=INHIBIT_TAINT_KEY,
                    help="Inhibitory scheduling-gate taint key (default: %(default)s)")
     p.add_argument("--inhibit-taint-value", default=INHIBIT_TAINT_VALUE,
@@ -1166,15 +1167,18 @@ def main() -> None:
     import lane_scheduler.k8s.pod_translator as _pt
     _nc.INHIBIT_TAINT_KEY   = args.inhibit_taint_key
     _nc.INHIBIT_TAINT_VALUE = args.inhibit_taint_value
-    _nc.GPU_CLASS_LABEL_KEY = args.node_gpu_class_label
+    _nc.GPU_CLASS_LABEL_KEY = args.gpu_class_label
     _pt.LABEL_COURSE        = args.course_label
     _pt.LABEL_BATCH         = args.batch_label
-    _pt.LABEL_GPU_CLASS     = args.pod_gpu_class_label
+    _pt.LABEL_GPU_CLASS     = args.gpu_class_label
+    _pt._GPU_TAINT_KEY      = args.gpu_class_label
+    _pt.SCHEDULING_GATE_NAME = args.scheduling_gate_name
     # Also update the names imported into this module's own namespace, which are
     # referenced by _enqueue() and _upsert_running() as module globals.
     _g = globals()
-    _g['LABEL_COURSE']    = args.course_label
-    _g['LABEL_GPU_CLASS'] = args.pod_gpu_class_label
+    _g['LABEL_COURSE']         = args.course_label
+    _g['LABEL_GPU_CLASS']      = args.gpu_class_label
+    _g['SCHEDULING_GATE_NAME'] = args.scheduling_gate_name
 
     # Load Kubernetes config
     if args.kubeconfig:
