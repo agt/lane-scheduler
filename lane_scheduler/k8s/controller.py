@@ -793,7 +793,7 @@ class LaneSchedulerController:
 
     def _run_cycle(self) -> None:
         caps = self.node_tracker.lane_capacity()
-        if all(v == 0.0 for v in caps.values()):
+        if caps and all(v == 0.0 for v in caps.values()):
             logger.debug("No node capacity known yet — skipping cycle")
             return
 

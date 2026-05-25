@@ -303,6 +303,10 @@ class Scheduler:
 
     def set_lane_capacity(self, lane_capacity: dict) -> None:
         """Atomically replace the lane-capacity view used for scoring."""
+        # TODO: add a set_lane_capacity() setter to UtilizationTracker so this
+        # doesn't reach into a private attribute.  Also consider defaulting the
+        # unknown-lane divisor to a small epsilon rather than 1.0 to bound the
+        # priority boost for lanes that haven't yet appeared in the capacity map.
         with self._lock:
             self.lane_capacity = lane_capacity
             self.util._lane_capacity = lane_capacity
