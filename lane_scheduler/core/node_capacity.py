@@ -211,6 +211,12 @@ class NodeCapacityTracker:
                     totals[info.lane] += info.capacity
         return totals
 
+    def lane_for_node(self, node_name: str) -> Optional[str]:
+        """Return the GPU lane for a named node, or None if not in the managed pool."""
+        with self._lock:
+            info = self._nodes.get(node_name)
+            return info.lane if info is not None else None
+
     def node_count(self) -> dict:
         from lane_scheduler.core.scheduler import Lane as _Lane
         counts: dict = {lane: 0 for lane in _Lane} if _Lane else {}

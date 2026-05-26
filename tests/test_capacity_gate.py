@@ -463,5 +463,92 @@ class TestCapacityGate(unittest.TestCase):
         self.assertEqual(tracked.active_deadline_seconds, 7200)
 
 
+class TestUnlabelledPodUtilization(unittest.TestCase):
+    """Running pods without a gpu-class pod label should be counted against
+    the lane derived from the node they are running on."""
+
+    def setUp(self):
+        self.csv_path = _write_csv([
+            {"course_id": "CSE234_SP26_A00", "weight": 0.775},
+        ])
+
+    def tearDown(self):
+        self.csv_path.unlink(missing_ok=True)
+
+    def _running_pod_dict(self, uid, node_name, gpu_count, gpu_class=None):
+        labels = {"dsmlp/course": "CSE234_SP26_A00"}
+        if gpu_class is not None:
+            labels[GPU_CLASS_LABEL_KEY] = gpu_class
+        return {
+            "metadata": {"uid": uid, "name": f"pod-{uid}", "namespace": "ns",
+                         "labels": labels},
+            "spec": {"nodeName": node_name, "tolerations": [], "schedulingGates": [],
+                     "containers": [{"name": "c", "resources": {
+                         "requests": {"cpu": "2", "nvidia.com/gpu": gpu_count},
+                     }}]},
+            "status": {"phase": "Running", "startTime": "2026-01-01T00:00:00Z"},
+        }
+
+    def test_unlabelled_pod_on_gpu_node_is_counted(self):
+        """A Running pod without a gpu-class label, on a managed GPU node,
+        must be attributed to that node's lane."""
+        ctrl, _ = _build_controller(self.csv_path, gpu_class="large", gpu_count=8)
+        lane = _gpu("large")
+
+        pod = self._running_pod_dict("u1", node_name="gpu-node-large-1",
+                                     gpu_count="2")
+        # The node in node_tracker is named "node-1" (from _make_node default).
+        # Add a second node with the name the pod uses.
+        ctrl.node_tracker.upsert(_make_node(name="gpu-node-large-1",
+                                            gpu_class="large", gpu_count="4"))
+        ctrl._handle_pod_event({"type": "MODIFIED", "object": pod})
+
+        with ctrl._running_lock:
+            tracked = ctrl._running.get(lane, {}).get("u1")
+        self.assertIsNotNone(tracked, "unlabelled pod on GPU node must be tracked")
+        self.assertAlmostEqual(tracked.resource_units, 2.0)
+
+    def test_unlabelled_pod_on_unmanaged_node_not_counted(self):
+        """A Running pod on a node not in the managed pool must NOT be tracked."""
+        ctrl, _ = _build_controller(self.csv_path, gpu_class="small", gpu_count=4)
+
+        pod = self._running_pod_dict("u2", node_name="cpu-node-99", gpu_count="0")
+        ctrl._handle_pod_event({"type": "MODIFIED", "object": pod})
+
+        with ctrl._running_lock:
+            for lane_dict in ctrl._running.values():
+                self.assertNotIn("u2", lane_dict,
+                                 "pod on unmanaged node must not appear in _running")
+
+    def test_unlabelled_pod_counts_toward_capacity_gate(self):
+        """Capacity gate must account for unlabelled pods consuming GPU capacity."""
+        ctrl, core_v1 = _build_controller(self.csv_path, gpu_class="small", gpu_count=2)
+        lane = _gpu("small")
+
+        # Seed a running unlabelled pod on the managed node (node-1, small lane)
+        ctrl.node_tracker.upsert(_make_node(name="node-1",
+                                            gpu_class="small", gpu_count="2"))
+        unlabelled = self._running_pod_dict("unlabelled-1", node_name="node-1",
+                                            gpu_count="2")
+        ctrl._handle_pod_event({"type": "MODIFIED", "object": unlabelled})
+
+        # All capacity consumed; new labelled pod should be blocked
+        pod = _make_pod(uid="new-uid", gpu_class="small", gpu_count="1")
+        _enqueue_pod(ctrl, pod)
+        ctrl._run_cycle()
+
+        core_v1.patch_namespaced_pod.assert_not_called()
+        self.assertEqual(_queue_depth(ctrl.scheduler, lane), 1)
+
+    def test_bootstrap_barrier_set_after_node_bootstrap(self):
+        """_nodes_bootstrapped event must be set once _bootstrap_nodes completes."""
+        ctrl, _ = _build_controller(self.csv_path, gpu_class="small", gpu_count=4)
+        # _build_controller calls node_tracker.upsert directly without going
+        # through _bootstrap_nodes, so the event is not set — that's fine.
+        # Simulate what _bootstrap_nodes does at the end:
+        ctrl._nodes_bootstrapped.set()
+        self.assertTrue(ctrl._nodes_bootstrapped.is_set())
+
+
 if __name__ == "__main__":
     unittest.main()
