@@ -294,11 +294,120 @@ class TestCapacityGate(unittest.TestCase):
         lane = _gpu("small")
         with ctrl._admitted_resources_lock:
             ctrl._admitted_resources["p1"] = (lane, 1.0)
+        with ctrl._admitted_lock:
+            ctrl._admitted.add("p1")
 
-        ctrl._dequeue("p1")
+        deleted_pod = {
+            "metadata": {"uid": "p1", "name": "pod-p1", "namespace": "ns", "labels": {}},
+            "spec": {"containers": [], "schedulingGates": []},
+            "status": {"phase": "Pending"},
+        }
+        ctrl._handle_pod_event({"type": "DELETED", "object": deleted_pod})
 
         with ctrl._admitted_resources_lock:
             self.assertNotIn("p1", ctrl._admitted_resources)
+
+    # ------------------------------------------------------------------
+    # Admitted entry preserved during Pending-without-gate limbo
+    # ------------------------------------------------------------------
+
+    def test_admitted_resources_preserved_during_pending_limbo(self):
+        """Capacity reservation must survive the Pending-without-gate phase.
+
+        After admission the pod watch fires a MODIFIED event with the scheduling
+        gate removed but phase still Pending and no nodeName.  The capacity
+        reservation must remain in _admitted_resources until the pod reaches
+        Running (where _running takes over), not be cleared on the first
+        MODIFIED event.
+        """
+        ctrl, core_v1 = _build_controller(self.csv_path, gpu_class="small", gpu_count=4)
+
+        pod = _make_pod(uid="p1", gpu_class="small", gpu_count="2")
+        _enqueue_pod(ctrl, pod)
+        ctrl._run_cycle()
+        core_v1.patch_namespaced_pod.assert_called_once()
+        with ctrl._admitted_resources_lock:
+            self.assertIn("p1", ctrl._admitted_resources, "reservation must be set after admission")
+
+        # Simulate: pod watch fires MODIFIED — gate removed, still Pending, no nodeName
+        limbo_pod = {
+            "metadata": {"uid": "p1", "name": "pod-p1", "namespace": "ns",
+                         "labels": {"dsmlp/course": "CSE234_SP26_A00",
+                                    GPU_CLASS_LABEL_KEY: "small"}},
+            "spec": {"nodeName": None, "tolerations": [], "schedulingGates": [],
+                     "containers": [{"name": "c", "resources": {
+                         "requests": {"cpu": "2", "nvidia.com/gpu": "2"}}}]},
+            "status": {"phase": "Pending"},
+        }
+        ctrl._handle_pod_event({"type": "MODIFIED", "object": limbo_pod})
+
+        with ctrl._admitted_resources_lock:
+            self.assertIn("p1", ctrl._admitted_resources,
+                          "reservation must persist during Pending-without-gate limbo")
+
+        # Simulate: pod watch fires MODIFIED — now Running
+        running_pod = {
+            "metadata": {"uid": "p1", "name": "pod-p1", "namespace": "ns",
+                         "labels": {"dsmlp/course": "CSE234_SP26_A00",
+                                    GPU_CLASS_LABEL_KEY: "small"}},
+            "spec": {"nodeName": "node-1", "tolerations": [],
+                     "schedulingGates": [],
+                     "containers": [{"name": "c", "resources": {
+                         "requests": {"cpu": "2", "nvidia.com/gpu": "2"}}}],
+                     "activeDeadlineSeconds": 3600},
+            "status": {"phase": "Running", "startTime": "2026-01-01T00:00:00Z"},
+        }
+        ctrl._handle_pod_event({"type": "MODIFIED", "object": running_pod})
+
+        with ctrl._admitted_resources_lock:
+            self.assertNotIn("p1", ctrl._admitted_resources,
+                             "reservation must be released once pod is Running")
+        lane = _gpu("small")
+        with ctrl._running_lock:
+            self.assertIn("p1", ctrl._running.get(lane, {}),
+                          "pod must be tracked in _running after Running transition")
+
+    # ------------------------------------------------------------------
+    # Capacity gate must block new admissions during the limbo period
+    # ------------------------------------------------------------------
+
+    def test_capacity_gate_blocks_during_pending_limbo(self):
+        """A second pod must be blocked while the first is admitted-but-pending.
+
+        Node has exactly 2 GPUs.  After the first 2-GPU pod is admitted and the
+        watch fires the limbo MODIFIED event, the capacity gate must see zero
+        free GPUs and reject the second pod.
+        """
+        ctrl, core_v1 = _build_controller(self.csv_path, gpu_class="small", gpu_count=2)
+
+        pod1 = _make_pod(uid="p1", gpu_class="small", gpu_count="2")
+        _enqueue_pod(ctrl, pod1)
+        ctrl._run_cycle()
+        core_v1.patch_namespaced_pod.assert_called_once()
+
+        # Drive pod1 into the limbo state (gate removed, still Pending)
+        limbo_pod = {
+            "metadata": {"uid": "p1", "name": "pod-p1", "namespace": "ns",
+                         "labels": {"dsmlp/course": "CSE234_SP26_A00",
+                                    GPU_CLASS_LABEL_KEY: "small"}},
+            "spec": {"nodeName": None, "tolerations": [], "schedulingGates": [],
+                     "containers": [{"name": "c", "resources": {
+                         "requests": {"cpu": "2", "nvidia.com/gpu": "2"}}}]},
+            "status": {"phase": "Pending"},
+        }
+        ctrl._handle_pod_event({"type": "MODIFIED", "object": limbo_pod})
+
+        # Enqueue a second pod and run another cycle
+        pod2 = _make_pod(uid="p2", gpu_class="small", gpu_count="1",
+                         namespace="ns2", name="pod-p2")
+        _enqueue_pod(ctrl, pod2)
+        core_v1.patch_namespaced_pod.reset_mock()
+        ctrl._run_cycle()
+
+        core_v1.patch_namespaced_pod.assert_not_called()
+        lane = _gpu("small")
+        self.assertEqual(_queue_depth(ctrl.scheduler, lane), 1,
+                         "second pod must remain queued while first is in limbo")
 
     # ------------------------------------------------------------------
     # Admitted entry released on patch failure (ApiException)
