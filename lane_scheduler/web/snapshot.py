@@ -37,6 +37,32 @@ def _fmt_wait(est) -> Optional[dict]:
     }
 
 
+def build_nodes_snapshot(ctrl: "LaneSchedulerController") -> dict:
+    """
+    Dump the live NodeCapacityTracker state for debugging.
+    Returns every node the tracker knows about (managed GPU pool only),
+    regardless of readiness.
+    """
+    now_str = __import__("datetime").datetime.now(
+        __import__("datetime").timezone.utc
+    ).isoformat()
+    with ctrl.node_tracker._lock:
+        nodes = [
+            {
+                "name":        info.name,
+                "lane":        info.lane,
+                "gpu_count":   info.gpu_count,
+                "ready":       info.ready,
+                "schedulable": info.schedulable,
+                "active":      info.active,
+            }
+            for info in sorted(
+                ctrl.node_tracker._nodes.values(), key=lambda n: n.name
+            )
+        ]
+    return {"generated_at": now_str, "nodes": nodes}
+
+
 def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
     """
     Aggregate controller state into a JSON-serializable snapshot.
