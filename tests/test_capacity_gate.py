@@ -517,6 +517,41 @@ class TestCapacityGate(unittest.TestCase):
         self.assertIsNotNone(tracked, "pod should be tracked even without activeDeadlineSeconds")
         self.assertEqual(tracked.active_deadline_seconds, 86400)
 
+    def test_running_pod_tracked_from_v1pod_model_object(self):
+        """Bootstrap pods arrive as V1Pod model objects; to_dict() gives snake_case keys.
+        The controller must handle start_time (datetime) as well as startTime (str)."""
+        from kubernetes.client.models import (
+            V1Pod, V1PodSpec, V1PodStatus, V1ObjectMeta, V1Container,
+        )
+        import datetime
+
+        ctrl, _ = _build_controller(self.csv_path, gpu_class="small", gpu_count=4)
+        lane = _gpu("small")
+
+        model_pod = V1Pod(
+            metadata=V1ObjectMeta(
+                uid="model-uid",
+                name="model-pod",
+                namespace="ns",
+                labels={"dsmlp/course": "CSE234_SP26_A00", GPU_CLASS_LABEL_KEY: "small"},
+            ),
+            spec=V1PodSpec(
+                containers=[V1Container(name="c")],
+                active_deadline_seconds=3600,
+            ),
+            status=V1PodStatus(
+                phase="Running",
+                start_time=datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc),
+            ),
+        )
+        # Simulate _bootstrap_pods(): model object passed directly as event object
+        ctrl._handle_pod_event({"type": "ADDED", "object": model_pod})
+
+        with ctrl._running_lock:
+            tracked = ctrl._running.get(lane, {}).get("model-uid")
+        self.assertIsNotNone(tracked, "pod from V1Pod model (bootstrap path) must be tracked")
+        self.assertEqual(tracked.active_deadline_seconds, 3600.0)
+
     def test_running_pod_no_deadline_custom_default(self):
         """Custom default_active_deadline is used for pods without activeDeadlineSeconds."""
         core_v1 = MagicMock()

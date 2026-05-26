@@ -120,9 +120,11 @@ CYCLE_INTERVAL      = _env_float("LANE_CYCLE_INTERVAL",     10.0)
 DISPATCH_K          = _env_int(  "LANE_DISPATCH_K",         8)
 ALPHA               = _env_float("LANE_ALPHA",              1.0)
 T_HALF_INTERACTIVE  = _env_float("LANE_T_HALF_INTERACTIVE", 600.0)
-T_HALF_BATCH        = _env_float("LANE_T_HALF_BATCH",       7200.0)
-UTIL_WINDOW         = _env_float("LANE_UTIL_WINDOW",        300.0)
-WAIT_CACHE_INTERVAL = _env_float("LANE_WAIT_CACHE_INTERVAL",60.0)
+T_HALF_BATCH        = _env_float("LANE_T_HALF_BATCH",      7200.0)
+COURSE_CSV          = os.environ.get("LANE_COURSE_CSV", "/etc/lane-scheduler/courses.csv")
+RELOAD_INTERVAL     = _env_float("LANE_RELOAD_INTERVAL",     30.0) # file-change check interval
+RESIDENCY_DB        = os.environ.get("LANE_RESIDENCY_DB", "")      # empty = disabled
+DB_PERSIST_INTERVAL = _env_float("LANE_DB_PERSIST_INTERVAL", 300.0)
 
 INTERACTIVE_MEAN_PCT = _env_float("LANE_INTERACTIVE_MEAN_PCT", 0.4)
 INTERACTIVE_STD_PCT  = _env_float("LANE_INTERACTIVE_STD_PCT",  0.2)
@@ -229,9 +231,11 @@ class LaneSchedulerController:
         self._kubernetes_pending_user: dict[str, str] = {}
 
         # Running pods per lane: {lane: {uid: RunningPod}}
-        self._kubernetes_running: dict[object, dict[str, RunningPod]] = {}
-        # username attribution for running pods
-        self._kubernetes_running_user: dict[str, str] = {}
+        self._running: dict[object, dict[str, RunningPod]] = {}
+        # uid → student_id (namespace) for running pods; kept in sync with _running
+        self._running_student: dict[str, str] = {}
+        # uid → class_id for running pods; kept in sync with _running
+        self._running_class: dict[str, str] = {}
         self._running_lock = threading.Lock()
 
         # Completion context: uid → (sched_group_id, lane_name, batch, deadline, ctx_created_monotonic)
@@ -506,19 +510,24 @@ class LaneSchedulerController:
         spec   = pod.get("spec")   or {}
         status = pod.get("status") or {}
 
-        deadline = spec.get("activeDeadlineSeconds") or self._default_active_deadline
+        deadline = spec.get("activeDeadlineSeconds") or spec.get("active_deadline_seconds") or self._default_active_deadline
 
-        start_str = status.get("startTime")
-        if start_str:
-            try:
-                import datetime
-                dt      = datetime.datetime.fromisoformat(start_str.replace("Z", "+00:00"))
-                wall_age = (datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds()
-                start_time = time.monotonic() - max(0.0, wall_age)
-            except Exception:
-                start_time = time.monotonic()
-        else:
-            start_time = time.monotonic()
+        # start_time from status.startTime (ISO8601) or status.start_time (datetime).
+        # The kubernetes client's to_dict() produces snake_case keys with datetime values;
+        # raw JSON dicts from the watch stream use camelCase keys with ISO string values.
+        import datetime as _dt
+        start_raw = status.get("startTime") or status.get("start_time")
+        if not start_raw:
+            return None
+        try:
+            if isinstance(start_raw, _dt.datetime):
+                dt = start_raw if start_raw.tzinfo else start_raw.replace(tzinfo=_dt.timezone.utc)
+            else:
+                dt = _dt.datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+            wall_age = (_dt.datetime.now(_dt.timezone.utc) - dt).total_seconds()
+            start_time = time.monotonic() - max(0.0, wall_age)
+        except Exception:
+            return None
 
         gpu_lane = _gpu_lane(pod)
         if gpu_lane is None:
@@ -572,18 +581,18 @@ class LaneSchedulerController:
         lane_name     = lane
         sched_group_id = (
             (pod.get("metadata") or {}).get("labels") or {}
-        ).get(LABEL_SCHED_GROUP, NO_SCHED_GROUP_LABEL) or NO_SCHED_GROUP_LABEL
-        username      = self._username_from_pod(pod)
-        batch         = _is_batch(pod)
-        deadline      = float(
-            (pod.get("spec") or {}).get("activeDeadlineSeconds") or self._default_active_deadline
-        )
+        ).get(LABEL_COURSE, NO_COURSE_LABEL) or NO_COURSE_LABEL
+        student_id = (pod.get("metadata") or {}).get("namespace", "")
+        batch     = _is_batch(pod)
+        _spec = pod.get("spec") or {}
+        deadline  = float(_spec.get("activeDeadlineSeconds") or _spec.get("active_deadline_seconds") or self._default_active_deadline)
 
         with self._running_lock:
-            if lane not in self._kubernetes_running:
-                self._kubernetes_running[lane] = {}
-            self._kubernetes_running[lane][uid] = rp
-            self._kubernetes_running_user[uid] = username
+            if lane not in self._running:
+                self._running[lane] = {}
+            self._running[lane][uid] = rp
+            self._running_student[uid] = student_id
+            self._running_class[uid] = course_id
 
         with self._running_ctx_lock:
             self._running_ctx[uid] = (
@@ -594,7 +603,8 @@ class LaneSchedulerController:
         with self._running_lock:
             for lane_dict in self._kubernetes_running.values():
                 lane_dict.pop(uid, None)
-            self._kubernetes_running_user.pop(uid, None)
+            self._running_student.pop(uid, None)
+            self._running_class.pop(uid, None)
         with self._running_ctx_lock:
             self._running_ctx.pop(uid, None)
 
@@ -909,20 +919,29 @@ class LaneSchedulerController:
 
         now = time.monotonic()
 
+        # Snapshot running units, student counts, and per-class utilization in
+        # one lock acquisition so all views are consistent.
         with self._running_lock:
             running_units: dict = {
                 lane: sum(rp.resource_units for rp in pods.values())
                 for lane, pods in self._kubernetes_running.items()
             }
             running_counts: dict = {}
-            for lane, pods in self._kubernetes_running.items():
+            running_util: dict = {}
+            for lane, pods in self._running.items():
                 counts: dict = {}
-                for uid in pods:
-                    uname = self._kubernetes_running_user.get(uid, "")
-                    counts[uname] = counts.get(uname, 0) + 1
+                util_by_class: dict = {}
+                for uid, rp in pods.items():
+                    sid      = self._running_student.get(uid, "")
+                    class_id = self._running_class.get(uid, NO_COURSE_LABEL)
+                    counts[sid] = counts.get(sid, 0) + 1
+                    util_by_class[class_id] = util_by_class.get(class_id, 0.0) + rp.resource_units
                 running_counts[lane] = counts
+                running_util[lane]   = util_by_class
 
+        # Push running snapshots so the scheduler can apply priority rules.
         self.scheduler.update_running_counts(running_counts)
+        self.scheduler.update_running_utilization(running_util)
 
         with self._kubernetes_pending_lock:
             pending_units: dict = {
@@ -1208,8 +1227,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Interactive aging half-life in seconds (default: %(default)s)")
     p.add_argument("--t-half-batch", type=float, default=T_HALF_BATCH,
                    help="Batch aging half-life in seconds (default: %(default)s)")
-    p.add_argument("--util-window", type=float, default=UTIL_WINDOW,
-                   help="Utilization rolling window in seconds (default: %(default)s)")
+
+    # --- Residency priors ---
     p.add_argument("--interactive-mean-pct", type=float, default=INTERACTIVE_MEAN_PCT,
                    help="Interactive residency mean as fraction of deadline (default: %(default)s)")
     p.add_argument("--interactive-std-pct", type=float, default=INTERACTIVE_STD_PCT,
@@ -1293,7 +1312,6 @@ def main() -> None:
         alpha               = args.alpha,
         t_half_interactive  = args.t_half_interactive,
         t_half_batch        = args.t_half_batch,
-        utilization_window  = args.util_window,
         dispatch_k          = args.dispatch_k,
     )
 
