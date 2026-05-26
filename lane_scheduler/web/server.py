@@ -111,6 +111,27 @@ footer span{white-space:nowrap;display:flex;align-items:center;gap:5px}
       <tbody id="course-body"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
     </table>
   </div>
+
+  <div class="card" id="pods-card">
+    <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+      <span>Running Pods <span id="pods-count" style="font-weight:400;color:#888"></span></span>
+      <span style="font-size:.7rem;color:#aaa;font-weight:400;text-transform:none;letter-spacing:0">debug view</span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Lane</th>
+          <th>Namespace</th>
+          <th class="r">GPUs</th>
+          <th>Course</th>
+          <th class="r">Running</th>
+          <th class="r">Deadline</th>
+          <th>Batch</th>
+        </tr>
+      </thead>
+      <tbody id="pods-body"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
+    </table>
+  </div>
 </main>
 
 <footer id="health-strip"><span>Loading…</span></footer>
@@ -203,6 +224,37 @@ function renderCourses(courses) {
   tb.innerHTML = rows.join('');
 }
 
+function renderRunningPods(pods) {
+  const tb = document.getElementById('pods-body');
+  const ct = document.getElementById('pods-count');
+  if (!pods || !pods.length) {
+    tb.innerHTML = '<tr><td colspan="7" class="empty">No running pods on managed nodes</td></tr>';
+    ct.textContent = '';
+    return;
+  }
+  ct.textContent = '(' + pods.length + ')';
+  const deadline_pct = function(p) {
+    if (!p.deadline_s) return 0;
+    return Math.min(100, (p.running_s / p.deadline_s * 100)).toFixed(0);
+  };
+  tb.innerHTML = pods.map(function(p) {
+    const pct  = deadline_pct(p);
+    const dcls = pct >= 90 ? 'crit' : pct >= 70 ? 'warn' : '';
+    const dbar = '<div class="bar-wrap"><div class="bar"><div class="bar-fill ' + dcls
+               + '" style="width:' + pct + '%"></div></div>'
+               + '<span>' + dur(p.running_s) + ' / ' + dur(p.deadline_s) + '</span></div>';
+    return '<tr>'
+      + '<td><span class="mono">' + p.lane + '</span></td>'
+      + '<td><span class="mono">' + (p.namespace || '—') + '</span></td>'
+      + '<td class="r">' + p.resource_units + '</td>'
+      + '<td><span class="mono">' + (p.course_id || '<em style="color:#aaa">none</em>') + '</span></td>'
+      + '<td class="r">' + dur(p.running_s) + '</td>'
+      + '<td>' + dbar + '</td>'
+      + '<td>' + (p.batch ? 'batch' : '—') + '</td>'
+      + '</tr>';
+  }).join('');
+}
+
 function renderHealth(sys, generatedAt) {
   const age = sys.wait_cache_age_s;
   const dotCls = age === null ? 'stale' : age < 90 ? '' : age < 180 ? 'warn' : 'stale';
@@ -231,6 +283,7 @@ async function fetchAndRender() {
     lastFetchAt = Date.now();
     renderLanes(data.lanes);
     renderCourses(data.courses);
+    renderRunningPods(data.running_pods);
     renderHealth(data.system, data.generated_at);
     updateHeaderStatus(true);
   } catch (e) {
