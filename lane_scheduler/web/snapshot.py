@@ -184,11 +184,12 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
             except Exception:
                 pass
 
-        if running_pods and lane_profiles is not None:
+        gpu_running_pods = [p for p in running_pods if p.resource_units > 0]
+        if gpu_running_pods and lane_profiles is not None:
             try:
                 sc_est = estimate_soonest_completion(
                     lane_name=lane_name,
-                    running=running_pods,
+                    running=gpu_running_pods,
                     profiles=lane_profiles,
                     now=now,
                 )
