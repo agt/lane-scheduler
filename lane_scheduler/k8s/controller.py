@@ -457,16 +457,26 @@ class LaneSchedulerController:
                 self._dequeue(uid)
                 phase = (pod.get("status") or {}).get("phase", "")
                 if phase == "Running":
+                    # Running pool now accounts for these resources.
+                    with self._admitted_resources_lock:
+                        self._admitted_resources.pop(uid, None)
                     self._upsert_running(uid, pod)
                 elif phase in ("Succeeded", "Failed"):
+                    with self._admitted_resources_lock:
+                        self._admitted_resources.pop(uid, None)
                     self._record_completion(uid, pod)
                     self._remove_running(uid)
                 else:
+                    # Pod is admitted-but-pending (gate removed, no nodeName yet).
+                    # _admitted_resources stays populated so the capacity gate
+                    # counts these resources until Running or terminal.
                     self._remove_running(uid)
 
         elif etype == "DELETED":
             self._dequeue(uid)
             self._remove_running(uid)
+            with self._admitted_resources_lock:
+                self._admitted_resources.pop(uid, None)
 
     def _running_pod_from_pod(self, uid: str, pod: dict) -> Optional[RunningPod]:
         """
@@ -693,9 +703,14 @@ class LaneSchedulerController:
         with self._pending_lock:
             was_pending = self._pending.pop(uid, None) is not None
         with self._admitted_lock:
+            was_admitted = uid in self._admitted
             self._admitted.discard(uid)
-        with self._admitted_resources_lock:
-            self._admitted_resources.pop(uid, None)
+        # Admitted pods keep their _admitted_resources entry until they reach
+        # Running or a terminal state so the capacity gate accounts for them
+        # during the Pending-without-gate limbo between gate removal and Running.
+        if not was_admitted:
+            with self._admitted_resources_lock:
+                self._admitted_resources.pop(uid, None)
         self._ignored_gpu_class.discard(uid)
         with self._admit_attempts_lock:
             self._admit_attempts.pop(uid, None)
