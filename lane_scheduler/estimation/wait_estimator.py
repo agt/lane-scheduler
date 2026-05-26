@@ -361,6 +361,82 @@ class WaitTimeCache:
 
 
 # ---------------------------------------------------------------------------
+# Soonest-completion estimator
+# ---------------------------------------------------------------------------
+
+def _prob_soonest_completion(
+    t: float,
+    running: list[RunningPod],
+    profiles: dict[str, ResidencyProfile],
+    now: float,
+) -> float:
+    """
+    P(at least one running pod finishes within t seconds).
+    = 1 − ∏_i P(pod_i still running after t seconds)
+    Uses log-sum for numerical stability when many pods are present.
+    """
+    log_all_survive = 0.0
+    for pod in running:
+        rem = pod.remaining_max(now)
+        if rem <= 0:
+            return 1.0
+        if t >= rem:
+            return 1.0
+        profile   = profiles["batch" if pod.batch else "interactive"]
+        mu, sigma = profile.for_deadline(pod.active_deadline_seconds)
+        p_finish  = _finish_prob(t, mu, sigma, pod.age(now))
+        p_survive = max(1.0 - p_finish, 1e-300)
+        log_all_survive += math.log(p_survive)
+    return 1.0 - math.exp(log_all_survive)
+
+
+def estimate_soonest_completion(
+    lane_name: str,
+    running:   list[RunningPod],
+    profiles:  dict[str, ResidencyProfile],
+    now:       Optional[float] = None,
+    t_max:     float = _T_MAX_DEFAULT,
+) -> Optional[WaitEstimate]:
+    """
+    Estimate when the first running pod in *lane_name* will finish.
+
+    Returns a WaitEstimate whose p20/median/p80 are the P20, P50, and P80
+    of the minimum completion time across all currently running pods.
+    Returns None when *running* is empty.
+    """
+    if not running:
+        return None
+    if now is None:
+        now = time.monotonic()
+
+    def _bisect_pct(target: float) -> float:
+        if _prob_soonest_completion(0.0, running, profiles, now) >= target:
+            return 0.0
+        if _prob_soonest_completion(t_max, running, profiles, now) < target:
+            return t_max
+        lo, hi = 0.0, t_max
+        for _ in range(_BISECT_ITERS):
+            mid = (lo + hi) / 2.0
+            if _prob_soonest_completion(mid, running, profiles, now) < target:
+                lo = mid
+            else:
+                hi = mid
+        return (lo + hi) / 2.0
+
+    p20    = _bisect_pct(0.20)
+    median = _bisect_pct(0.50)
+    p80    = _bisect_pct(0.80)
+
+    return WaitEstimate(
+        median_seconds = median,
+        p20_seconds    = p20,
+        p80_seconds    = p80,
+        queue_rank     = 0,
+        lane_name      = lane_name,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Formatting helpers
 # ---------------------------------------------------------------------------
 
