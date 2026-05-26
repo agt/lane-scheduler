@@ -312,7 +312,9 @@ class EventPublisher:
         )
 
         import datetime as dt
-        timestamp  = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_dt     = dt.datetime.now(dt.timezone.utc)
+        microtime  = now_dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        timestamp  = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         event_name = (
             f"{pod_name}.unknown-gpu"
             .lower()
@@ -333,7 +335,7 @@ class EventPublisher:
             "reason":             _EVENT_REASON_IGNORED,
             "message":            message,
             "type":               _EVENT_TYPE_WARNING,
-            "eventTime":          timestamp,
+            "eventTime":          microtime,
             "firstTimestamp":     timestamp,
             "lastTimestamp":      timestamp,
             "reportingComponent": _EVENT_COMPONENT,
@@ -376,7 +378,9 @@ class EventPublisher:
         Returns True on success, False on error.
         """
         import datetime as dt
-        timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_dt    = dt.datetime.now(dt.timezone.utc)
+        microtime = now_dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        timestamp = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         # Use a name that is unique per emission to avoid K8s deduplication
         # collapsing distinct events into one (which increments 'count' rather
@@ -405,7 +409,7 @@ class EventPublisher:
             "reason":              _EVENT_REASON,
             "message":             message,
             "type":                _EVENT_TYPE,
-            "eventTime":           timestamp,
+            "eventTime":           microtime,
             "firstTimestamp":      timestamp,
             "lastTimestamp":       timestamp,
             "reportingComponent":  _EVENT_COMPONENT,
