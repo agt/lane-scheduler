@@ -462,16 +462,21 @@ class LaneSchedulerController:
         spec   = pod.get("spec")   or {}
         status = pod.get("status") or {}
 
-        deadline = spec.get("activeDeadlineSeconds") or self._default_active_deadline
+        deadline = spec.get("activeDeadlineSeconds") or spec.get("active_deadline_seconds") or self._default_active_deadline
 
-        # start_time from status.startTime (ISO8601); convert to monotonic offset
-        start_str = status.get("startTime")
-        if not start_str:
+        # start_time from status.startTime (ISO8601) or status.start_time (datetime).
+        # The kubernetes client's to_dict() produces snake_case keys with datetime values;
+        # raw JSON dicts from the watch stream use camelCase keys with ISO string values.
+        import datetime as _dt
+        start_raw = status.get("startTime") or status.get("start_time")
+        if not start_raw:
             return None
         try:
-            import datetime
-            dt      = datetime.datetime.fromisoformat(start_str.replace("Z", "+00:00"))
-            wall_age = (datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds()
+            if isinstance(start_raw, _dt.datetime):
+                dt = start_raw if start_raw.tzinfo else start_raw.replace(tzinfo=_dt.timezone.utc)
+            else:
+                dt = _dt.datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+            wall_age = (_dt.datetime.now(_dt.timezone.utc) - dt).total_seconds()
             start_time = time.monotonic() - max(0.0, wall_age)
         except Exception:
             return None
@@ -510,7 +515,8 @@ class LaneSchedulerController:
         ).get(LABEL_COURSE, NO_COURSE_LABEL) or NO_COURSE_LABEL
         student_id = (pod.get("metadata") or {}).get("namespace", "")
         batch     = _is_batch(pod)
-        deadline  = float((pod.get("spec") or {}).get("activeDeadlineSeconds") or self._default_active_deadline)
+        _spec = pod.get("spec") or {}
+        deadline  = float(_spec.get("activeDeadlineSeconds") or _spec.get("active_deadline_seconds") or self._default_active_deadline)
 
         with self._running_lock:
             if lane not in self._running:
