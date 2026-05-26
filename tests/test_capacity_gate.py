@@ -554,6 +554,47 @@ class TestCapacityGate(unittest.TestCase):
         self.assertIsNotNone(tracked, "pod should be tracked with custom default")
         self.assertEqual(tracked.active_deadline_seconds, 7200)
 
+    def test_running_pod_tracked_from_v1pod_model_object(self):
+        """Bootstrap pods arrive as V1Pod model objects via list_namespaced_pod().
+        The kubernetes client's to_dict() returns snake_case keys with datetime values
+        (start_time=datetime, active_deadline_seconds=int).  The controller must handle
+        both this shape and the camelCase ISO-string shape from the watch stream.
+        """
+        from kubernetes.client.models import (
+            V1Pod, V1PodSpec, V1PodStatus, V1ObjectMeta, V1Container,
+            V1ResourceRequirements,
+        )
+        import datetime
+
+        ctrl, _ = _build_controller(gpu_class="small", gpu_count=4)
+        lane = _gpu("small")
+
+        model_pod = V1Pod(
+            metadata=V1ObjectMeta(
+                uid="model-uid",
+                name="model-pod",
+                namespace="ns",
+                labels={"dsmlp/course": "CSE234_SP26_A00", GPU_CLASS_LABEL_KEY: "small"},
+            ),
+            spec=V1PodSpec(
+                containers=[V1Container(
+                    name="c",
+                    resources=V1ResourceRequirements(requests={"nvidia.com/gpu": "1"}),
+                )],
+                active_deadline_seconds=3600,
+            ),
+            status=V1PodStatus(
+                phase="Running",
+                start_time=datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc),
+            ),
+        )
+        ctrl._handle_pod_event({"type": "ADDED", "object": model_pod})
+
+        with ctrl._running_lock:
+            tracked = ctrl._kubernetes_running.get(lane, {}).get("model-uid")
+        self.assertIsNotNone(tracked, "V1Pod model object (bootstrap path) must be tracked")
+        self.assertEqual(tracked.active_deadline_seconds, 3600.0)
+
 
 class TestUnlabelledPodUtilization(unittest.TestCase):
     """Running pods without a gpu-class pod label should be counted against

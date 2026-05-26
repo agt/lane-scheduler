@@ -376,6 +376,7 @@ class TestDeleteClearsSchedulerQueue(unittest.TestCase):
             uid="uid-DEL",
             labels={"dsmlp/course": "CSE101", "gpu-class": "medium"},
             phase="Pending",
+            containers=[{"name": "c", "resources": {"requests": {"cpu": "2", "nvidia.com/gpu": "1"}}}],
         )
         ctrl._handle_pod_event({"type": "ADDED", "object": pod})
         self.assertGreater(
