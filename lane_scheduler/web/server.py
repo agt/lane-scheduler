@@ -82,10 +82,11 @@ footer span{white-space:nowrap;display:flex;align-items:center;gap:5px}
           <th class="r">Capacity</th>
           <th>Utilization</th>
           <th class="r">Queued</th>
+          <th>Soonest completion</th>
           <th class="r">Est. drain (P80)</th>
         </tr>
       </thead>
-      <tbody id="lane-body"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+      <tbody id="lane-body"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
     </table>
   </div>
 
@@ -157,7 +158,7 @@ function barCls(used, cap) {
 function renderLanes(lanes) {
   const tb = document.getElementById('lane-body');
   if (!lanes || !lanes.length) {
-    tb.innerHTML = '<tr><td colspan="6" class="empty">No lanes configured</td></tr>';
+    tb.innerHTML = '<tr><td colspan="7" class="empty">No lanes configured</td></tr>';
     return;
   }
   tb.innerHTML = lanes.map(function(ln) {
@@ -176,6 +177,7 @@ function renderLanes(lanes) {
         + '" style="width:' + pct + '%"></div></div>'
         + '<span>' + runLabel + '</span></div></td>'
       + '<td class="r">' + ln.queued_count + '</td>'
+      + '<td>' + fmtWait(ln.soonest_completion) + '</td>'
       + '<td class="r">' + dur(ln.drain_p80_s) + '</td>'
       + '</tr>';
   }).join('');

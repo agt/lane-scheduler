@@ -71,7 +71,10 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
     with the scheduling cycle.
     """
     from lane_scheduler.core.scheduler import Lane
-    from lane_scheduler.estimation.wait_estimator import estimate_wait
+    from lane_scheduler.estimation.wait_estimator import (
+        estimate_soonest_completion,
+        estimate_wait,
+    )
 
     now = time.monotonic()
 
@@ -165,26 +168,46 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
         run_count    = running_count_by_lane.get(lane_name, 0)
         queued_total = sum(queue_depths.get(lane_name, {}).values())
 
+        running_pods = list(running_snap.get(lane, {}).values())
         drain_p80_s: Optional[float] = None
-        if queued_total > 0:
-            running_pods = list(running_snap.get(lane, {}).values())
-            k8s_pend_u   = pending_units_by_lane.get(lane, 0.0)
-            free_u       = max(
-                0.0,
-                capacity - run_units - k8s_pend_u - admitted_by_lane.get(lane, 0.0)
-            )
+        soonest_completion: Optional[dict] = None
+
+        lane_profiles = None
+        if running_pods or queued_total > 0:
             try:
-                profiles = {
+                lane_profiles = {
                     "interactive": ctrl.residency_stats.profile_for(
                         _NO_SCHED_GROUP, lane_name, batch=False),
                     "batch": ctrl.residency_stats.profile_for(
                         _NO_SCHED_GROUP, lane_name, batch=True),
                 }
+            except Exception:
+                pass
+
+        if running_pods and lane_profiles is not None:
+            try:
+                sc_est = estimate_soonest_completion(
+                    lane_name=lane_name,
+                    running=running_pods,
+                    profiles=lane_profiles,
+                    now=now,
+                )
+                soonest_completion = _fmt_wait(sc_est)
+            except Exception:
+                pass
+
+        if queued_total > 0 and lane_profiles is not None:
+            k8s_pend_u = pending_units_by_lane.get(lane, 0.0)
+            free_u     = max(
+                0.0,
+                capacity - run_units - k8s_pend_u - admitted_by_lane.get(lane, 0.0)
+            )
+            try:
                 drain_est = estimate_wait(
                     queue_rank=queued_total,
                     lane_name=lane_name,
                     running=running_pods,
-                    profiles=profiles,
+                    profiles=lane_profiles,
                     required_units=1.0,
                     free_units=free_u,
                     now=now,
@@ -194,13 +217,14 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
                 pass
 
         lanes_out.append({
-            "name":           lane_name,
-            "node_count":     nodes,
-            "capacity_units": round(capacity, 1),
-            "running_count":  run_count,
-            "running_units":  round(run_units, 1),
-            "queued_count":   queued_total,
-            "drain_p80_s":    drain_p80_s,
+            "name":               lane_name,
+            "node_count":         nodes,
+            "capacity_units":     round(capacity, 1),
+            "running_count":      run_count,
+            "running_units":      round(run_units, 1),
+            "queued_count":       queued_total,
+            "drain_p80_s":        drain_p80_s,
+            "soonest_completion": soonest_completion,
         })
 
     # ------------------------------------------------------------------

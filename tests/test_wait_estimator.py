@@ -13,11 +13,13 @@ from lane_scheduler.estimation.wait_estimator import (
     ResidencyProfile,
     RunningPod,
     WaitEstimate,
+    estimate_soonest_completion,
     estimate_wait,
     format_wait,
     _phi,
     _finish_prob,
     _expected_slots,
+    _prob_soonest_completion,
 )
 
 
@@ -319,6 +321,90 @@ class TestResidencyProfile(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# estimate_soonest_completion tests
+# ---------------------------------------------------------------------------
+
+class TestProbSoonestCompletion(unittest.TestCase):
+
+    def test_empty_running_returns_zero(self):
+        p = _prob_soonest_completion(600.0, [], PROFILES, time.monotonic())
+        self.assertAlmostEqual(p, 0.0)
+
+    def test_pod_past_deadline_returns_one(self):
+        # Pod with 0 remaining time → already expired
+        pod = _pod(deadline=100.0, age=100.0)
+        p = _prob_soonest_completion(0.0, [pod], PROFILES, time.monotonic())
+        self.assertAlmostEqual(p, 1.0)
+
+    def test_t_exceeding_remaining_returns_one(self):
+        pod = _pod(deadline=3600.0, age=3500.0)
+        rem = pod.remaining_max()
+        p = _prob_soonest_completion(rem + 1.0, [pod], PROFILES, time.monotonic())
+        self.assertAlmostEqual(p, 1.0)
+
+    def test_increases_with_t(self):
+        pods = [_pod(deadline=3600.0, age=600.0) for _ in range(3)]
+        now = time.monotonic()
+        p1 = _prob_soonest_completion(300.0,  pods, PROFILES, now)
+        p2 = _prob_soonest_completion(1800.0, pods, PROFILES, now)
+        self.assertLess(p1, p2)
+
+    def test_more_pods_finish_sooner(self):
+        now = time.monotonic()
+        one = [_pod(deadline=3600.0, age=1200.0)]
+        ten = [_pod(deadline=3600.0, age=1200.0) for _ in range(10)]
+        p1  = _prob_soonest_completion(600.0, one, PROFILES, now)
+        p10 = _prob_soonest_completion(600.0, ten, PROFILES, now)
+        self.assertLess(p1, p10)
+
+
+class TestEstimateSoonestCompletion(unittest.TestCase):
+
+    def test_empty_running_returns_none(self):
+        result = estimate_soonest_completion(
+            lane_name="cpu", running=[], profiles=PROFILES
+        )
+        self.assertIsNone(result)
+
+    def test_p20_le_median_le_p80(self):
+        pods = [_pod(deadline=3600.0, age=600.0) for _ in range(4)]
+        est  = estimate_soonest_completion("gpu-medium", pods, PROFILES)
+        self.assertIsNotNone(est)
+        self.assertLessEqual(est.p20_seconds,   est.median_seconds)
+        self.assertLessEqual(est.median_seconds, est.p80_seconds)
+
+    def test_all_near_deadline_returns_small_values(self):
+        pods = [_pod(deadline=3600.0, age=3590.0) for _ in range(3)]
+        est  = estimate_soonest_completion("gpu-small", pods, PROFILES)
+        self.assertIsNotNone(est)
+        self.assertLess(est.p80_seconds, 60.0)
+
+    def test_more_pods_predict_earlier_completion(self):
+        one  = [_pod(deadline=3600.0, age=600.0)]
+        many = [_pod(deadline=3600.0, age=600.0) for _ in range(8)]
+        e1   = estimate_soonest_completion("cpu", one,  PROFILES)
+        e8   = estimate_soonest_completion("cpu", many, PROFILES)
+        self.assertLess(e8.median_seconds, e1.median_seconds)
+
+    def test_returns_correct_lane_name_and_rank(self):
+        pods = [_pod(deadline=3600.0, age=600.0)]
+        est  = estimate_soonest_completion("gpu-xlarge", pods, PROFILES)
+        self.assertEqual(est.lane_name,  "gpu-xlarge")
+        self.assertEqual(est.queue_rank, 0)
+
+    def test_single_pod_median_near_expected_remaining(self):
+        deadline = 3600.0
+        mean_pct = PROFILES["interactive"].mean_pct
+        age      = 0.0
+        pods     = [_pod(deadline=deadline, age=age)]
+        est      = estimate_soonest_completion("cpu", pods, PROFILES)
+        self.assertIsNotNone(est)
+        # Median of remaining normal ≈ mean_pct * deadline for fresh pod
+        self.assertGreater(est.median_seconds, 0.0)
+        self.assertLess(est.median_seconds, deadline)
 
 
 # ---------------------------------------------------------------------------
