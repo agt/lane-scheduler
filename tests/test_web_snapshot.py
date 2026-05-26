@@ -79,8 +79,13 @@ class TestBuildSnapshotStructure(unittest.TestCase):
     def test_required_top_level_keys(self):
         from lane_scheduler.web.snapshot import build_snapshot
         snap = build_snapshot(self.ctrl)
-        for key in ("generated_at", "system", "lanes", "courses"):
+        for key in ("generated_at", "system", "lanes", "courses", "running_pods"):
             self.assertIn(key, snap)
+
+    def test_running_pods_is_list(self):
+        from lane_scheduler.web.snapshot import build_snapshot
+        snap = build_snapshot(self.ctrl)
+        self.assertIsInstance(snap["running_pods"], list)
 
     def test_system_keys(self):
         from lane_scheduler.web.snapshot import build_snapshot
@@ -201,6 +206,74 @@ class TestBuildSnapshotWithJobs(unittest.TestCase):
             for c in snap["courses"]
         ]
         self.assertEqual(queued, sorted(queued, reverse=True))
+
+
+class TestRunningPodsDebugView(unittest.TestCase):
+    """Verify the running_pods debug list contains the right shape."""
+
+    def setUp(self):
+        self.ctrl = _make_controller()
+
+    def _inject_running(self, uid, namespace, lane, resource_units=1.0,
+                        course_id=None, batch=False, running_s=60):
+        from lane_scheduler.estimation.wait_estimator import RunningPod
+        rp = RunningPod(
+            pod_uid=uid,
+            start_time=time.monotonic() - running_s,
+            active_deadline_seconds=3600,
+            batch=batch,
+            resource_units=resource_units,
+        )
+        with self.ctrl._running_lock:
+            self.ctrl._running.setdefault(lane, {})[uid] = rp
+            self.ctrl._running_student[uid] = namespace
+        with self.ctrl._running_ctx_lock:
+            self.ctrl._running_ctx[uid] = (
+                course_id or "__unlabelled__", lane, batch, 3600.0, time.monotonic()
+            )
+
+    def test_running_pod_appears_in_list(self):
+        from lane_scheduler.web.snapshot import build_snapshot
+        self._inject_running("uid-1", "jsmith", _small(), resource_units=2.0,
+                             course_id="CSE101")
+        pods = build_snapshot(self.ctrl)["running_pods"]
+        self.assertEqual(len(pods), 1)
+        p = pods[0]
+        self.assertEqual(p["uid"], "uid-1")
+        self.assertEqual(p["namespace"], "jsmith")
+        self.assertEqual(p["lane"], _small())
+        self.assertAlmostEqual(p["resource_units"], 2.0)
+        self.assertEqual(p["course_id"], "CSE101")
+        self.assertFalse(p["batch"])
+
+    def test_unlabelled_course_pod_has_null_course_id(self):
+        from lane_scheduler.web.snapshot import build_snapshot
+        self._inject_running("uid-2", "s7ko", _small(), course_id=None)
+        pods = build_snapshot(self.ctrl)["running_pods"]
+        self.assertEqual(len(pods), 1)
+        self.assertIsNone(pods[0]["course_id"])
+
+    def test_pod_row_has_required_keys(self):
+        from lane_scheduler.web.snapshot import build_snapshot
+        self._inject_running("uid-3", "ns1", _small())
+        pods = build_snapshot(self.ctrl)["running_pods"]
+        self.assertEqual(len(pods), 1)
+        for key in ("uid", "namespace", "lane", "resource_units",
+                    "course_id", "batch", "running_s", "deadline_s"):
+            self.assertIn(key, pods[0], f"missing key {key!r}")
+
+    def test_sorted_by_lane_then_longest_running(self):
+        from lane_scheduler.web.snapshot import build_snapshot
+        self._inject_running("uid-a", "ns1", _small(), running_s=30)
+        self._inject_running("uid-b", "ns2", _small(), running_s=120)
+        pods = build_snapshot(self.ctrl)["running_pods"]
+        self.assertEqual(len(pods), 2)
+        self.assertGreaterEqual(pods[0]["running_s"], pods[1]["running_s"])
+
+    def test_empty_when_no_running_pods(self):
+        from lane_scheduler.web.snapshot import build_snapshot
+        pods = build_snapshot(self.ctrl)["running_pods"]
+        self.assertEqual(pods, [])
 
 
 class TestNoPrivateIdentifiers(unittest.TestCase):

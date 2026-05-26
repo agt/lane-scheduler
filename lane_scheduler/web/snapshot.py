@@ -63,6 +63,7 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
             lane: dict(pods)
             for lane, pods in ctrl._running.items()
         }
+        student_snap = dict(ctrl._running_student)
     with ctrl._running_ctx_lock:
         # uid → (course_id, lane_name, batch, deadline, ctx_created_monotonic)
         ctx_snap = dict(ctrl._running_ctx)
@@ -235,6 +236,29 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
         reverse=True,
     )
 
+    # ------------------------------------------------------------------
+    # Running-pod detail rows (debug view)
+    # ------------------------------------------------------------------
+    running_pods_out = []
+    for lane, pods in running_snap.items():
+        for uid, rp in pods.items():
+            ctx       = ctx_snap.get(uid)
+            course_id = ctx[0] if ctx else _NO_COURSE
+            batch     = bool(ctx[2]) if ctx else rp.batch
+            namespace = student_snap.get(uid, "")
+            running_s = max(0, round(now - rp.start_time))
+            running_pods_out.append({
+                "uid":            uid,
+                "namespace":      namespace,
+                "lane":           lane,
+                "resource_units": rp.resource_units,
+                "course_id":      course_id if course_id != _NO_COURSE else None,
+                "batch":          batch,
+                "running_s":      running_s,
+                "deadline_s":     round(rp.active_deadline_seconds),
+            })
+    running_pods_out.sort(key=lambda p: (p["lane"], -p["running_s"]))
+
     cache_age = ctrl.wait_cache.snapshot_age()
 
     return {
@@ -246,6 +270,7 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
             "course_count":          len(ctrl.registry),
             "pending_count":         pending_count,
         },
-        "lanes":   lanes_out,
-        "courses": courses_out,
+        "lanes":        lanes_out,
+        "courses":      courses_out,
+        "running_pods": running_pods_out,
     }
