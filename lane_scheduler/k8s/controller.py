@@ -416,6 +416,11 @@ class LaneSchedulerController:
             self._handle_pod_event({"type": "ADDED", "object": item})
         self._bootstrap_pod_cache = cache
         self._pod_resource_version = rv
+        # Node bootstrap may have already completed (and fired rescan with an
+        # empty cache). Now that the cache is populated, rescan again so pods
+        # that were skipped due to missing node data are attributed correctly.
+        if self._nodes_bootstrapped.is_set():
+            self._rescan_unlaned_running_pods()
 
     def _update_resource_version(self, event: dict, *, is_pod: bool) -> None:
         obj = event.get("object")
