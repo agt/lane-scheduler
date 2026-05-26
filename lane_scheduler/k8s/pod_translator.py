@@ -102,6 +102,21 @@ def _parse_gpu_count(value: str) -> float:
     return float(value.strip())
 
 
+def _gpu_request_count(pod: dict) -> float:
+    """Sum nvidia.com/gpu requests across all containers; 0.0 if none requested."""
+    containers = pod.get("spec", {}).get("containers", []) or []
+    total = 0.0
+    for container in containers:
+        requests = (container.get("resources", {}) or {}).get("requests", {}) or {}
+        if _GPU_RESOURCE in requests:
+            try:
+                total += _parse_gpu_count(requests[_GPU_RESOURCE])
+            except ValueError:
+                logger.debug("Unparseable GPU request %r in pod %s",
+                             requests[_GPU_RESOURCE], _pod_name(pod))
+    return total
+
+
 def _resource_units(pod: dict, gpu_lane: Optional[str]) -> float:
     """
     Returns a resource scalar for utilization accounting.
@@ -110,17 +125,7 @@ def _resource_units(pod: dict, gpu_lane: Optional[str]) -> float:
     """
     if gpu_lane is None:
         return 1.0
-    containers = pod.get("spec", {}).get("containers", []) or []
-    total_gpu  = 0.0
-    for container in containers:
-        requests = (container.get("resources", {}) or {}).get("requests", {}) or {}
-        if _GPU_RESOURCE in requests:
-            try:
-                total_gpu += _parse_gpu_count(requests[_GPU_RESOURCE])
-            except ValueError:
-                logger.debug("Unparseable GPU request %r in pod %s",
-                             requests[_GPU_RESOURCE], _pod_name(pod))
-    return total_gpu
+    return _gpu_request_count(pod)
 
 
 def _pod_name(pod: dict) -> str:

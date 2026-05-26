@@ -47,6 +47,7 @@ from lane_scheduler.k8s.pod_translator import (
     admission_patch,
     needs_scheduling,
     pod_to_job,
+    _gpu_request_count,
 )
 from lane_scheduler.estimation.wait_estimator import (
     ResidencyProfile, RunningPod, WaitEstimate,
@@ -516,6 +517,9 @@ class LaneSchedulerController:
         from lane_scheduler.k8s.pod_translator import _gpu_lane, _is_batch
         gpu_lane = _gpu_lane(pod)
         if gpu_lane is None:
+            if _gpu_request_count(pod) == 0.0:
+                # No label and no GPU resources — not relevant to utilization tracking.
+                return
             _nname = ((pod.get("spec") or {}).get("nodeName", "") or "")
             gpu_lane = self.node_tracker.lane_for_node(_nname) if _nname else None
             if gpu_lane is not None:
@@ -630,6 +634,9 @@ class LaneSchedulerController:
             LABEL_GPU_CLASS, ""
         ).strip()
         if not gpu_class:
+            if _gpu_request_count(pod) == 0.0:
+                # No label and no GPU resources — not relevant to lane scheduling.
+                return
             if uid not in self._ignored_gpu_class:
                 self._ignored_gpu_class.add(uid)
                 logger.error(
