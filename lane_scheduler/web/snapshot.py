@@ -93,6 +93,10 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
     with ctrl._running_ctx_lock:
         # uid → (course_id, lane_name, batch, deadline, ctx_created_monotonic)
         ctx_snap = dict(ctrl._running_ctx)
+    with ctrl._admitted_resources_lock:
+        admitted_by_lane: dict = {}
+        for _uid, (lane, units) in ctrl._admitted_resources.items():
+            admitted_by_lane[lane] = admitted_by_lane.get(lane, 0.0) + units
 
     queue_depths  = ctrl.scheduler.queue_depths()   # {lane_name: {class_id: count}}
     cached_ests   = ctrl.wait_cache.all_estimates()  # {pod_uid: WaitEstimate}
@@ -156,6 +160,8 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
         drain_p80_s: Optional[float] = None
         if queued_total > 0:
             running_pods = list(running_snap.get(lane, {}).values())
+            run_units    = running_units_by_lane.get(lane_name, 0.0)
+            free_u       = max(0.0, capacity - run_units - admitted_by_lane.get(lane, 0.0))
             try:
                 profiles = {
                     "interactive": ctrl.residency_stats.profile_for(
@@ -169,6 +175,7 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
                     running=running_pods,
                     profiles=profiles,
                     required_units=1.0,
+                    free_units=free_u,
                     now=now,
                 )
                 drain_p80_s = round(drain_est.p80_seconds, 1)
@@ -220,6 +227,9 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
                 # non-overlapping with other courses) but gives a useful upper bound.
                 if queued > 1:
                     tail_rank = top_info["rank"] + queued - 1
+                    run_u     = running_units_by_lane.get(lane_name, 0.0)
+                    cap       = lane_capacity.get(lane, 0.0)
+                    free_u    = max(0.0, cap - run_u - admitted_by_lane.get(lane, 0.0))
                     try:
                         profiles = {
                             "interactive": ctrl.residency_stats.profile_for(
@@ -233,6 +243,7 @@ def build_snapshot(ctrl: "LaneSchedulerController") -> dict:
                             running=top_info["running_pods"],
                             profiles=profiles,
                             required_units=1.0,
+                            free_units=free_u,
                             now=now,
                         )
                         tail_wait = _fmt_wait(tail_est)

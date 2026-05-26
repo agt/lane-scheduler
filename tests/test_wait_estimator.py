@@ -154,13 +154,54 @@ class TestExpectedSlots(unittest.TestCase):
 class TestEstimateWait(unittest.TestCase):
 
     def test_rank_1_no_running_is_immediate(self):
+        # free_units >= required_units: dispatch immediately
         est = estimate_wait(
             queue_rank=1, lane_name="cpu",
             running=[], profiles=PROFILES,
-            required_units=1.0,
+            required_units=1.0, free_units=1.0,
         )
         self.assertAlmostEqual(est.median_seconds, 0.0, places=1)
         self.assertAlmostEqual(est.p20_seconds,    0.0, places=1)
+
+    def test_rank_1_full_lane_has_positive_wait(self):
+        # Lane is saturated (free_units=0): rank-1 job with 1 required unit must wait
+        running = [_pod(deadline=3600.0, age=0.0) for _ in range(4)]
+        est = estimate_wait(
+            queue_rank=1, lane_name="gpu-medium",
+            running=running, profiles=PROFILES,
+            required_units=1.0, free_units=0.0,
+        )
+        self.assertGreater(est.median_seconds, 0.0)
+
+    def test_rank_1_insufficient_free_capacity(self):
+        # Job needs 6 units but only 3 are free: must wait for 3 more to be released
+        running = [_pod(deadline=3600.0, age=600.0) for _ in range(10)]
+        est_enough = estimate_wait(
+            queue_rank=1, lane_name="gpu-medium",
+            running=running, profiles=PROFILES,
+            required_units=6.0, free_units=6.0,
+        )
+        est_short = estimate_wait(
+            queue_rank=1, lane_name="gpu-medium",
+            running=running, profiles=PROFILES,
+            required_units=6.0, free_units=3.0,
+        )
+        self.assertAlmostEqual(est_enough.median_seconds, 0.0, places=1)
+        self.assertGreater(est_short.median_seconds, 0.0)
+
+    def test_more_free_units_means_shorter_wait(self):
+        running = [_pod(deadline=3600.0, age=600.0) for _ in range(8)]
+        est_none = estimate_wait(
+            queue_rank=3, lane_name="gpu-medium",
+            running=running, profiles=PROFILES,
+            required_units=1.0, free_units=0.0,
+        )
+        est_some = estimate_wait(
+            queue_rank=3, lane_name="gpu-medium",
+            running=running, profiles=PROFILES,
+            required_units=1.0, free_units=2.0,
+        )
+        self.assertGreater(est_none.median_seconds, est_some.median_seconds)
 
     def test_rank_2_with_congested_lane_has_positive_wait(self):
         # Rank 2 must wait for 1 slot to free — with fresh pods that takes time

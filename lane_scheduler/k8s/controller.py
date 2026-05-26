@@ -1087,7 +1087,8 @@ class LaneSchedulerController:
         from lane_scheduler.core.scheduler import Lane as _Lane
         from lane_scheduler.k8s.pod_translator import _is_batch
 
-        now = time.monotonic()
+        now  = time.monotonic()
+        caps = self.node_tracker.lane_capacity()
 
         with self._pending_lock:
             pending_snapshot = dict(self._pending)
@@ -1096,14 +1097,21 @@ class LaneSchedulerController:
                 lane: dict(pods)
                 for lane, pods in self._running.items()
             }
+        with self._admitted_resources_lock:
+            admitted_by_lane: dict = {}
+            for _uid, (lane, units) in self._admitted_resources.items():
+                admitted_by_lane[lane] = admitted_by_lane.get(lane, 0.0) + units
 
         estimates:       dict[str, WaitEstimate] = {}
         lane_candidates: dict[str, list]         = {}
 
         for lane in (_Lane or []):
-            lane_name  = lane
-            running    = list((running_snapshot.get(lane) or {}).values())
-            candidates = self.scheduler._scored_candidates(lane, now)
+            lane_name    = lane
+            running      = list((running_snapshot.get(lane) or {}).values())
+            running_u    = sum(rp.resource_units for rp in running)
+            admitted_u   = admitted_by_lane.get(lane, 0.0)
+            free_units   = max(0.0, caps.get(lane, 0.0) - running_u - admitted_u)
+            candidates   = self.scheduler._scored_candidates(lane, now)
             lane_candidates[lane] = candidates
 
             for rank, (_, job) in enumerate(candidates, start=1):
@@ -1120,6 +1128,7 @@ class LaneSchedulerController:
                     running        = running,
                     profiles       = profiles,
                     required_units = job.resource_units,
+                    free_units     = free_units,
                     now            = now,
                 )
                 estimates[job.job_id] = est
