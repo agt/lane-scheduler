@@ -240,6 +240,7 @@ def estimate_wait(
     running:          list[RunningPod],
     profiles:         dict[str, ResidencyProfile],
     required_units:   float = 1.0,
+    free_units:       float = 0.0,
     now:              Optional[float] = None,
     t_max:            float = _T_MAX_DEFAULT,
 ) -> WaitEstimate:
@@ -254,6 +255,8 @@ def estimate_wait(
     running         : currently running pods in this lane
     profiles        : {"interactive": ResidencyProfile, "batch": ResidencyProfile}
     required_units  : resource_units the queued pod needs (default 1)
+    free_units      : resource units already free in the lane (capacity minus
+                      running minus admitted-but-not-yet-running); default 0
     now             : current time (time.monotonic()); defaults to now
     t_max           : search ceiling in seconds (default 24 h)
 
@@ -264,10 +267,11 @@ def estimate_wait(
     if now is None:
         now = time.monotonic()
 
-    # Target: number of resource-unit-slots that must free up before this pod.
-    # A pod at rank 1 needs nothing ahead of it to clear — it's next.
-    # A pod at rank N needs (N-1) × required_units of running pods to finish first.
-    target = float(queue_rank - 1) * required_units
+    # Target: running-pod slots that must free up before this pod can start.
+    # A pod at rank N needs (N × required_units) total capacity, minus whatever
+    # is already free.  free_units covers capacity that running pods don't occupy,
+    # so we only need the remainder to come from running pods finishing.
+    target = max(0.0, float(queue_rank) * required_units - free_units)
 
     median = _bisect_wait(target, running, profiles, now, z_adjust=0.0,     t_max=t_max)
     p20    = _bisect_wait(target, running, profiles, now, z_adjust=_Z_P20,  t_max=t_max)
