@@ -295,6 +295,7 @@ class LaneSchedulerController:
         )
 
         self._stop = threading.Event()
+        self._nodes_bootstrapped = threading.Event()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -397,6 +398,7 @@ class LaneSchedulerController:
 
     def _bootstrap_pods(self) -> None:
         """List all pods and seed our state + resourceVersion."""
+        self._nodes_bootstrapped.wait(timeout=10.0)
         resp = self.core_v1.list_pod_for_all_namespaces()
         items = getattr(resp, "items", None) or []
         rv = None
@@ -482,6 +484,9 @@ class LaneSchedulerController:
             return None
 
         gpu_lane = _gpu_lane(pod)
+        if gpu_lane is None:
+            _nname = spec.get("nodeName", "") or ""
+            gpu_lane = self.node_tracker.lane_for_node(_nname) if _nname else None
         batch    = _is_batch(pod)
 
         from lane_scheduler.k8s.pod_translator import _resource_units as _ru
@@ -502,9 +507,11 @@ class LaneSchedulerController:
         from lane_scheduler.k8s.pod_translator import _gpu_lane, _is_batch
         gpu_lane = _gpu_lane(pod)
         if gpu_lane is None:
-            logger.warning(
-                "Running pod %s has no recognised gpu-class label; "
-                "skipping utilization tracking",
+            _nname = ((pod.get("spec") or {}).get("nodeName", "") or "")
+            gpu_lane = self.node_tracker.lane_for_node(_nname) if _nname else None
+        if gpu_lane is None:
+            logger.debug(
+                "Running pod %s is not on a managed GPU node; skipping utilization tracking",
                 uid,
             )
             return
@@ -740,6 +747,7 @@ class LaneSchedulerController:
             self._handle_node_event({"type": "ADDED", "object": item})
         self._sync_lane_capacity()
         self._node_resource_version = rv
+        self._nodes_bootstrapped.set()
 
     def _handle_node_event(self, event: dict) -> None:
         etype = event.get("type", "")

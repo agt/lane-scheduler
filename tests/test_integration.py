@@ -395,6 +395,27 @@ class TestNodeCapacityTracker(unittest.TestCase):
         for cls in ("xsmall", "small", "medium", "large", "xlarge"):
             self.assertAlmostEqual(caps[_gpu(cls)], 0.0, msg=f"leaked into {cls}")
 
+    def test_lane_for_node_known_node(self):
+        t = NodeCapacityTracker()
+        t.upsert(_make_node(name="gpu-node-1", gpu="4", gpu_class="large"))
+        self.assertEqual(t.lane_for_node("gpu-node-1"), _gpu("large"))
+
+    def test_lane_for_node_unknown_node(self):
+        t = NodeCapacityTracker()
+        t.upsert(_make_node(name="gpu-node-1", gpu="4", gpu_class="large"))
+        self.assertIsNone(t.lane_for_node("not-a-node"))
+
+    def test_lane_for_node_cpu_only_node_not_tracked(self):
+        t = NodeCapacityTracker()
+        t.upsert(_make_node(cpu="64"))  # no gpu_class
+        self.assertIsNone(t.lane_for_node("default-node"))
+
+    def test_lane_for_node_after_remove(self):
+        t = NodeCapacityTracker()
+        t.upsert(_make_node(name="gpu-node-1", gpu="4", gpu_class="medium"))
+        t.remove("gpu-node-1")
+        self.assertIsNone(t.lane_for_node("gpu-node-1"))
+
 
 # ---------------------------------------------------------------------------
 # Controller-level integration: pod DELETE clears the scheduler queue
