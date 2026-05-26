@@ -418,6 +418,8 @@ class LaneSchedulerController:
             return
 
         if etype in ("ADDED", "MODIFIED"):
+            if _gpu_request_count(pod) == 0.0:
+                return
             if needs_scheduling(pod):
                 self._enqueue(uid, pod)
             else:

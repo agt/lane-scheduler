@@ -562,6 +562,7 @@ class TestCapacityGate(unittest.TestCase):
         """
         from kubernetes.client.models import (
             V1Pod, V1PodSpec, V1PodStatus, V1ObjectMeta, V1Container,
+            V1ResourceRequirements,
         )
         import datetime
 
@@ -576,7 +577,10 @@ class TestCapacityGate(unittest.TestCase):
                 labels={"dsmlp/course": "CSE234_SP26_A00", GPU_CLASS_LABEL_KEY: "small"},
             ),
             spec=V1PodSpec(
-                containers=[V1Container(name="c")],
+                containers=[V1Container(
+                    name="c",
+                    resources=V1ResourceRequirements(requests={"nvidia.com/gpu": "1"}),
+                )],
                 active_deadline_seconds=3600,
             ),
             status=V1PodStatus(
