@@ -45,7 +45,8 @@ Resource → lane mapping
 
 Resource units
 ~~~~~~~~~~~~~~
-    GPU lanes : total nvidia.com/gpu count requested, floor 1.0
+    GPU lanes : total nvidia.com/gpu count requested (no floor; 0 is valid for
+                unlabelled pods on GPU nodes that consume no GPUs)
 """
 
 from __future__ import annotations
@@ -104,8 +105,8 @@ def _parse_gpu_count(value: str) -> float:
 def _resource_units(pod: dict, gpu_lane: Optional[str]) -> float:
     """
     Returns a resource scalar for utilization accounting.
-        GPU lanes : nvidia.com/gpu count, floor 1.0
-        Unknown lane (gpu_lane=None): returns 1.0
+        GPU lanes : nvidia.com/gpu count from container requests (0.0 if none)
+        Unknown lane (gpu_lane=None): returns 1.0 (pending job without lane info)
     """
     if gpu_lane is None:
         return 1.0
@@ -119,7 +120,7 @@ def _resource_units(pod: dict, gpu_lane: Optional[str]) -> float:
             except ValueError:
                 logger.debug("Unparseable GPU request %r in pod %s",
                              requests[_GPU_RESOURCE], _pod_name(pod))
-    return max(total_gpu, 1.0)
+    return total_gpu
 
 
 def _pod_name(pod: dict) -> str:
@@ -140,7 +141,7 @@ def pod_to_job(pod: dict, submit_time: Optional[float] = None) -> Job:
         job_id      = pod UID
         lane        = gpu-class label → GPU lane string
         batch       = dsmlp/batch == "true"
-        resource_units = nvidia.com/gpu count requested, floor 1.0
+        resource_units = nvidia.com/gpu count requested
 
     Raises ValueError if the pod has no recognised gpu-class label.
     """
