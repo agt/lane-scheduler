@@ -121,7 +121,6 @@ DISPATCH_K          = _env_int(  "LANE_DISPATCH_K",         8)
 ALPHA               = _env_float("LANE_ALPHA",              1.0)
 T_HALF_INTERACTIVE  = _env_float("LANE_T_HALF_INTERACTIVE", 600.0)
 T_HALF_BATCH        = _env_float("LANE_T_HALF_BATCH",       7200.0)
-UTIL_WINDOW         = _env_float("LANE_UTIL_WINDOW",        300.0)
 WAIT_CACHE_INTERVAL = _env_float("LANE_WAIT_CACHE_INTERVAL",60.0)
 
 INTERACTIVE_MEAN_PCT = _env_float("LANE_INTERACTIVE_MEAN_PCT", 0.4)
@@ -408,7 +407,11 @@ class LaneSchedulerController:
         pod   = event.get("object", {})
 
         if hasattr(pod, "to_dict"):
-            pod = self.core_v1.api_client.sanitize_for_serialization(pod)
+            # Kubernetes model object (V1Pod) from the bootstrap list path.
+            # Convert to a camelCase dict matching the watch-stream format so
+            # the rest of the pipeline (pod_translator functions) works unchanged.
+            # Use a standalone ApiClient — no connection required for serialization.
+            pod = client.ApiClient().sanitize_for_serialization(pod)
 
         uid = (pod.get("metadata") or {}).get("uid")
         if not uid:
@@ -501,23 +504,37 @@ class LaneSchedulerController:
         self._upsert_running(uid, pod)
 
     def _running_pod_from_pod(self, uid: str, pod: dict) -> Optional[RunningPod]:
-        """Build a RunningPod from a Kubernetes pod dict."""
+        """Build a RunningPod from a Kubernetes pod dict or V1Pod model object.
+
+        The kubernetes client produces two different shapes depending on the code path:
+          - watch.stream() dicts: camelCase keys, ISO string values (e.g. startTime="2026-01-01T...")
+          - list_namespaced_pod() model objects: snake_case keys, datetime values
+            (e.g. start_time=datetime.datetime(...))
+        Both shapes are handled here.
+        """
+        import datetime as _dt
         from lane_scheduler.k8s.pod_translator import _is_batch, _resource_units, _gpu_lane
         spec   = pod.get("spec")   or {}
         status = pod.get("status") or {}
 
-        deadline = spec.get("activeDeadlineSeconds") or self._default_active_deadline
+        # activeDeadlineSeconds (camelCase) or active_deadline_seconds (snake_case)
+        deadline = (spec.get("activeDeadlineSeconds")
+                    or spec.get("active_deadline_seconds")
+                    or self._default_active_deadline)
 
-        start_str = status.get("startTime")
-        if start_str:
-            try:
-                import datetime
-                dt      = datetime.datetime.fromisoformat(start_str.replace("Z", "+00:00"))
-                wall_age = (datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds()
-                start_time = time.monotonic() - max(0.0, wall_age)
-            except Exception:
-                start_time = time.monotonic()
-        else:
+        # startTime (camelCase ISO str) or start_time (snake_case datetime)
+        start_raw = status.get("startTime") or status.get("start_time")
+        if start_raw is None:
+            # Pod is Running but startTime not yet populated; skip until next event.
+            return None
+        try:
+            if isinstance(start_raw, _dt.datetime):
+                dt = start_raw if start_raw.tzinfo else start_raw.replace(tzinfo=_dt.timezone.utc)
+            else:
+                dt = _dt.datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+            wall_age   = (_dt.datetime.now(_dt.timezone.utc) - dt).total_seconds()
+            start_time = time.monotonic() - max(0.0, wall_age)
+        except Exception:
             start_time = time.monotonic()
 
         gpu_lane = _gpu_lane(pod)
@@ -909,20 +926,32 @@ class LaneSchedulerController:
 
         now = time.monotonic()
 
+        # Snapshot group attribution for running pods (ctx lock, then running lock).
+        # Two separate acquisitions are intentional: _running_ctx_lock must never
+        # be held while _running_lock is held (see lock-ordering note in __init__).
+        with self._running_ctx_lock:
+            group_by_uid: dict = {uid: ctx[0] for uid, ctx in self._running_ctx.items()}
+
         with self._running_lock:
             running_units: dict = {
                 lane: sum(rp.resource_units for rp in pods.values())
                 for lane, pods in self._kubernetes_running.items()
             }
             running_counts: dict = {}
+            running_util:   dict = {}
             for lane, pods in self._kubernetes_running.items():
-                counts: dict = {}
-                for uid in pods:
-                    uname = self._kubernetes_running_user.get(uid, "")
+                counts:        dict = {}
+                util_by_group: dict = {}
+                for uid, rp in pods.items():
+                    uname    = self._kubernetes_running_user.get(uid, "")
+                    group_id = group_by_uid.get(uid, "")
                     counts[uname] = counts.get(uname, 0) + 1
+                    util_by_group[group_id] = util_by_group.get(group_id, 0.0) + rp.resource_units
                 running_counts[lane] = counts
+                running_util[lane]   = util_by_group
 
         self.scheduler.update_running_counts(running_counts)
+        self.scheduler.update_running_utilization(running_util)
 
         with self._kubernetes_pending_lock:
             pending_units: dict = {
@@ -1208,8 +1237,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Interactive aging half-life in seconds (default: %(default)s)")
     p.add_argument("--t-half-batch", type=float, default=T_HALF_BATCH,
                    help="Batch aging half-life in seconds (default: %(default)s)")
-    p.add_argument("--util-window", type=float, default=UTIL_WINDOW,
-                   help="Utilization rolling window in seconds (default: %(default)s)")
     p.add_argument("--interactive-mean-pct", type=float, default=INTERACTIVE_MEAN_PCT,
                    help="Interactive residency mean as fraction of deadline (default: %(default)s)")
     p.add_argument("--interactive-std-pct", type=float, default=INTERACTIVE_STD_PCT,
@@ -1293,7 +1320,6 @@ def main() -> None:
         alpha               = args.alpha,
         t_half_interactive  = args.t_half_interactive,
         t_half_batch        = args.t_half_batch,
-        utilization_window  = args.util_window,
         dispatch_k          = args.dispatch_k,
     )
 

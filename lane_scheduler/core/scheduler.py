@@ -108,12 +108,11 @@ def is_known_gpu_class(gpu_class: str) -> bool:
 EPSILON = 0.01  # utilization floor to prevent div-by-zero; not operator-tunable
 
 DEFAULTS = dict(
-    alpha              = 1.0,
-    t_half_interactive = 600.0,
-    t_half_batch       = 7200.0,
-    batch_mode_penalty = 0.3,
-    utilization_window = 300.0,
-    dispatch_k         = 8,
+    alpha              = 1.0,    # urgency scaling factor
+    t_half_interactive = 600.0,  # 10 min — interactive job aging half-life (s)
+    t_half_batch       = 7200.0, # 2 hr  — batch job aging half-life (s)
+    batch_mode_penalty = 0.3,    # batch jobs score at 30% of interactive baseline
+    dispatch_k         = 8,      # max jobs dispatched per lane per cycle
 )
 
 
@@ -127,7 +126,6 @@ class SchedulerConfig:
     t_half_interactive: float = DEFAULTS["t_half_interactive"]
     t_half_batch:       float = DEFAULTS["t_half_batch"]
     batch_mode_penalty: float = DEFAULTS["batch_mode_penalty"]
-    utilization_window: float = DEFAULTS["utilization_window"]
     dispatch_k:         int   = DEFAULTS["dispatch_k"]
 
     def __post_init__(self) -> None:
@@ -139,8 +137,6 @@ class SchedulerConfig:
             raise ValueError(f"t_half_batch must be > 0, got {self.t_half_batch}")
         if self.batch_mode_penalty <= 0:
             raise ValueError(f"batch_mode_penalty must be > 0, got {self.batch_mode_penalty}")
-        if self.utilization_window <= 0:
-            raise ValueError(f"utilization_window must be > 0, got {self.utilization_window}")
         if self.dispatch_k <= 0:
             raise ValueError(f"dispatch_k must be > 0, got {self.dispatch_k}")
 
@@ -179,43 +175,6 @@ class Job:
         t = now if now is not None else time.monotonic()
         return t - self.submit_time
 
-
-# ---------------------------------------------------------------------------
-# Utilization tracker (rolling window)
-# ---------------------------------------------------------------------------
-
-class UtilizationTracker:
-    """
-    Tracks resource consumption per (sched_group_id, lane) over a rolling window.
-    Usage events are timestamped; expired events are purged on read.
-    """
-
-    def __init__(self, window: float, lane_capacity: dict) -> None:
-        self._window = window
-        self._lane_capacity = lane_capacity
-        self._events: dict[tuple, list] = defaultdict(list)
-
-    def record(self, sched_group_id: str, lane: str, units: float,
-               now: Optional[float] = None) -> None:
-        ts = now if now is not None else time.monotonic()
-        self._events[(sched_group_id, lane)].append((ts, units))
-
-    def utilization(self, sched_group_id: str, lane: str,
-                    now: Optional[float] = None) -> float:
-        ts     = now if now is not None else time.monotonic()
-        cutoff = ts - self._window
-        key    = (sched_group_id, lane)
-        filtered = [(t, u) for t, u in self._events[key] if t >= cutoff]
-        if filtered:
-            self._events[key] = filtered
-        else:
-            self._events.pop(key, None)
-        total    = sum(u for _, u in filtered)
-        capacity = self._lane_capacity.get(lane, 1.0)
-        return total / (capacity * self._window) if capacity > 0 else 0.0
-
-    def reset(self, sched_group_id: str, lane: str) -> None:
-        self._events.pop((sched_group_id, lane), None)
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +217,7 @@ class Scheduler:
     - Log-aging wait boost with batch/interactive half-lives
     - Batch mode penalty keeps interactive jobs preferred
     - Fewest-running-then-oldest-submit user ordering within each group
-    - Rolling-window utilization tracking per (sched_group, lane)
+    - Live utilization derived from running pod resource units per (sched_group, lane)
 
     Queue structure: {lane: {sched_group_id: {username: [Job, ...]}}}
     """
@@ -274,15 +233,19 @@ class Scheduler:
         self.config  = config or SchedulerConfig()
         self.scorer  = PriorityScorer(self.config)
         self._groups: dict[str, SchedGroup] = {}
-        self.util    = UtilizationTracker(self.config.utilization_window, lane_capacity)
 
         # Per-lane per-user count of currently running pods, set each cycle
         # by the controller before calling cycle().  Used by _top_user().
         self._running_counts: dict = {}  # {lane: {username: count}}
 
+        # Per-lane per-group running resource units, pushed each cycle by the
+        # controller from its live _kubernetes_running snapshot.
+        # Used to compute U(g, lane) = running_units / lane_capacity.
+        self._running_utilization: dict = {}  # {lane: {sched_group_id: float}}
+
         # Single re-entrant lock protects _groups, _queues, _running_counts,
-        # and self.util.  Acquisition order: any controller lock is acquired
-        # BEFORE Scheduler._lock, never after.
+        # and _running_utilization.  Acquisition order: any controller lock is
+        # acquired BEFORE Scheduler._lock, never after.
         self._lock = threading.RLock()
 
         # {lane: {sched_group_id: {username: [Job, ...]}}}
@@ -295,7 +258,6 @@ class Scheduler:
         """Atomically replace the lane-capacity view used for scoring."""
         with self._lock:
             self.lane_capacity = lane_capacity
-            self.util._lane_capacity = lane_capacity
 
     def update_running_counts(self, counts: dict) -> None:
         """
@@ -305,6 +267,16 @@ class Scheduler:
         """
         with self._lock:
             self._running_counts = counts
+
+    def update_running_utilization(self, utilization: dict) -> None:
+        """
+        Replace the per-lane per-group running resource units snapshot.
+        utilization: {lane_str: {sched_group_id: total_resource_units}}
+        Called by the controller at the start of each cycle, before cycle().
+        U(g, lane) is then computed as running_units / lane_capacity.
+        """
+        with self._lock:
+            self._running_utilization = utilization
 
     def _top_user(self, active_users: set[str], lane: str,
                   user_map: dict) -> str:
@@ -331,10 +303,12 @@ class Scheduler:
             active_users = {u for u, jobs in user_map.items() if jobs}
             if not active_users:
                 continue
-            username = self._top_user(active_users, lane, user_map)
-            job      = user_map[username][0]
-            util     = self.util.utilization(sched_group_id, lane, now)
-            score    = self.scorer.score(job, group, util, now)
+            username     = self._top_user(active_users, lane, user_map)
+            job          = user_map[username][0]
+            running      = self._running_utilization.get(lane, {}).get(sched_group_id, 0.0)
+            cap          = self.lane_capacity.get(lane, 1.0)
+            util         = running / cap if cap > 0 else 0.0
+            score        = self.scorer.score(job, group, util, now)
             yield sched_group_id, score, job, group
 
     def register_group(self, group: SchedGroup) -> None:
@@ -385,7 +359,6 @@ class Scheduler:
 
         1. Per lane: select one candidate per group via _top_user().
         2. Score candidates; dispatch top-K.
-        3. Update utilization tracker.
         """
         now = now if now is not None else time.monotonic()
         dispatched: list[Job] = []
@@ -415,7 +388,6 @@ class Scheduler:
                     if not self._queues[lane][job.sched_group_id]:
                         del self._queues[lane][job.sched_group_id]
 
-                    self.util.record(job.sched_group_id, lane, job.resource_units, now)
                     dispatched.append(job)
                     log_entries.append((job, lane, score))
 
