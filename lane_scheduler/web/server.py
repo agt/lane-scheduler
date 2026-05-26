@@ -316,6 +316,8 @@ def _make_handler(controller: "LaneSchedulerController"):
                 self._serve(200, "text/html; charset=utf-8", _DASHBOARD_HTML.encode("utf-8"))
             elif path == "/api/snapshot":
                 self._serve_snapshot()
+            elif path == "/api/nodes":
+                self._serve_nodes()
             else:
                 self.send_error(404)
 
@@ -326,20 +328,30 @@ def _make_handler(controller: "LaneSchedulerController"):
             self.end_headers()
             self.wfile.write(body)
 
+        def _serve_json(self, data: dict) -> None:
+            body = json.dumps(data, separators=(",", ":"), indent=2).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
         def _serve_snapshot(self) -> None:
             try:
                 from lane_scheduler.web.snapshot import build_snapshot
-                data = build_snapshot(controller)
-                body = json.dumps(data, separators=(",", ":")).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(body)
+                self._serve_json(build_snapshot(controller))
             except Exception as exc:
                 logger.error("Snapshot build failed: %s", exc, exc_info=True)
+                self.send_error(500)
+
+        def _serve_nodes(self) -> None:
+            try:
+                from lane_scheduler.web.snapshot import build_nodes_snapshot
+                self._serve_json(build_nodes_snapshot(controller))
+            except Exception as exc:
+                logger.error("Nodes snapshot failed: %s", exc, exc_info=True)
                 self.send_error(500)
 
         def log_message(self, fmt, *args) -> None:  # type: ignore[override]

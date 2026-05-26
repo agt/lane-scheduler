@@ -296,6 +296,9 @@ class LaneSchedulerController:
 
         self._stop = threading.Event()
         self._nodes_bootstrapped = threading.Event()
+        # Populated by _bootstrap_pods; consumed (and cleared) by
+        # _rescan_unlaned_running_pods after node bootstrap completes.
+        self._bootstrap_pod_cache: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -405,8 +408,14 @@ class LaneSchedulerController:
         meta = getattr(resp, "metadata", None)
         if meta is not None:
             rv = getattr(meta, "resource_version", None)
+        cache: dict[str, dict] = {}
         for item in items:
+            pod = item.to_dict() if hasattr(item, "to_dict") else item
+            uid = (pod.get("metadata") or {}).get("uid")
+            if uid:
+                cache[uid] = pod
             self._handle_pod_event({"type": "ADDED", "object": item})
+        self._bootstrap_pod_cache = cache
         self._pod_resource_version = rv
 
     def _update_resource_version(self, event: dict, *, is_pod: bool) -> None:
@@ -509,11 +518,18 @@ class LaneSchedulerController:
         if gpu_lane is None:
             _nname = ((pod.get("spec") or {}).get("nodeName", "") or "")
             gpu_lane = self.node_tracker.lane_for_node(_nname) if _nname else None
+            if gpu_lane is not None:
+                logger.info(
+                    "Running pod %s: no gpu-class pod label; attributed to lane %s via node %r",
+                    uid, gpu_lane, _nname,
+                )
+            else:
+                logger.info(
+                    "Running pod %s: no gpu-class pod label and node %r not in managed pool; "
+                    "skipping utilization tracking",
+                    uid, _nname,
+                )
         if gpu_lane is None:
-            logger.debug(
-                "Running pod %s is not on a managed GPU node; skipping utilization tracking",
-                uid,
-            )
             return
         lane      = gpu_lane
         lane_name = lane
@@ -748,6 +764,39 @@ class LaneSchedulerController:
         self._sync_lane_capacity()
         self._node_resource_version = rv
         self._nodes_bootstrapped.set()
+        self._rescan_unlaned_running_pods()
+
+    def _rescan_unlaned_running_pods(self) -> None:
+        """
+        Re-try _upsert_running for any pods that were skipped at bootstrap
+        because node data was not yet available.
+
+        Called once after _bootstrap_nodes completes so that Running pods
+        on managed nodes are counted even when pod bootstrap raced ahead of
+        node bootstrap and the 10 s barrier timed out.
+        """
+        with self._pending_lock:
+            pending_uids = set(self._pending)
+        with self._running_lock:
+            already_tracked = set()
+            for pods in self._running.values():
+                already_tracked.update(pods)
+
+        requeued = 0
+        for uid, pod in list(getattr(self, "_bootstrap_pod_cache", {}).items()):
+            if uid in already_tracked or uid in pending_uids:
+                continue
+            phase = (pod.get("status") or {}).get("phase", "")
+            if phase == "Running":
+                self._upsert_running(uid, pod)
+                requeued += 1
+
+        if requeued:
+            logger.info(
+                "Post-node-bootstrap rescan attributed %d previously-unlaned Running pod(s)",
+                requeued,
+            )
+        self._bootstrap_pod_cache.clear()
 
     def _handle_node_event(self, event: dict) -> None:
         etype = event.get("type", "")
