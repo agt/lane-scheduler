@@ -18,7 +18,7 @@ _GPU_CLASSES = ["small", "medium", "large"]
 initialise_lanes(_GPU_CLASSES)
 
 from lane_scheduler.core.scheduler import (  # noqa: E402 — after initialise_lanes
-    CourseClass, Job, Scheduler, SchedulerConfig,
+    SchedGroup, Job, Scheduler, SchedulerConfig,
 )
 
 
@@ -42,14 +42,13 @@ class SimConfig:
 
 
 # ---------------------------------------------------------------------------
-# Synthetic class definitions
+# Synthetic scheduling group definitions
 # ---------------------------------------------------------------------------
 
 import math as _math
 
-CLASSES = [
-    # (class_id, weight,                          profile, n_students)
-    # Weights computed as tier / sqrt(enrollment) — adjust externally as needed.
+SCHED_GROUPS = [
+    # (sched_group_id, weight,                      profile, n_users)
     ("INTRO-101",  1.0 / _math.sqrt(220),   1, 220),
     ("INTRO-102",  1.0 / _math.sqrt(180),   1, 180),
     ("UPPER-201",  2.0 / _math.sqrt(60),    2,  60),
@@ -96,43 +95,43 @@ def pick_lane(probs: dict, rng: random.Random):
 
 @dataclass
 class Stats:
-    dispatched_by_class:    dict = field(default_factory=lambda: defaultdict(int))
-    wait_by_class:          dict = field(default_factory=lambda: defaultdict(list))
+    dispatched_by_group:    dict = field(default_factory=lambda: defaultdict(int))
+    wait_by_group:          dict = field(default_factory=lambda: defaultdict(list))
     dispatched_by_lane:     dict = field(default_factory=lambda: defaultdict(int))
     dispatched_by_profile:  dict = field(default_factory=lambda: defaultdict(int))
 
 
-def record(stats: Stats, job: Job, course: CourseClass, profile: int) -> None:
+def record(stats: Stats, job: Job, group: SchedGroup, profile: int) -> None:
     wait = (job.dispatch_time - job.submit_time)
-    stats.dispatched_by_class[job.class_id] += 1
-    stats.wait_by_class[job.class_id].append(wait)
+    stats.dispatched_by_group[job.sched_group_id] += 1
+    stats.wait_by_group[job.sched_group_id].append(wait)
     stats.dispatched_by_lane[job.lane] += 1
     stats.dispatched_by_profile[profile] += 1
 
 
-def print_report(stats: Stats, classes: dict[str, CourseClass],
+def print_report(stats: Stats, groups: dict[str, SchedGroup],
                  total_submitted: dict[str, int], duration: float) -> None:
 
     print("\n" + "=" * 70)
     print("SIMULATION REPORT")
     print("=" * 70)
 
-    # Per-class table
-    print(f"\n{'Class':<14} {'Weight':>7} "
+    # Per-group table
+    print(f"\n{'Group':<14} {'Weight':>7} "
           f"{'Submit':>7} {'Dispatched':>10} {'Dispatch%':>10} "
           f"{'AvgWait(s)':>11} {'P95Wait(s)':>11}")
     print("-" * 75)
 
-    for class_id, course in sorted(classes.items()):
-        submitted  = total_submitted.get(class_id, 0)
-        dispatched = stats.dispatched_by_class.get(class_id, 0)
-        waits      = stats.wait_by_class.get(class_id, [0])
+    for sched_group_id, group in sorted(groups.items()):
+        submitted  = total_submitted.get(sched_group_id, 0)
+        dispatched = stats.dispatched_by_group.get(sched_group_id, 0)
+        waits      = stats.wait_by_group.get(sched_group_id, [0])
         pct        = 100 * dispatched / submitted if submitted else 0
         avg_wait   = statistics.mean(waits) if waits else 0
         p95_wait   = sorted(waits)[int(0.95 * len(waits))] if waits else 0
 
-        print(f"{class_id:<14} "
-              f"{course.class_weight:>7.4f} {submitted:>7} {dispatched:>10} "
+        print(f"{sched_group_id:<14} "
+              f"{group.weight:>7.4f} {submitted:>7} {dispatched:>10} "
               f"{pct:>9.1f}% {avg_wait:>11.1f} {p95_wait:>11.1f}")
 
     # By profile
@@ -160,25 +159,25 @@ def run(sim_cfg: SimConfig | None = None) -> None:
     sched_cfg = SchedulerConfig(dispatch_k=sim_cfg.dispatch_k)
     scheduler = Scheduler(lane_capacity=sim_cfg.lane_capacity, config=sched_cfg)
 
-    courses: dict[str, CourseClass] = {}
-    class_profiles: dict[str, int] = {}  # class_id → profile key (1/2/3)
-    for class_id, weight, profile_key, n_students in CLASSES:
-        c = CourseClass(class_id=class_id, class_weight=weight)
-        courses[class_id] = c
-        class_profiles[class_id] = profile_key
-        scheduler.register_class(c)
+    groups: dict[str, SchedGroup] = {}
+    group_profiles: dict[str, int] = {}  # sched_group_id → profile key (1/2/3)
+    for sched_group_id, weight, profile_key, n_users in SCHED_GROUPS:
+        g = SchedGroup(sched_group_id=sched_group_id, weight=weight)
+        groups[sched_group_id] = g
+        group_profiles[sched_group_id] = profile_key
+        scheduler.register_group(g)
 
     # Pre-generate job submission events
-    # Each student submits jobs at a Poisson rate based on their profile
+    # Each user submits jobs at a Poisson rate based on their profile
     events: list[tuple[float, Job]] = []
     job_counter = 0
 
-    for class_id, _weight, profile_key, n_students in CLASSES:
+    for sched_group_id, _weight, profile_key, n_users in SCHED_GROUPS:
         profile = _TIER_PROFILES[profile_key]
         rate_per_second = profile["rate"] / 3600.0
 
-        for student_idx in range(n_students):
-            student_id = f"{class_id}-S{student_idx:04d}"
+        for user_idx in range(n_users):
+            username = f"{sched_group_id}-U{user_idx:04d}"
             t = rng.expovariate(rate_per_second)
             while t < sim_cfg.duration:
                 lane = pick_lane(profile["lane_probs"], rng)
@@ -186,8 +185,8 @@ def run(sim_cfg: SimConfig | None = None) -> None:
                 batch = rng.random() < profile["batch_prob"]
                 job = Job(
                     job_id=f"J{job_counter:06d}",
-                    class_id=class_id,
-                    student_id=student_id,
+                    sched_group_id=sched_group_id,
+                    username=username,
                     lane=lane,
                     batch=batch,
                     submit_time=t,
@@ -198,14 +197,14 @@ def run(sim_cfg: SimConfig | None = None) -> None:
                 t += rng.expovariate(rate_per_second)
 
     events.sort(key=lambda x: x[0])
-    total_students = sum(n for _, _, _, n in CLASSES)
+    total_users = sum(n for _, _, _, n in SCHED_GROUPS)
     print(f"Generated {len(events)} job submissions across "
-          f"{total_students} students.")
+          f"{total_users} users.")
 
-    # Count submissions per class for reporting
+    # Count submissions per group for reporting
     total_submitted: dict[str, int] = defaultdict(int)
     for _, job in events:
-        total_submitted[job.class_id] += 1
+        total_submitted[job.sched_group_id] += 1
 
     # Run simulation
     stats = Stats()
@@ -222,7 +221,8 @@ def run(sim_cfg: SimConfig | None = None) -> None:
         # Run scheduling cycle
         dispatched = scheduler.cycle(now=t)
         for job in dispatched:
-            record(stats, job, courses[job.class_id], class_profiles[job.class_id])
+            record(stats, job, groups[job.sched_group_id],
+                   group_profiles[job.sched_group_id])
 
         t += sim_cfg.cycle_interval
 
@@ -231,10 +231,10 @@ def run(sim_cfg: SimConfig | None = None) -> None:
     if depths:
         print(f"\nRemaining queue depths at end of simulation:")
         for lane_name, counts in depths.items():
-            for class_id, n in counts.items():
-                print(f"  [{lane_name}] {class_id}: {n} jobs waiting")
+            for sched_group_id, n in counts.items():
+                print(f"  [{lane_name}] {sched_group_id}: {n} jobs waiting")
 
-    print_report(stats, courses, total_submitted, sim_cfg.duration)
+    print_report(stats, groups, total_submitted, sim_cfg.duration)
 
 
 if __name__ == "__main__":

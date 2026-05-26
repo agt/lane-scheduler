@@ -24,29 +24,15 @@ Admission gate model
 
 Label / annotation contract
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    dsmlp/course        : course identifier, e.g. "CSE234_SP26_A00"
-                          Required.  Pod is held under NO_COURSE_LABEL if absent.
-    gpu-class           : one of {xsmall, small, medium, large, xlarge}
-                          Injected by the mutating admission controller.
-                          Pods without this label are rejected with an error Event.
-    dsmlp/batch         : "true" (case-insensitive) → batch mode scoring penalty
-                          Absent or any other value → interactive priority.
-                          Override key with LANE_BATCH_LABEL env var.
-
-Resource → lane mapping
-~~~~~~~~~~~~~~~~~~~~~~~
-    gpu-class=xsmall                → "gpu-xsmall"
-    gpu-class=small                 → "gpu-small"
-    gpu-class=medium                → "gpu-medium"
-    gpu-class=large                 → "gpu-large"
-    gpu-class=xlarge                → "gpu-xlarge"
-    No gpu-class label / unknown    → rejected; error Event emitted; ValueError
-                                      raised by pod_to_job()
-
-Resource units
-~~~~~~~~~~~~~~
-    GPU lanes : total nvidia.com/gpu count requested (no floor; 0 is valid for
-                unlabelled pods on GPU nodes that consume no GPUs)
+    dsmlp/course  : scheduling group identifier, e.g. "CSE234_SP26_A00"
+                    Required.  Pod is queued under NO_SCHED_GROUP_LABEL if absent.
+    dsmlp/user    : username for per-user fairness tracking.
+                    Falls back to pod namespace if absent.
+    gpu-class     : one of {xsmall, small, medium, large, xlarge}
+                    Injected by the mutating admission controller.
+                    Pods without this label are rejected with an error Event.
+    dsmlp/batch   : "true" (case-insensitive) → batch mode scoring penalty
+                    Absent or any other value → interactive priority.
 """
 
 from __future__ import annotations
@@ -62,17 +48,16 @@ from lane_scheduler.core.node_capacity import GPU_CLASS_LABEL_KEY as _GPU_TAINT_
 logger = logging.getLogger(__name__)
 
 # Labels we read
-LABEL_COURSE     = os.environ.get("LANE_COURSE_LABEL",     "dsmlp/course")
-LABEL_BATCH      = os.environ.get("LANE_BATCH_LABEL",      "dsmlp/batch")
-# Label key on pods that identifies the requested GPU class / lane.
-# Override with LANE_POD_GPU_CLASS_LABEL if your cluster uses a different key.
-LABEL_GPU_CLASS  = os.environ.get("LANE_GPU_CLASS_LABEL", "gpu-class")
+LABEL_SCHED_GROUP = os.environ.get("LANE_COURSE_LABEL",     "dsmlp/course")
+LABEL_USER        = os.environ.get("LANE_USER_LABEL",       "dsmlp/user")
+LABEL_BATCH       = os.environ.get("LANE_BATCH_LABEL",      "dsmlp/batch")
+LABEL_GPU_CLASS   = os.environ.get("LANE_GPU_CLASS_LABEL",  "gpu-class")
 
 # Name of the scheduling gate injected by the mutating admission controller.
 SCHEDULING_GATE_NAME = os.environ.get("LANE_SCHEDULING_GATE_NAME", "lane-scheduler")
 
-# Fallback course label when pod carries none
-_NO_COURSE_LABEL = "__unlabelled__"
+# Sentinel for pods that carry no dsmlp/course label
+_NO_SCHED_GROUP_LABEL = "__unlabelled__"
 
 # Resource request key for GPUs
 _GPU_RESOURCE = "nvidia.com/gpu"
@@ -141,11 +126,11 @@ def pod_to_job(pod: dict, submit_time: Optional[float] = None) -> Job:
     """
     Convert a Kubernetes pod dict to a scheduler Job.
 
-        student_id  = pod namespace          (one namespace per student)
-        class_id    = dsmlp/course label
-        job_id      = pod UID
-        lane        = gpu-class label → GPU lane string
-        batch       = dsmlp/batch == "true"
+        sched_group_id = dsmlp/course label (or __unlabelled__)
+        username       = dsmlp/user label (falls back to pod namespace)
+        job_id         = pod UID
+        lane           = gpu-class label → GPU lane string
+        batch          = dsmlp/batch == "true"
         resource_units = nvidia.com/gpu count requested
 
     Raises ValueError if the pod has no recognised gpu-class label.
@@ -155,9 +140,10 @@ def pod_to_job(pod: dict, submit_time: Optional[float] = None) -> Job:
     uid       = meta.get("uid", _pod_name(pod))
     labels    = _labels(pod)
 
-    course_id = labels.get(LABEL_COURSE, _NO_COURSE_LABEL).strip() or _NO_COURSE_LABEL
-    batch     = _is_batch(pod)
-    gpu_lane  = _gpu_lane(pod)
+    sched_group_id = labels.get(LABEL_SCHED_GROUP, _NO_SCHED_GROUP_LABEL).strip() or _NO_SCHED_GROUP_LABEL
+    username       = labels.get(LABEL_USER, "").strip() or namespace
+    batch          = _is_batch(pod)
+    gpu_lane       = _gpu_lane(pod)
     if gpu_lane is None:
         gpu_class = labels.get(LABEL_GPU_CLASS, "").strip()
         raise ValueError(
@@ -169,8 +155,8 @@ def pod_to_job(pod: dict, submit_time: Optional[float] = None) -> Job:
 
     job = Job(
         job_id         = uid,
-        class_id       = course_id,
-        student_id     = namespace,
+        sched_group_id = sched_group_id,
+        username       = username,
         lane           = lane,
         batch          = batch,
         resource_units = units,
@@ -178,8 +164,8 @@ def pod_to_job(pod: dict, submit_time: Optional[float] = None) -> Job:
     job.submit_time = submit_time if submit_time is not None else time.monotonic()
 
     logger.debug(
-        "Translated pod %s → job %s [course=%s lane=%s batch=%s units=%.2f]",
-        _pod_name(pod), uid, course_id, lane, batch, units,
+        "Translated pod %s → job %s [group=%s user=%s lane=%s batch=%s units=%.2f]",
+        _pod_name(pod), uid, sched_group_id, username, lane, batch, units,
     )
     return job
 
@@ -204,31 +190,23 @@ def admission_patch(pod: dict) -> dict:
     """
     Build a strategic-merge patch that admits the pod for Kubernetes scheduling:
 
-        a) Adds a nodeSelector entry (gpu-class=<class>) so the default
-           scheduler targets only nodes in the correct GPU lane.
-        b) Adds the gpu-class=<class>:NoSchedule toleration so the pod can
-           land on the tainted GPU node.
-        c) Removes the "lane-scheduler" schedulingGate entry so the default
-           Kubernetes scheduler picks up the pod.
+        a) Adds a nodeSelector entry (gpu-class=<class>) to target the correct GPU nodes.
+        b) Adds the gpu-class=<class>:NoSchedule toleration.
+        c) Removes the "lane-scheduler" schedulingGate entry.
 
     Returns {} if the scheduling gate is already absent (idempotent).
-
-    Apply via:
-        core_v1.patch_namespaced_pod(name, namespace, body=admission_patch(pod))
     """
     gates = (pod.get("spec", {}) or {}).get("schedulingGates", []) or []
     if not any(g.get("name") == SCHEDULING_GATE_NAME for g in gates):
-        return {}   # gate already removed — nothing to do
+        return {}
 
     gpu_class = _labels(pod).get(LABEL_GPU_CLASS, "").strip()
     patch: dict = {"spec": {}}
 
-    # a) nodeSelector: direct the default scheduler to the right GPU lane.
     existing_node_selector = dict((pod.get("spec", {}) or {}).get("nodeSelector", {}) or {})
     if gpu_class and existing_node_selector.get(_GPU_TAINT_KEY) != gpu_class:
         patch["spec"]["nodeSelector"] = {**existing_node_selector, _GPU_TAINT_KEY: gpu_class}
 
-    # b) GPU-class NoSchedule toleration
     existing_tolerations = list((pod.get("spec", {}) or {}).get("tolerations", []) or [])
     already_tolerated = any(
         t.get("key") == _GPU_TAINT_KEY and t.get("value") == gpu_class
@@ -242,8 +220,6 @@ def admission_patch(pod: dict) -> dict:
             "effect":   "NoSchedule",
         }]
 
-    # c) Remove the lane-scheduler scheduling gate.
-    # Use the $patch:delete directive so other gates (if any) are preserved.
     patch["spec"]["schedulingGates"] = [
         {"$patch": "delete", "name": SCHEDULING_GATE_NAME}
     ]
@@ -251,4 +227,4 @@ def admission_patch(pod: dict) -> dict:
     return patch
 
 
-NO_COURSE_LABEL = _NO_COURSE_LABEL
+NO_SCHED_GROUP_LABEL = _NO_SCHED_GROUP_LABEL

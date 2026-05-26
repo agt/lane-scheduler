@@ -1,30 +1,40 @@
 # Lane-based Priority Scheduler
 
-A Kubernetes controller that fairly allocates cluster resources across university courses, preventing high-volume courses from crowding out lower-volume ones with higher scheduling priority, while respecting heterogeneous GPU hardware classes.
+A Kubernetes controller that fairly allocates cluster resources across university scheduling groups (courses), preventing high-volume groups from crowding out lower-volume ones, while respecting heterogeneous GPU hardware classes.
 
 ---
 
 ## Goals
 
-University teaching clusters face a structural fairness problem: a high-enrollment course will naturally generate far more queued jobs than a small one, causing lower-volume courses to starve during peak periods even when they warrant equal or higher scheduling priority.
+University teaching clusters face a structural fairness problem: a high-enrollment course will naturally generate far more queued jobs than a small one, causing lower-volume courses to starve during peak periods even when they warrant equal scheduling priority.
 
 This scheduler addresses that by:
 
-- Assigning each course an operator-defined weight that can incorporate whatever priority factors are relevant — academic level, enrollment, or any other consideration — so high-priority courses compete on equal or better footing with high-volume ones regardless of raw job count
-- Distributing a course's share fairly among its individual students, so no single active student within a course monopolizes its allocation
+- Giving every scheduling group equal weight (W = 1.0) so the priority formula treats all groups symmetrically; per-group weights are a planned future capability
+- Distributing a group's share fairly among its individual users, so no single active user within a scheduling group monopolizes its allocation
 - Preferring interactive jobs over batch jobs within any resource lane, while ensuring batch jobs eventually drain overnight
 - Providing students with real-time queue position and estimated wait time via Kubernetes Events visible in `kubectl describe pod`
-- Adapting wait-time estimates over time using course-specific completion data, so estimates improve as the term progresses
+- Adapting wait-time estimates over time using per-group completion data, so estimates improve as the term progresses
 
 The scheduler is implemented as a Kubernetes controller. It does not replace the default Kubernetes scheduler; instead it acts as a gating layer. Pods of interest arrive in a SchedulingGated state — held by a `lane-scheduler` scheduling gate injected by an external mutating admission controller. When a pod reaches the top of the priority queue, the controller patches in the matching GPU-class `nodeSelector` and `NoSchedule` toleration and removes the scheduling gate, allowing the default scheduler to place the pod normally.
 
 ### Scheduling Model
 
-The system operates as a set of independent finite-capacity multi-server queues (lanes), one per GPU hardware class. Only pods that arrive bearing the `lane-scheduler` scheduling gate are managed; pods without a recognised `gpu-class` label are rejected with an error Event. Each lane accepts a multi-class open workload of heterogeneous jobs; jobs are held in the SchedulingGated state and released in discrete scheduling cycles. The service discipline within each lane is a dynamic non-preemptive priority rule: at each cycle, queued jobs are scored and the top-*K* are admitted subject to a capacity constraint.
+The system operates as a set of independent finite-capacity multi-server queues (lanes), one per GPU hardware class. Only pods that arrive bearing the `lane-scheduler` scheduling gate are managed; pods without a recognised `gpu-class` label are rejected with an error Event. Each lane accepts a multi-group open workload of heterogeneous jobs; jobs are held in the SchedulingGated state and released in discrete scheduling cycles. The service discipline within each lane is a dynamic non-preemptive priority rule: at each cycle, queued jobs are scored and the top-*K* are admitted subject to a capacity constraint.
 
-The per-job priority score is P(*j*, *l*) = W(*c*) · M(*j*) · A(*j*) / U(*c*, *l*), where W(*c*) is a static operator-assigned class weight, M(*j*) ∈ {0.3, 1.0} is a batch/interactive mode multiplier, A(*j*) = 1 + α log(1 + *t*_w / *t*_½) is a logarithmic age boost parameterised by wait time *t*_w and configurable half-life *t*_½, and U(*c*, *l*) is the rolling-window resource utilisation of class *c* in lane *l* over a recent time window. The utilisation denominator gives the discipline its fairness character: a class currently consuming a large share of lane capacity scores lower than an equally weighted idle class, producing a weighted max-min allocation across active classes analogous to Generalised Processor Sharing (GPS), but approximated in periodic discrete cycles rather than fluid flow. Logarithmic aging is preferred over linear aging to bound runaway priority elevation while still guaranteeing finite waiting — a job's score grows without bound but at a rate that decreases with wait time, suppressing the synchronised burst discharges that arise when many long-waiting jobs simultaneously reach a linear threshold.
+The per-job priority score is P(*j*, *l*) = W(*g*) · M(*j*) · A(*j*) / U(*g*, *l*), where W(*g*) = 1.0 for all scheduling groups (equal weight; per-group configuration is deferred), M(*j*) ∈ {0.3, 1.0} is a batch/interactive mode multiplier, A(*j*) = 1 + α log(1 + *t*_w / *t*_½) is a logarithmic age boost parameterised by wait time *t*_w and configurable half-life *t*_½, and U(*g*, *l*) is the rolling-window resource utilisation of scheduling group *g* in lane *l* over a recent time window. The utilisation denominator gives the discipline its fairness character: a group currently consuming a large share of lane capacity scores lower than an equally weighted idle group, producing a weighted max-min allocation across active groups analogous to Generalised Processor Sharing (GPS), but approximated in periodic discrete cycles rather than fluid flow. Logarithmic aging is preferred over linear aging to bound runaway priority elevation while still guaranteeing finite waiting.
 
-Within each class the scheduler applies a secondary max-min fairness rule: among all students with pending jobs in the lane, it selects the one with the fewest currently running pods, breaking ties by earliest submit time. This min-running / FIFO discipline is a discrete analogue of per-user processor sharing, ensuring that no individual student can exhaust a course's dispatch share while holding active sessions. Admission is gated by a closed-loop capacity check — free capacity is computed as total lane capacity minus running resource units minus admitted-but-unplaced resource units — preventing the phantom-capacity over-commitment that arises in two-level scheduling architectures during the interval between pod admission and physical placement. Wait-time estimates are derived by modelling each running pod's residency as a truncated normal random variable; summing completion-probability integrals across all running pods gives the expected freed capacity as a function of time, and bisection inverts this to find the wait percentile corresponding to a job's queue rank. Per-course residency parameters are maintained online via Welford's algorithm with Bayesian shrinkage toward a cluster-wide prior, so estimates converge from prior toward course-specific behaviour as observations accumulate.
+Within each scheduling group the scheduler applies a secondary max-min fairness rule: among all users with pending jobs in the lane, it selects the one with the fewest currently running pods, breaking ties by earliest submit time. This min-running / FIFO discipline is a discrete analogue of per-user processor sharing, ensuring that no individual user can exhaust a group's dispatch share while holding active sessions.
+
+Admission is gated by a closed-loop capacity check — free capacity is computed as:
+
+```
+free = lane_cap − running_units − kubernetes_pending_units − admitted_units
+```
+
+This three-term deduction prevents over-commitment during the interval between pod admission and physical placement. Pods transition through four states: SchedulingGated → admitted (reserved in `_admitted_resources`) → k8s-Pending (tracked in `_kubernetes_pending`, resource reservation maintained) → Running (tracked in `_kubernetes_running`).
+
+Wait-time estimates are derived by modelling each running pod's residency as a truncated normal random variable; summing completion-probability integrals across all running pods gives the expected freed capacity as a function of time, and bisection inverts this to find the wait percentile corresponding to a job's queue rank. Per-group residency parameters are maintained online via Welford's algorithm with Bayesian shrinkage toward a cluster-wide prior.
 
 ---
 
@@ -32,11 +42,11 @@ Within each class the scheduler applies a secondary max-min fairness rule: among
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    LaneSchedulerController                           │
+│                    LaneSchedulerController                  │
 │                                                             │
 │  pod-watch thread ──► _handle_pod_event                     │
-│     • enqueue pending pods                                   │
-│     • track running pods                                     │
+│     • enqueue SchedulingGated pods                          │
+│     • track: admitted → k8s-Pending → Running transitions   │
 │     • record completions → ResidencyStats                   │
 │                                                             │
 │  node-watch thread ──► NodeCapacityTracker                  │
@@ -51,9 +61,6 @@ Within each class the scheduler applies a secondary max-min fairness rule: among
 │  wait-cache thread (60s) ──► _build_wait_snapshot()         │
 │     • compute WaitEstimate for every queued pod             │
 │     • publish Kubernetes Events                             │
-│                                                             │
-│  csv-reload thread (daily) ──► CourseRegistry               │
-│     • reload registrar data                                 │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -61,16 +68,16 @@ Within each class the scheduler applies a secondary max-min fairness rule: among
 
 | Module | Responsibility |
 |---|---|
-| `lane_scheduler/core/scheduler.py` | Core scheduling logic: priority scoring, within-class fairness, utilization tracking |
-| `lane_scheduler/core/course_registry.py` | Course scheduling weights from registrar CSV; fallback for unknown courses |
+| `lane_scheduler/core/scheduler.py` | Core scheduling logic: priority scoring, within-group fairness, utilization tracking |
+| `lane_scheduler/core/sched_group_registry.py` | Stub registry returning W=1.0 for all scheduling groups; per-group weights deferred |
 | `lane_scheduler/core/node_capacity.py` | Tracks allocatable capacity per GPU class lane from node watch events |
 | `lane_scheduler/k8s/controller.py` | Orchestrates all threads; Kubernetes API interactions |
 | `lane_scheduler/k8s/pod_translator.py` | Translates Kubernetes pod dicts into scheduler domain objects |
 | `lane_scheduler/k8s/event_publisher.py` | Kubernetes Event creation with per-pod emission schedules |
 | `lane_scheduler/estimation/wait_estimator.py` | Truncated-normal wait-time estimation; background cache |
-| `lane_scheduler/estimation/residency_stats.py` | Per-course Bayesian residency distribution tracking |
+| `lane_scheduler/estimation/residency_stats.py` | Per-group Bayesian residency distribution tracking |
 | `tools/simulate.py` | Synthetic workload simulation for offline testing |
-| `deploy/manifests.yaml` | RBAC, Deployment, ConfigMap, and CronJob manifests |
+| `deploy/manifests.yaml` | RBAC and Deployment manifests |
 
 ---
 
@@ -88,25 +95,19 @@ Lane.GPU_LARGE    — nodes labelled/tainted gpu-class=large
 Lane.GPU_XLARGE   — nodes labelled/tainted gpu-class=xlarge
 ```
 
-Only pods bearing the `lane-scheduler` scheduling gate are managed. A gated pod without a `gpu-class` label, or with an unrecognised class, is rejected immediately with a Warning Event and ignored. Lanes are discovered dynamically at controller startup by scanning node labels, so adding a new GPU class requires only a controller restart rather than a code change. Each lane maintains independent utilization accounting and a separate priority queue.
+Only pods bearing the `lane-scheduler` scheduling gate are managed. A gated pod without a `gpu-class` label, or with an unrecognised class, is rejected immediately with a Warning Event and ignored. Lanes are discovered dynamically at controller startup by scanning node labels, so adding a new GPU class requires only a controller restart rather than a code change.
 
 ### Priority Score
 
 Every queued job receives a score:
 
 ```
-P(j, l) = W(c) × Mode(j) × Age(j) / U(c, l)
+P(j, l) = W(g) × Mode(j) × Age(j) / U(g, l)
 ```
 
-**`W(c)` — Class Weight**
+**`W(g)` — Scheduling Group Weight**
 
-The class weight `W` is a positive float supplied per-course in the registrar CSV. The scheduler uses it as-is; how it is derived is left to the operator. A natural starting point for a tiered academic environment is:
-
-```
-W(c) = tier / sqrt(seats)
-```
-
-where `tier` encodes academic level (e.g. 1 = lower-division, 2 = upper-division, 3 = graduate) and `seats` is enrollment. The square-root denominator dampens — but does not eliminate — the advantage of large courses: a 200-seat introductory section at tier 1 yields W ≈ 0.07, while a 15-seat graduate seminar at tier 3 yields W ≈ 0.77. Any positive value works; operators can freely encode alternative priority schemes.
+All scheduling groups default to W = 1.0 (equal weight). The `SchedGroupRegistry` is currently a stub; per-group weight configuration is planned for a future release.
 
 **`Mode(j)` — Batch Penalty**
 
@@ -125,26 +126,13 @@ Age(j) = 1 + α × log(1 + wait / t_half)
 
 Logarithmic aging ensures no job waits indefinitely. Interactive jobs use `t_half = 10 min`; batch jobs use `t_half = 2 hr`, meaning batch jobs age more slowly (they are expected to wait longer) but will eventually rise if interactive demand subsides.
 
-**`U(c, l)` — Class Utilization**
+**`U(g, l)` — Group Utilization**
 
-Rolling-window utilization over the past 5 minutes. Classes already consuming resources in a lane score lower, giving idle classes a natural boost.
+Rolling-window utilization over the past 5 minutes. Groups already consuming resources in a lane score lower, giving idle groups a natural boost.
 
-### Within-Class Fairness
+### Within-Group Fairness
 
-When multiple students in the same course have jobs waiting, the scheduler selects the student with the fewest currently running pods in that lane. Among students tied on running-pod count, the one with the oldest pending job (earliest submit time) is chosen. This prevents a student who already has a running session from blocking classmates who have none.
-
-### Course Registry
-
-Course metadata is loaded from a CSV file exported daily from the university registrar:
-
-```
-course_id,weight
-CSE234_SP26_A00,0.775
-CSE10_SP26_A00,0.069
-CSE150_SP26_A00,0.270
-```
-
-`weight` is a positive float used directly as `W` in the priority formula. The operator computes it by whatever means reflect local policy — `tier / sqrt(seats)` is a common starting point for tiered academic environments. If a pod references a course not in the registry, the scheduler defaults to `weight=1.0`, logging a warning.
+When multiple users in the same scheduling group have jobs waiting, the scheduler selects the user with the fewest currently running pods in that lane. Among users tied on running-pod count, the one with the oldest pending job (earliest submit time) is chosen. This prevents a user who already has a running session from blocking others who have none.
 
 ---
 
@@ -163,18 +151,12 @@ The lane scheduler watches for pods with this gate. When a pod wins a scheduling
 - Adds a `gpu-class=<class>:NoSchedule` toleration to satisfy the node taint.
 - Removes the `lane-scheduler` scheduling gate, releasing the pod to the default Kubernetes scheduler.
 
-This design keeps the lane scheduler simple — it decides *when* and *to which lane* to admit a pod; the default scheduler handles *where* exactly to place it within that lane.
-
-### GPU Class Routing
-
-GPU nodes are identified by their `gpu-class` node label and carry a matching `gpu-class=<class>:NoSchedule` taint. Pods without a `gpu-class` label, or with a class not present on any known node, are rejected with a Warning Event and never admitted.
-
 ### Pod Identity
 
 | Field | Source |
 |---|---|
-| Student (scheduling entity) | Pod namespace (one namespace per student) |
-| Course | `dsmlp/course` label |
+| User (fairness entity) | `dsmlp/user` label (falls back to namespace if absent) |
+| Scheduling group | `dsmlp/course` label |
 | Lane | `gpu-class` label (absent or unknown → Warning Event, pod ignored) |
 | Batch mode | `dsmlp/batch=true` label |
 | Resource units | `resources.requests` (GPU count, floor 1.0) |
@@ -203,9 +185,9 @@ Summing this probability across all running pods in a lane gives the expected nu
 
 The result is a `WaitEstimate` with median, P20 (optimistic), and P80 (pessimistic) in seconds.
 
-### Per-Course Adaptation
+### Per-Group Adaptation
 
-The cluster-wide residency parameters (`mean_pct`, `std_pct`) serve as a Bayesian prior. As pods complete, the controller records each pod's actual residency fraction and updates per-course, per-lane, per-mode statistics using Welford's online algorithm.
+The cluster-wide residency parameters (`mean_pct`, `std_pct`) serve as a Bayesian prior. As pods complete, the controller records each pod's actual residency fraction and updates per-group, per-lane, per-mode statistics using Welford's online algorithm.
 
 The posterior blends prior and observations via a pseudo-count `prior_weight` (default 10):
 
@@ -213,13 +195,11 @@ The posterior blends prior and observations via a pseudo-count `prior_weight` (d
 posterior_mean = (prior_weight × prior_mean + n × sample_mean) / (prior_weight + n)
 ```
 
-With few observations a course's estimate stays close to the cluster prior. With many (after ~30 completions), it reflects the course's own typical usage patterns — useful for assignments where all students tend to run similar workloads.
-
-Pods killed at their `activeDeadlineSeconds` deadline are recorded as 100% residency.
+With few observations a group's estimate stays close to the cluster prior. With many (after ~30 completions), it reflects the group's own typical usage patterns.
 
 ### Background Cache
 
-Computing wait estimates for all queued pods is CPU-intensive (~7 seconds for 200 queued pods against 600 running). Estimates are recomputed on a background thread every 60 seconds and cached atomically. Callers receive the most recent snapshot with no blocking. Failed snapshots leave the previous cache intact.
+Computing wait estimates for all queued pods is CPU-intensive. Estimates are recomputed on a background thread every 60 seconds and cached atomically. Callers receive the most recent snapshot with no blocking. Failed snapshots leave the previous cache intact.
 
 ---
 
@@ -233,7 +213,7 @@ kubectl describe pod <pod-name> -n <student-namespace>
 
 Example event message:
 ```
-Queue position: #3 overall in gpu-medium lane, #1 within course.
+Queue position: #3 overall in gpu-medium lane, #1 within scheduling group.
 Estimated wait: 8.2m (optimistic 4.1m, pessimistic 14.7m).
 ```
 
@@ -249,8 +229,6 @@ Estimated wait: 8.2m (optimistic 4.1m, pessimistic 14.7m).
 - At 25%, 50%, and 75% of the initial median wait estimate
 - No further events after the 75% milestone
 
-Batch milestone times are anchored to the first estimated median wait and do not shift as the queue evolves, ensuring predictable notification timing. Each event is created as a distinct Kubernetes object (not an update to an existing one) so that the event stream shows a genuine history of position changes.
-
 ---
 
 ## Configuration
@@ -259,7 +237,6 @@ All tuning parameters are configurable via environment variables or CLI flags.
 
 | Environment Variable | Default | Description |
 |---|---|---|
-| `LANE_COURSE_CSV` | `/etc/lane-scheduler/courses.csv` | Path to registrar CSV |
 | `LANE_CYCLE_INTERVAL` | `10` | Scheduling cycle interval (seconds) |
 | `LANE_DISPATCH_K` | `8` | Max jobs dispatched per lane per cycle |
 | `LANE_ALPHA` | `1.0` | Wait-time aging scaling factor |
@@ -267,13 +244,17 @@ All tuning parameters are configurable via environment variables or CLI flags.
 | `LANE_T_HALF_BATCH` | `7200` | Batch job aging half-life (seconds) |
 | `LANE_EPSILON` | `0.01` | Utilization floor (prevents division by zero) |
 | `LANE_UTIL_WINDOW` | `300` | Rolling utilization window (seconds) |
-| `LANE_RELOAD_INTERVAL` | `86400` | Course CSV reload interval (seconds) |
 | `LANE_INTERACTIVE_MEAN_PCT` | `0.4` | Prior: interactive mean residency fraction |
 | `LANE_INTERACTIVE_STD_PCT` | `0.2` | Prior: interactive residency std fraction |
 | `LANE_BATCH_MEAN_PCT` | `0.7` | Prior: batch mean residency fraction |
 | `LANE_BATCH_STD_PCT` | `0.15` | Prior: batch residency std fraction |
 | `LANE_PRIOR_WEIGHT` | `10.0` | Bayesian prior pseudo-count |
 | `LANE_WAIT_CACHE_INTERVAL` | `60` | Wait estimate refresh interval (seconds) |
+| `LANE_USER_LABEL` | `dsmlp/user` | Pod label key for user identity (falls back to namespace) |
+| `LANE_COURSE_LABEL` | `dsmlp/course` | Pod label key for scheduling group |
+| `LANE_BATCH_LABEL` | `dsmlp/batch` | Pod label key for batch mode |
+| `LANE_GPU_CLASS_LABEL` | `gpu-class` | Label key on pods and nodes for GPU class |
+| `LANE_SCHEDULING_GATE_NAME` | `lane-scheduler` | Scheduling gate name injected by webhook |
 
 ---
 
@@ -282,13 +263,11 @@ All tuning parameters are configurable via environment variables or CLI flags.
 ### Prerequisites
 
 - Kubernetes cluster with GPU nodes labelled and tainted by `gpu-class`
-- One namespace per student
-- Mutating admission controller that injects `schedulingGates: [{name: "lane-scheduler"}]` and the `gpu-class` label onto GPU pods
+- Mutating admission controller that injects `schedulingGates: [{name: "lane-scheduler"}]`, the `gpu-class` label, and the `dsmlp/user` label onto GPU pods
 
 ### Node Setup
 
 ```bash
-# Label and taint each GPU node with its hardware class
 kubectl label nodes <gpu-node> gpu-class=medium
 kubectl taint nodes <gpu-node> gpu-class=medium:NoSchedule
 ```
@@ -300,42 +279,16 @@ kubectl create namespace lane-scheduler
 kubectl apply -f deploy/manifests.yaml
 ```
 
-The `manifests.yaml` includes RBAC (ServiceAccount, ClusterRole, ClusterRoleBinding), a ConfigMap for the course CSV, the controller Deployment, and a daily CronJob that refreshes the course ConfigMap from the registrar.
-
-### Required RBAC Permissions
-
-```yaml
-- pods:   get, list, watch, patch
-- nodes:  get, list, watch
-- events: create
-```
-
 ### Pod Labels
 
-The mutating admission controller injects the scheduling gate and `gpu-class` label automatically. Student workload manifests should supply:
+The mutating admission controller injects the scheduling gate, `gpu-class`, and `dsmlp/user` labels automatically. Student workload manifests should supply:
 
 ```yaml
 metadata:
   labels:
-    dsmlp/course: CSE234_SP26_A00      # required for fair scheduling weight
+    dsmlp/course: CSE234_SP26_A00      # scheduling group
     dsmlp/batch: "true"                 # optional; absent = interactive
 ```
-
-The `gpu-class` label is injected by the mutating webhook and must not be set manually by students.
-
----
-
-## Design Decisions
-
-**Why not a custom Kubernetes scheduler?** Custom schedulers must handle all scheduling decisions including node affinity, resource fitting, and pod topology. Using scheduling gates lets us focus purely on fairness policy while delegating placement to the well-tested default scheduler.
-
-**Why dynamic Lane enum?** GPU hardware classes are managed by a separate infrastructure team and change independently of the scheduler codebase. Building lanes from node labels at startup means a new GPU class requires only a controller restart rather than a code change and redeployment.
-
-**Why Bayesian shrinkage rather than pure course data?** Course sections may have few completions early in a semester, or may never accumulate enough data if they are small. The prior ensures estimates are always reasonable, while the shrinkage ensures the system learns when data is available. The `prior_weight` parameter controls the trade-off explicitly.
-
-**Why log aging rather than linear?** Linear aging can cause runaway priority elevation for very long-waiting jobs, potentially causing large single-job bursts when they finally dispatch. Logarithmic aging rises steeply at first (preventing short-term starvation) but flattens out, producing smoother dispatch behavior at high queue depths.
-
-**Why fresh Event creates rather than updates?** Kubernetes deduplicates events with identical reason/message by incrementing a `count` field rather than creating a new timeline entry. Creating distinct events (with unique names per emission) ensures that `kubectl describe pod` shows a genuine chronological history of queue position changes, which is more useful to students than a single entry with an incrementing counter.
 
 ---
 
@@ -346,7 +299,7 @@ pip install -e .
 python -m pytest tests/
 ```
 
-200+ tests, all passing. No external dependencies beyond the `kubernetes` Python client (used only in `lane_scheduler/k8s/controller.py`). All scheduling logic, wait estimation, residency statistics, and event scheduling are tested with stdlib only.
+250+ tests, all passing. No external dependencies beyond the `kubernetes` Python client (used only in `lane_scheduler/k8s/controller.py`). All scheduling logic, wait estimation, residency statistics, and event scheduling are tested with stdlib only.
 
 The `tools/simulate.py` harness runs a synthetic workload against the scheduler for offline validation of fairness properties without a live cluster:
 

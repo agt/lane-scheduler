@@ -1,7 +1,7 @@
 """
 Tests for lane_scheduler.web.snapshot.build_snapshot().
 
-Uses a real Scheduler + CourseRegistry + ResidencyStats/WaitTimeCache but
+Uses a real Scheduler + SchedGroupRegistry + ResidencyStats/WaitTimeCache but
 mocks the Kubernetes client so no cluster is needed.
 """
 
@@ -10,10 +10,10 @@ import unittest
 from unittest.mock import MagicMock
 
 from lane_scheduler.core.scheduler import (
-    CourseClass, Job, SchedulerConfig, Scheduler,
+    SchedGroup, Job, SchedulerConfig, Scheduler,
     initialise_lanes, lane_for_gpu_class,
 )
-from lane_scheduler.core.course_registry import CourseRegistry
+from lane_scheduler.core.sched_group_registry import SchedGroupRegistry
 from lane_scheduler.core.node_capacity import NodeCapacityTracker
 from lane_scheduler.estimation.wait_estimator import ResidencyProfile, WaitTimeCache
 from lane_scheduler.estimation.residency_stats import ResidencyStats
@@ -32,7 +32,7 @@ def _make_controller(cycle_interval=10.0):
     from lane_scheduler.k8s.controller import LaneSchedulerController
 
     core_v1 = MagicMock()
-    registry = CourseRegistry()
+    registry = SchedGroupRegistry()
     sched_config = SchedulerConfig()
     residency_profiles = {
         "interactive": ResidencyProfile(mean_pct=0.4, std_pct=0.2),
@@ -49,29 +49,28 @@ def _make_controller(cycle_interval=10.0):
     return ctrl
 
 
-def _register(ctrl, class_id, weight=1.0):
-    course = CourseClass(class_id=class_id, class_weight=weight)
-    ctrl.registry._exact[class_id] = course
-    ctrl.scheduler.register_class(course)
-    return course
+def _register(ctrl, sched_group_id):
+    """Register a scheduling group with the scheduler (registry always returns weight=1.0)."""
+    group = SchedGroup(sched_group_id=sched_group_id, weight=1.0)
+    ctrl.scheduler.register_group(group)
+    return group
 
 
-def _submit(ctrl, class_id, lane, job_id="J1", student_id="s1", batch=False):
+def _submit(ctrl, sched_group_id, lane, job_id="J1", username="s1", batch=False):
     job = Job(
         job_id=job_id,
-        class_id=class_id,
-        student_id=student_id,
+        sched_group_id=sched_group_id,
+        username=username,
         lane=lane,
         batch=batch,
         resource_units=1.0,
     )
-    job.submit_time = time.monotonic() - 30.0  # 30s old
+    job.submit_time = time.monotonic() - 30.0
     ctrl.scheduler.submit(job)
     return job
 
 
 class TestBuildSnapshotStructure(unittest.TestCase):
-    """Verify the top-level shape and required keys are always present."""
 
     def setUp(self):
         self.ctrl = _make_controller()
@@ -79,7 +78,7 @@ class TestBuildSnapshotStructure(unittest.TestCase):
     def test_required_top_level_keys(self):
         from lane_scheduler.web.snapshot import build_snapshot
         snap = build_snapshot(self.ctrl)
-        for key in ("generated_at", "system", "lanes", "courses", "running_pods"):
+        for key in ("generated_at", "system", "lanes", "sched_groups", "running_pods"):
             self.assertIn(key, snap)
 
     def test_running_pods_is_list(self):
@@ -91,7 +90,7 @@ class TestBuildSnapshotStructure(unittest.TestCase):
         from lane_scheduler.web.snapshot import build_snapshot
         sys = build_snapshot(self.ctrl)["system"]
         for key in ("cycle_interval_s", "wait_cache_age_s",
-                    "wait_cache_duration_s", "course_count"):
+                    "wait_cache_duration_s", "sched_group_count"):
             self.assertIn(key, sys)
 
     def test_cycle_interval_propagated(self):
@@ -117,15 +116,14 @@ class TestBuildSnapshotStructure(unittest.TestCase):
 
 
 class TestBuildSnapshotEmpty(unittest.TestCase):
-    """Empty cluster — no queued or running jobs."""
 
     def setUp(self):
         self.ctrl = _make_controller()
 
-    def test_no_courses_in_output(self):
+    def test_no_sched_groups_in_output(self):
         from lane_scheduler.web.snapshot import build_snapshot
         snap = build_snapshot(self.ctrl)
-        self.assertEqual(snap["courses"], [])
+        self.assertEqual(snap["sched_groups"], [])
 
     def test_queued_count_zero(self):
         from lane_scheduler.web.snapshot import build_snapshot
@@ -136,86 +134,83 @@ class TestBuildSnapshotEmpty(unittest.TestCase):
 
 
 class TestBuildSnapshotWithJobs(unittest.TestCase):
-    """Queue with a couple of courses and jobs."""
 
     def setUp(self):
         self.ctrl = _make_controller()
-        _register(self.ctrl, "CSE101", weight=0.07)
-        _register(self.ctrl, "CSE250", weight=0.47)
+        _register(self.ctrl, "CSE101")
+        _register(self.ctrl, "CSE250")
 
-    def test_queued_course_appears(self):
+    def test_queued_group_appears(self):
         from lane_scheduler.web.snapshot import build_snapshot
-        _submit(self.ctrl, "CSE101", _small(), job_id="J1", student_id="s1")
+        _submit(self.ctrl, "CSE101", _small(), job_id="J1", username="s1")
         snap = build_snapshot(self.ctrl)
-        course_ids = {c["course_id"] for c in snap["courses"]}
-        self.assertIn("CSE101", course_ids)
+        group_ids = {g["sched_group_id"] for g in snap["sched_groups"]}
+        self.assertIn("CSE101", group_ids)
 
     def test_queued_count_matches(self):
         from lane_scheduler.web.snapshot import build_snapshot
-        _submit(self.ctrl, "CSE101", _small(), job_id="J1", student_id="s1")
-        _submit(self.ctrl, "CSE101", _small(), job_id="J2", student_id="s2")
+        _submit(self.ctrl, "CSE101", _small(), job_id="J1", username="s1")
+        _submit(self.ctrl, "CSE101", _small(), job_id="J2", username="s2")
         snap = build_snapshot(self.ctrl)
-        cse101 = next(c for c in snap["courses"] if c["course_id"] == "CSE101")
+        cse101 = next(g for g in snap["sched_groups"] if g["sched_group_id"] == "CSE101")
         small_lane = next(l for l in cse101["lanes"] if l["lane_name"] == "gpu-small")
         self.assertEqual(small_lane["queued_count"], 2)
 
     def test_lane_queued_count_matches(self):
         from lane_scheduler.web.snapshot import build_snapshot
-        _submit(self.ctrl, "CSE101", _small(), job_id="J1", student_id="s1")
-        _submit(self.ctrl, "CSE250", _small(), job_id="J2", student_id="s2")
+        _submit(self.ctrl, "CSE101", _small(), job_id="J1", username="s1")
+        _submit(self.ctrl, "CSE250", _small(), job_id="J2", username="s2")
         snap = build_snapshot(self.ctrl)
         small_row = next(r for r in snap["lanes"] if r["name"] == "gpu-small")
         self.assertEqual(small_row["queued_count"], 2)
 
-    def test_course_metadata(self):
+    def test_group_weight_is_one(self):
+        """SchedGroupRegistry always returns weight=1.0."""
         from lane_scheduler.web.snapshot import build_snapshot
-        _submit(self.ctrl, "CSE250", _small(), job_id="J1", student_id="s1")
+        _submit(self.ctrl, "CSE250", _small(), job_id="J1", username="s1")
         snap = build_snapshot(self.ctrl)
-        cse250 = next(c for c in snap["courses"] if c["course_id"] == "CSE250")
-        self.assertAlmostEqual(cse250["weight"], 0.47, places=2)
+        cse250 = next(g for g in snap["sched_groups"] if g["sched_group_id"] == "CSE250")
+        self.assertAlmostEqual(cse250["weight"], 1.0, places=2)
 
     def test_tail_wait_absent_for_single_job(self):
         from lane_scheduler.web.snapshot import build_snapshot
-        _submit(self.ctrl, "CSE101", _small(), job_id="J1", student_id="s1")
+        _submit(self.ctrl, "CSE101", _small(), job_id="J1", username="s1")
         snap = build_snapshot(self.ctrl)
-        cse101 = next(c for c in snap["courses"] if c["course_id"] == "CSE101")
+        cse101 = next(g for g in snap["sched_groups"] if g["sched_group_id"] == "CSE101")
         small_lane = next(l for l in cse101["lanes"] if l["lane_name"] == "gpu-small")
         self.assertEqual(small_lane["queued_count"], 1)
         self.assertIsNone(small_lane["tail_wait"])
 
     def test_tail_wait_present_for_multiple_jobs(self):
         from lane_scheduler.web.snapshot import build_snapshot
-        _submit(self.ctrl, "CSE101", _small(), job_id="J1", student_id="s1")
-        _submit(self.ctrl, "CSE101", _small(), job_id="J2", student_id="s2")
+        _submit(self.ctrl, "CSE101", _small(), job_id="J1", username="s1")
+        _submit(self.ctrl, "CSE101", _small(), job_id="J2", username="s2")
         snap = build_snapshot(self.ctrl)
-        cse101 = next(c for c in snap["courses"] if c["course_id"] == "CSE101")
+        cse101 = next(g for g in snap["sched_groups"] if g["sched_group_id"] == "CSE101")
         small_lane = next(l for l in cse101["lanes"] if l["lane_name"] == "gpu-small")
         self.assertEqual(small_lane["queued_count"], 2)
-        # tail_wait may be None if no running pods to base estimate on,
-        # but the dict key must be present
         self.assertIn("tail_wait", small_lane)
 
     def test_sorted_by_queued_descending(self):
         from lane_scheduler.web.snapshot import build_snapshot
-        _submit(self.ctrl, "CSE250", _small(), job_id="J1", student_id="s1")
-        _submit(self.ctrl, "CSE101", _small(), job_id="J2", student_id="s2")
-        _submit(self.ctrl, "CSE101", _small(), job_id="J3", student_id="s3")
+        _submit(self.ctrl, "CSE250", _small(), job_id="J1", username="s1")
+        _submit(self.ctrl, "CSE101", _small(), job_id="J2", username="s2")
+        _submit(self.ctrl, "CSE101", _small(), job_id="J3", username="s3")
         snap = build_snapshot(self.ctrl)
         queued = [
-            sum(l["queued_count"] for l in c["lanes"])
-            for c in snap["courses"]
+            sum(l["queued_count"] for l in g["lanes"])
+            for g in snap["sched_groups"]
         ]
         self.assertEqual(queued, sorted(queued, reverse=True))
 
 
 class TestRunningPodsDebugView(unittest.TestCase):
-    """Verify the running_pods debug list contains the right shape."""
 
     def setUp(self):
         self.ctrl = _make_controller()
 
-    def _inject_running(self, uid, namespace, lane, resource_units=1.0,
-                        course_id=None, batch=False, running_s=60):
+    def _inject_running(self, uid, username, lane, resource_units=1.0,
+                        sched_group_id=None, batch=False, running_s=60):
         from lane_scheduler.estimation.wait_estimator import RunningPod
         rp = RunningPod(
             pod_uid=uid,
@@ -225,41 +220,42 @@ class TestRunningPodsDebugView(unittest.TestCase):
             resource_units=resource_units,
         )
         with self.ctrl._running_lock:
-            self.ctrl._running.setdefault(lane, {})[uid] = rp
-            self.ctrl._running_student[uid] = namespace
+            self.ctrl._kubernetes_running.setdefault(lane, {})[uid] = rp
+            self.ctrl._kubernetes_running_user[uid] = username
         with self.ctrl._running_ctx_lock:
             self.ctrl._running_ctx[uid] = (
-                course_id or "__unlabelled__", lane, batch, 3600.0, time.monotonic()
+                sched_group_id or "__unlabelled__", lane, batch, 3600.0,
+                time.monotonic()
             )
 
     def test_running_pod_appears_in_list(self):
         from lane_scheduler.web.snapshot import build_snapshot
         self._inject_running("uid-1", "jsmith", _small(), resource_units=2.0,
-                             course_id="CSE101")
+                             sched_group_id="CSE101")
         pods = build_snapshot(self.ctrl)["running_pods"]
         self.assertEqual(len(pods), 1)
         p = pods[0]
         self.assertEqual(p["uid"], "uid-1")
-        self.assertEqual(p["namespace"], "jsmith")
+        self.assertEqual(p["username"], "jsmith")
         self.assertEqual(p["lane"], _small())
         self.assertAlmostEqual(p["resource_units"], 2.0)
-        self.assertEqual(p["course_id"], "CSE101")
+        self.assertEqual(p["sched_group_id"], "CSE101")
         self.assertFalse(p["batch"])
 
-    def test_unlabelled_course_pod_has_null_course_id(self):
+    def test_unlabelled_pod_has_null_sched_group_id(self):
         from lane_scheduler.web.snapshot import build_snapshot
-        self._inject_running("uid-2", "s7ko", _small(), course_id=None)
+        self._inject_running("uid-2", "s7ko", _small(), sched_group_id=None)
         pods = build_snapshot(self.ctrl)["running_pods"]
         self.assertEqual(len(pods), 1)
-        self.assertIsNone(pods[0]["course_id"])
+        self.assertIsNone(pods[0]["sched_group_id"])
 
     def test_pod_row_has_required_keys(self):
         from lane_scheduler.web.snapshot import build_snapshot
         self._inject_running("uid-3", "ns1", _small())
         pods = build_snapshot(self.ctrl)["running_pods"]
         self.assertEqual(len(pods), 1)
-        for key in ("uid", "namespace", "lane", "resource_units",
-                    "course_id", "batch", "running_s", "deadline_s"):
+        for key in ("uid", "username", "lane", "resource_units",
+                    "sched_group_id", "batch", "running_s", "deadline_s"):
             self.assertIn(key, pods[0], f"missing key {key!r}")
 
     def test_sorted_by_lane_then_longest_running(self):
@@ -277,37 +273,36 @@ class TestRunningPodsDebugView(unittest.TestCase):
 
 
 class TestNoPrivateIdentifiers(unittest.TestCase):
-    """Ensure no student/pod identifiers leak into the snapshot."""
 
     def setUp(self):
         self.ctrl = _make_controller()
         _register(self.ctrl, "CSE101")
 
-    def test_no_student_ids(self):
+    def test_no_usernames_in_queued_output(self):
         from lane_scheduler.web.snapshot import build_snapshot
-        _submit(self.ctrl, "CSE101", _small(), job_id="pod-uid-abc", student_id="alice")
+        _submit(self.ctrl, "CSE101", _small(), job_id="pod-uid-abc", username="alice")
         snap = build_snapshot(self.ctrl)
-        dump = str(snap)
+        # sched_groups output must not include usernames or job IDs
+        dump = str(snap["sched_groups"])
         self.assertNotIn("alice", dump)
         self.assertNotIn("pod-uid-abc", dump)
 
-    def test_unlabelled_course_excluded(self):
+    def test_unlabelled_group_excluded(self):
         from lane_scheduler.web.snapshot import build_snapshot
-        from lane_scheduler.k8s.pod_translator import NO_COURSE_LABEL
+        from lane_scheduler.k8s.pod_translator import NO_SCHED_GROUP_LABEL
         ctrl = _make_controller()
-        course = CourseClass(class_id=NO_COURSE_LABEL, class_weight=1.0)
-        ctrl.scheduler._classes[NO_COURSE_LABEL] = course
-        job = Job(job_id="J-unlabelled", class_id=NO_COURSE_LABEL,
-                  student_id="s1", lane=_small())
+        group = SchedGroup(sched_group_id=NO_SCHED_GROUP_LABEL, weight=1.0)
+        ctrl.scheduler._groups[NO_SCHED_GROUP_LABEL] = group
+        job = Job(job_id="J-unlabelled", sched_group_id=NO_SCHED_GROUP_LABEL,
+                  username="s1", lane=_small())
         job.submit_time = time.monotonic()
-        ctrl.scheduler._queues[_small()][NO_COURSE_LABEL]["s1"].append(job)
+        ctrl.scheduler._queues[_small()][NO_SCHED_GROUP_LABEL]["s1"].append(job)
         snap = build_snapshot(ctrl)
-        course_ids = {c["course_id"] for c in snap["courses"]}
-        self.assertNotIn(NO_COURSE_LABEL, course_ids)
+        group_ids = {g["sched_group_id"] for g in snap["sched_groups"]}
+        self.assertNotIn(NO_SCHED_GROUP_LABEL, group_ids)
 
 
 class TestWaitCacheAllEstimates(unittest.TestCase):
-    """WaitTimeCache.all_estimates() returns a copy of the current cache."""
 
     def test_empty_cache(self):
         cache = WaitTimeCache(snapshot_fn=lambda: {})
@@ -318,9 +313,7 @@ class TestWaitCacheAllEstimates(unittest.TestCase):
         est = WaitEstimate(median_seconds=60.0, p20_seconds=30.0,
                            p80_seconds=120.0, queue_rank=1, lane_name="gpu-small")
         cache = WaitTimeCache(snapshot_fn=lambda: {"uid-1": est})
-        # Manually inject into cache to avoid background thread timing
         from lane_scheduler.estimation.wait_estimator import CacheEntry
-        import threading
         cache._cache = {"uid-1": CacheEntry(estimate=est, computed_at=time.monotonic())}
         result = cache.all_estimates()
         self.assertIn("uid-1", result)
@@ -340,13 +333,12 @@ class TestWaitCacheAllEstimates(unittest.TestCase):
 
 
 class TestControllerDryRun(unittest.TestCase):
-    """_admit_pod in dry_run=True must not call patch_namespaced_pod."""
 
     def _make_dry_controller(self):
         from lane_scheduler.k8s.controller import LaneSchedulerController
         from lane_scheduler.estimation.wait_estimator import ResidencyProfile
         core_v1 = MagicMock()
-        registry = CourseRegistry()
+        registry = SchedGroupRegistry()
         sched_config = SchedulerConfig()
         residency_profiles = {
             "interactive": ResidencyProfile(mean_pct=0.4, std_pct=0.2),
@@ -363,7 +355,7 @@ class TestControllerDryRun(unittest.TestCase):
 
     def _make_pod_and_job(self, ctrl):
         _register(ctrl, "CSE101")
-        job = _submit(ctrl, "CSE101", _small(), job_id="uid-dry", student_id="s1")
+        job = _submit(ctrl, "CSE101", _small(), job_id="uid-dry", username="s1")
         pod = {
             "metadata": {
                 "name": "dry-pod", "namespace": "ns",
@@ -382,7 +374,6 @@ class TestControllerDryRun(unittest.TestCase):
         core_v1.patch_namespaced_pod.assert_not_called()
 
     def test_pod_still_marked_admitted_in_dry_run(self):
-        """Internal state must advance so the pod isn't re-tried next cycle."""
         ctrl, _ = self._make_dry_controller()
         pod, job = self._make_pod_and_job(ctrl)
         ctrl._admit_pod(pod, job)
@@ -393,7 +384,7 @@ class TestControllerDryRun(unittest.TestCase):
         from lane_scheduler.k8s.controller import LaneSchedulerController
         from lane_scheduler.estimation.wait_estimator import ResidencyProfile
         core_v1 = MagicMock()
-        registry = CourseRegistry()
+        registry = SchedGroupRegistry()
         ctrl = LaneSchedulerController(
             core_v1=core_v1,
             registry=registry,
@@ -406,7 +397,7 @@ class TestControllerDryRun(unittest.TestCase):
             web_port=0,
         )
         _register(ctrl, "CSE101")
-        job = _submit(ctrl, "CSE101", _small(), job_id="uid-live", student_id="s1")
+        job = _submit(ctrl, "CSE101", _small(), job_id="uid-live", username="s1")
         pod = {
             "metadata": {
                 "name": "live-pod", "namespace": "ns",
@@ -421,8 +412,6 @@ class TestControllerDryRun(unittest.TestCase):
 
 
 class TestAdmitBackoff(unittest.TestCase):
-    """_admit_pod must back off on transient API errors and give up after
-    _MAX_ADMIT_ATTEMPTS."""
 
     def _make_ctrl_with_failing_patch(self):
         from lane_scheduler.k8s.controller import LaneSchedulerController
@@ -433,7 +422,7 @@ class TestAdmitBackoff(unittest.TestCase):
         core_v1.patch_namespaced_pod.side_effect = (
             k8s_client.exceptions.ApiException(status=500, reason="Internal")
         )
-        registry = CourseRegistry()
+        registry = SchedGroupRegistry()
         ctrl = LaneSchedulerController(
             core_v1=core_v1,
             registry=registry,
@@ -449,7 +438,7 @@ class TestAdmitBackoff(unittest.TestCase):
 
     def _make_pod_job(self, ctrl, uid="uid-retry"):
         _register(ctrl, "CSE101")
-        job = _submit(ctrl, "CSE101", _small(), job_id=uid, student_id="s1")
+        job = _submit(ctrl, "CSE101", _small(), job_id=uid, username="s1")
         pod = {
             "metadata": {
                 "name": "retry-pod", "namespace": "ns",
@@ -465,12 +454,10 @@ class TestAdmitBackoff(unittest.TestCase):
         ctrl, _ = self._make_ctrl_with_failing_patch()
         pod, job = self._make_pod_job(ctrl)
         ctrl._admit_pod(pod, job)
-        # Backoff state recorded; pod re-queued; not in _admitted
         with ctrl._admit_attempts_lock:
             self.assertIn("uid-retry", ctrl._admit_attempts)
             attempts, next_retry = ctrl._admit_attempts["uid-retry"]
         self.assertEqual(attempts, 1)
-        import time
         self.assertGreater(next_retry, time.monotonic())
         with ctrl._pending_lock:
             self.assertIn("uid-retry", ctrl._pending)
@@ -481,21 +468,17 @@ class TestAdmitBackoff(unittest.TestCase):
         pod, job = self._make_pod_job(ctrl)
         for _ in range(_MAX_ADMIT_ATTEMPTS):
             ctrl._admit_pod(pod, job)
-        # After the last attempt, state is cleared and pod is dropped.
         with ctrl._admit_attempts_lock:
             self.assertNotIn("uid-retry", ctrl._admit_attempts)
         with ctrl._pending_lock:
             self.assertNotIn("uid-retry", ctrl._pending)
-        # Scheduler queue should also be empty for this job
         self.assertIsNone(ctrl.scheduler.remove_job("uid-retry"))
 
     def test_404_clears_attempts(self):
         from kubernetes import client as k8s_client
         ctrl, core_v1 = self._make_ctrl_with_failing_patch()
         pod, job = self._make_pod_job(ctrl)
-        # First call fails 500 → attempt recorded
         ctrl._admit_pod(pod, job)
-        # Switch to 404; next attempt clears the entry without dropping
         core_v1.patch_namespaced_pod.side_effect = (
             k8s_client.exceptions.ApiException(status=404, reason="Not Found")
         )

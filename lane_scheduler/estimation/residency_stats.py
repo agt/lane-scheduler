@@ -1,9 +1,9 @@
 """
 Residency Statistics
 --------------------
-Maintains per-(course, lane, batch-mode) residency distributions, updated
+Maintains per-(sched_group, lane, batch-mode) residency distributions, updated
 online as pods complete.  Each stratum starts from a cluster-wide prior and
-converges toward course-specific observations via Bayesian shrinkage.
+converges toward scheduling-group-specific observations via Bayesian shrinkage.
 
 Math
 ~~~~
@@ -16,11 +16,6 @@ ones.  Given smoothing factor α ∈ (0, 1):
 
     var_new  = (1 − α) × (var_old + α × (x − mean_old)²)
 
-Higher α means faster adaptation to recent data (α = 1 reduces to always
-using the latest observation; α → 0 gives equal weight to all history).
-The actual observation count n is still tracked so Bayesian shrinkage can
-be applied correctly.
-
 The posterior mean and variance blend the prior with observed EWMA data:
 
     n_eff  = prior_weight + n_obs
@@ -30,20 +25,16 @@ The posterior mean and variance blend the prior with observed EWMA data:
              / n_eff
 
 prior_weight acts as a pseudo-count: with prior_weight=10, the prior counts
-as 10 observations.  The course estimate stays close to the cluster prior
-until ~10 real observations have accumulated, then shifts toward course data.
+as 10 observations.  The group estimate stays close to the cluster prior
+until ~10 real observations have accumulated, then shifts toward group data.
 
 Residency observations
 ~~~~~~~~~~~~~~~~~~~~~~
     residency_pct = (finish_time - start_time) / active_deadline_seconds
 
-Pods killed at their deadline are treated as 100% residency (residency_pct=1.0).
-Only pods with active_deadline_seconds > 0 contribute observations.
-
 Thread safety
 ~~~~~~~~~~~~~
-All public methods are protected by a single RLock.  Updates and reads are
-both short-lived and non-blocking.
+All public methods are protected by a single RLock.
 """
 
 from __future__ import annotations
@@ -58,15 +49,8 @@ from lane_scheduler.estimation.wait_estimator import ResidencyProfile
 
 logger = logging.getLogger(__name__)
 
-# Default prior pseudo-count: trust the prior as strongly as this many real
-# observations.  Raise to make courses converge more slowly; lower to make
-# them adapt faster.
 DEFAULT_PRIOR_WEIGHT = 10.0
-
-# Default EWMA smoothing factor.  Each new observation contributes α of the
-# update; lower values retain history longer.  Raise to react faster to
-# shifts in course behaviour.
-DEFAULT_EWMA_ALPHA = 0.1
+DEFAULT_EWMA_ALPHA   = 0.1
 
 
 # ---------------------------------------------------------------------------
@@ -75,16 +59,10 @@ DEFAULT_EWMA_ALPHA = 0.1
 
 @dataclass
 class _EWMA:
-    """
-    Exponentially weighted mean and variance estimator.
-
-    alpha: smoothing factor in (0, 1).  Higher = faster adaptation to recent
-           observations (α=0.1 means ~10 % weight on the newest point).
-    """
     alpha: float
     n:     int   = 0
     mean:  float = 0.0
-    var:   float = 0.0  # exponentially weighted variance
+    var:   float = 0.0
 
     def update(self, x: float) -> None:
         self.n += 1
@@ -97,7 +75,6 @@ class _EWMA:
 
     @property
     def variance(self) -> float:
-        """Exponentially weighted variance; 0 until at least two observations."""
         return self.var if self.n >= 2 else 0.0
 
     @property
@@ -111,9 +88,9 @@ class _EWMA:
 
 @dataclass(frozen=True)
 class _StratumKey:
-    course_id: str
-    lane_name: str   # human-readable, e.g. "gpu-medium"
-    batch:     bool
+    sched_group_id: str
+    lane_name:      str
+    batch:          bool
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +99,7 @@ class _StratumKey:
 
 class ResidencyStats:
     """
-    Per-course residency distribution tracker with Bayesian shrinkage
+    Per-scheduling-group residency distribution tracker with Bayesian shrinkage
     toward cluster-wide priors.
 
     Usage
@@ -130,25 +107,22 @@ class ResidencyStats:
         stats = ResidencyStats(
             interactive_prior = ResidencyProfile(mean_pct=0.4, std_pct=0.2),
             batch_prior       = ResidencyProfile(mean_pct=0.7, std_pct=0.15),
-            prior_weight      = 10.0,
-            ewma_alpha        = 0.1,
         )
 
-        # On pod completion (from controller._handle_pod_event):
+        # On pod completion:
         stats.record(
-            course_id    = "CSE234_SP26_A00",
-            lane_name    = "gpu-medium",
-            batch        = False,
-            residency_pct = 0.63,
+            sched_group_id = "CSE234_SP26_A00",
+            lane_name      = "gpu-medium",
+            batch          = False,
+            residency_pct  = 0.63,
         )
 
-        # In _build_wait_snapshot, per queued pod:
+        # Per queued pod in the wait snapshot:
         profile = stats.profile_for(
-            course_id = "CSE234_SP26_A00",
-            lane_name = "gpu-medium",
-            batch     = False,
+            sched_group_id = "CSE234_SP26_A00",
+            lane_name      = "gpu-medium",
+            batch          = False,
         )
-        # → ResidencyProfile blending prior + course observations
     """
 
     def __init__(
@@ -171,10 +145,10 @@ class ResidencyStats:
 
     def record(
         self,
-        course_id:     str,
-        lane_name:     str,
-        batch:         bool,
-        residency_pct: float,
+        sched_group_id: str,
+        lane_name:      str,
+        batch:          bool,
+        residency_pct:  float,
     ) -> None:
         """
         Record one pod completion.
@@ -183,16 +157,16 @@ class ResidencyStats:
         to its full deadline.  Values outside [0, 1] are clamped.
         """
         pct = max(0.0, min(1.0, residency_pct))
-        key = _StratumKey(course_id=course_id, lane_name=lane_name, batch=batch)
+        key = _StratumKey(sched_group_id=sched_group_id, lane_name=lane_name, batch=batch)
         with self._lock:
             if key not in self._strata:
                 self._strata[key] = _EWMA(alpha=self._ewma_alpha)
             self._strata[key].update(pct)
 
         logger.debug(
-            "Residency recorded [course=%s lane=%s batch=%s]: "
+            "Residency recorded [group=%s lane=%s batch=%s]: "
             "pct=%.3f  n=%d  mean=%.3f  std=%.3f",
-            course_id, lane_name, batch, pct,
+            sched_group_id, lane_name, batch, pct,
             self._strata[key].n,
             self._strata[key].mean,
             self._strata[key].std,
@@ -204,19 +178,16 @@ class ResidencyStats:
 
     def profile_for(
         self,
-        course_id: str,
-        lane_name: str,
-        batch:     bool,
+        sched_group_id: str,
+        lane_name:      str,
+        batch:          bool,
     ) -> ResidencyProfile:
         """
         Return a ResidencyProfile blending the cluster prior with any
-        course-specific observations collected so far.
-
-        With no observations the prior is returned unchanged.
-        With many observations the profile converges to the course mean/std.
+        group-specific observations collected so far.
         """
         prior = self._batch_prior if batch else self._interactive_prior
-        key   = _StratumKey(course_id=course_id, lane_name=lane_name, batch=batch)
+        key   = _StratumKey(sched_group_id=sched_group_id, lane_name=lane_name, batch=batch)
 
         with self._lock:
             acc = self._strata.get(key)
@@ -226,70 +197,22 @@ class ResidencyStats:
 
         return self._posterior(prior, acc)
 
-    def observation_count(self, course_id: str, lane_name: str, batch: bool) -> int:
+    def observation_count(self, sched_group_id: str, lane_name: str, batch: bool) -> int:
         """Return the number of observations recorded for this stratum."""
-        key = _StratumKey(course_id=course_id, lane_name=lane_name, batch=batch)
+        key = _StratumKey(sched_group_id=sched_group_id, lane_name=lane_name, batch=batch)
         with self._lock:
             acc = self._strata.get(key)
         return acc.n if acc else 0
 
-    # ------------------------------------------------------------------
-    # Persistence helpers
-    # ------------------------------------------------------------------
-
-    def seed(
-        self,
-        course_id: str,
-        lane_name: str,
-        batch:     bool,
-        ewma_mean: float,
-        ewma_var:  float,
-        n:         int,
-    ) -> None:
-        """
-        Restore an EWMA accumulator from persisted state.
-
-        Only takes effect if no live observations have been recorded for this
-        stratum yet, making it safe to call at startup before the pod-watch
-        loop runs.  Silently ignored if the stratum already has data.
-        """
-        if n <= 0:
-            return
-        key = _StratumKey(course_id=course_id, lane_name=lane_name, batch=batch)
-        acc = _EWMA(alpha=self._ewma_alpha, n=n, mean=ewma_mean, var=ewma_var)
-        with self._lock:
-            if key not in self._strata:
-                self._strata[key] = acc
-
-    def dump(self) -> list[tuple]:
-        """
-        Return current EWMA state for all strata that have at least one
-        observation, as a list of (course_id, lane_name, batch, ewma_mean,
-        ewma_var, n) tuples suitable for ResidencyStore.save().
-        """
-        result = []
-        with self._lock:
-            for key, acc in self._strata.items():
-                if acc.n > 0:
-                    result.append(
-                        (key.course_id, key.lane_name, key.batch,
-                         acc.mean, acc.var, acc.n)
-                    )
-        return result
-
     def all_profiles(self) -> dict[tuple, ResidencyProfile]:
-        """
-        Return current posterior profiles for all strata that have at least
-        one observation.  Key is (course_id, lane_name, batch).
-        Useful for monitoring and logging.
-        """
+        """Return current posterior profiles for all strata with at least one observation."""
         result = {}
         with self._lock:
             items = list(self._strata.items())
         for key, acc in items:
             if acc.n > 0:
                 prior = self._batch_prior if key.batch else self._interactive_prior
-                result[(key.course_id, key.lane_name, key.batch)] = \
+                result[(key.sched_group_id, key.lane_name, key.batch)] = \
                     self._posterior(prior, acc)
         return result
 
@@ -302,13 +225,9 @@ class ResidencyStats:
         Compute the Bayesian posterior ResidencyProfile.
 
         posterior_mean = (w × prior_mean + n × sample_mean) / (w + n)
-
         posterior_var  = (w × prior_var + n × sample_var
                           + w × n × (prior_mean - sample_mean)² / (w + n))
                          / (w + n)
-
-        The second term in posterior_var is the between-group variance
-        contribution — it grows when the course mean drifts far from the prior.
         """
         w   = self._prior_weight
         n   = float(acc.n)
@@ -326,7 +245,6 @@ class ResidencyStats:
             + w * n * (prior_mean - samp_mean) ** 2 / n_eff
         ) / n_eff
 
-        # Clamp to valid ResidencyProfile ranges
         post_mean = max(0.01, min(0.99, post_mean))
         post_std  = max(0.01, math.sqrt(post_var))
 

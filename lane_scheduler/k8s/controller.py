@@ -2,16 +2,18 @@
 Lane-based Priority Scheduler Controller
 -----------------------------------------
 Watches all pod and node events cluster-wide.  Pending pods that carry the
-dsmlp/course label are held by the inhibitory node taint until our scheduler
+dsmlp/course label are held by the scheduling gate until our scheduler
 selects them, at which point we patch in the matching toleration and let the
 default Kubernetes scheduler handle actual placement.
 
 Entry point:
-    python controller.py [--config config.yaml]
+    lane-scheduler   (via pyproject.toml entry_point)
+    python -m lane_scheduler.k8s.controller
 
-Kubernetes RBAC required (see rbac.yaml):
+Kubernetes RBAC required (see deploy/manifests.yaml):
     Pods  : get, list, watch, patch
     Nodes : get, list, watch
+    Events: create
 """
 
 from __future__ import annotations
@@ -26,21 +28,24 @@ import time
 from pathlib import Path
 from typing import Optional
 
-# kubernetes-client is the only external dependency
 try:
     from kubernetes import client, config as k8s_config, watch
 except ImportError:
     sys.exit("kubernetes package not found.  Run: pip install kubernetes")
 
-from lane_scheduler.core.scheduler import Job, Lane, SchedulerConfig, Scheduler, initialise_lanes, lane_for_gpu_class, is_known_gpu_class
-from lane_scheduler.core.course_registry import CourseRegistry
+from lane_scheduler.core.scheduler import (
+    Job, Lane, SchedulerConfig, Scheduler,
+    initialise_lanes, lane_for_gpu_class, is_known_gpu_class,
+)
+from lane_scheduler.core.sched_group_registry import SchedGroupRegistry
 from lane_scheduler.core.node_capacity import (
     NodeCapacityTracker,
     INHIBIT_TAINT_KEY, INHIBIT_TAINT_VALUE, GPU_CLASS_LABEL_KEY,
 )
 from lane_scheduler.k8s.pod_translator import (
-    NO_COURSE_LABEL,
-    LABEL_COURSE,
+    NO_SCHED_GROUP_LABEL,
+    LABEL_SCHED_GROUP,
+    LABEL_USER,
     LABEL_BATCH,
     LABEL_GPU_CLASS,
     SCHEDULING_GATE_NAME,
@@ -55,7 +60,6 @@ from lane_scheduler.estimation.wait_estimator import (
 )
 from lane_scheduler.k8s.event_publisher import EventPublisher
 from lane_scheduler.estimation.residency_stats import ResidencyStats
-from lane_scheduler.estimation.residency_store import ResidencyStore
 
 logger = logging.getLogger(__name__)
 
@@ -67,15 +71,8 @@ logger = logging.getLogger(__name__)
 def discover_gpu_classes(core_v1: "client.CoreV1Api") -> list[str]:
     """
     List all nodes and collect distinct gpu-class label values.
-
-    Called once at startup, before initialise_lanes(), so that the Lane enum
-    reflects the actual hardware inventory.  A controller restart is required
-    for new GPU classes added after startup to be recognised.
-
-    Returns a (possibly empty) sorted list of gpu-class strings.
+    Called once at startup, before initialise_lanes().
     """
-    from lane_scheduler.core.node_capacity import GPU_CLASS_LABEL_KEY
-
     found: set[str] = set()
     try:
         nodes = core_v1.list_node().items or []
@@ -118,43 +115,39 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
-WEB_PORT            = _env_int(  "LANE_WEB_PORT",           8080)   # 0 = disabled
-CYCLE_INTERVAL      = _env_float("LANE_CYCLE_INTERVAL",   10.0)   # seconds
+WEB_PORT            = _env_int(  "LANE_WEB_PORT",           8080)
+CYCLE_INTERVAL      = _env_float("LANE_CYCLE_INTERVAL",     10.0)
 DISPATCH_K          = _env_int(  "LANE_DISPATCH_K",         8)
 ALPHA               = _env_float("LANE_ALPHA",              1.0)
 T_HALF_INTERACTIVE  = _env_float("LANE_T_HALF_INTERACTIVE", 600.0)
-T_HALF_BATCH        = _env_float("LANE_T_HALF_BATCH",      7200.0)
+T_HALF_BATCH        = _env_float("LANE_T_HALF_BATCH",       7200.0)
 UTIL_WINDOW         = _env_float("LANE_UTIL_WINDOW",        300.0)
-COURSE_CSV          = os.environ.get("LANE_COURSE_CSV", "/etc/lane-scheduler/courses.csv")
-RELOAD_INTERVAL     = _env_float("LANE_RELOAD_INTERVAL",     30.0) # file-change check interval
-RESIDENCY_DB        = os.environ.get("LANE_RESIDENCY_DB", "")      # empty = disabled
-DB_PERSIST_INTERVAL = _env_float("LANE_DB_PERSIST_INTERVAL", 300.0)
+WAIT_CACHE_INTERVAL = _env_float("LANE_WAIT_CACHE_INTERVAL",60.0)
 
-# Residency distribution parameters (fraction of activeDeadlineSeconds)
 INTERACTIVE_MEAN_PCT = _env_float("LANE_INTERACTIVE_MEAN_PCT", 0.4)
 INTERACTIVE_STD_PCT  = _env_float("LANE_INTERACTIVE_STD_PCT",  0.2)
 BATCH_MEAN_PCT       = _env_float("LANE_BATCH_MEAN_PCT",       0.7)
 BATCH_STD_PCT        = _env_float("LANE_BATCH_STD_PCT",        0.15)
-WAIT_CACHE_INTERVAL  = _env_float("LANE_WAIT_CACHE_INTERVAL",  60.0)  # seconds
-PRIOR_WEIGHT         = _env_float("LANE_PRIOR_WEIGHT",          10.0)  # pseudo-count
-EWMA_ALPHA           = _env_float("LANE_EWMA_ALPHA",             0.1)  # residency EWMA smoothing factor
-DEFAULT_ACTIVE_DEADLINE = _env_int("LANE_DEFAULT_ACTIVE_DEADLINE_SECONDS", 86400)  # fallback for pods with no activeDeadlineSeconds
+PRIOR_WEIGHT         = _env_float("LANE_PRIOR_WEIGHT",          10.0)
+EWMA_ALPHA           = _env_float("LANE_EWMA_ALPHA",             0.1)
+DEFAULT_ACTIVE_DEADLINE = _env_int("LANE_DEFAULT_ACTIVE_DEADLINE_SECONDS", 86400)
+
+KUBECONFIG = os.environ.get("KUBECONFIG")
+LOG_LEVEL  = os.environ.get("LANE_LOG_LEVEL", "INFO").upper()
+DRY_RUN    = os.environ.get("LANE_DRY_RUN", "").lower() in ("1", "true", "yes")
 NO_UNKNOWN_GPU_CLASS_EVENTS = os.environ.get(
     "LANE_NO_UNKNOWN_GPU_CLASS_EVENTS", ""
 ).lower() in ("1", "true", "yes")
 
-# Environment variable fallbacks for flags that previously had no env-var equivalent
-KUBECONFIG = os.environ.get("KUBECONFIG")                                    # standard k8s convention
-LOG_LEVEL  = os.environ.get("LANE_LOG_LEVEL", "INFO").upper()
-DRY_RUN    = os.environ.get("LANE_DRY_RUN", "").lower() in ("1", "true", "yes")
-
 # Admission retry / circuit breaker
 _MAX_ADMIT_ATTEMPTS = 5
-_MAX_ADMIT_BACKOFF  = 300.0   # cap individual backoff sleep at 5 minutes
+_MAX_ADMIT_BACKOFF  = 300.0
 
-# Eviction TTL for completion context entries when a pod's completion event
-# was missed (e.g. watch reconnection gap).  24 hours.
+# TTL for completion-context entries when a pod's completion event was missed.
 _RUNNING_CTX_TTL = 86400.0
+
+# How long an admitted entry may linger before we validate it against the cluster.
+_ADMITTED_STALE_TTL = 600.0  # 10 minutes
 
 
 # ---------------------------------------------------------------------------
@@ -166,39 +159,33 @@ class LaneSchedulerController:
     Orchestrates the pod/node watch loops and the scheduling cycle.
 
     Threading model:
-        - pod_watch_thread   : streams pod events, maintains _pending set
-        - node_watch_thread  : streams node events, updates NodeCapacityTracker
-        - cycle_thread       : runs scheduler.cycle() every CYCLE_INTERVAL seconds
-        - csv_reload_thread  : reloads the course CSV when its mtime changes (checked every RELOAD_INTERVAL seconds)
+        - pod-watch thread  : streams pod events; maintains pending/running state
+        - node-watch thread : streams node events; updates NodeCapacityTracker
+        - cycle thread      : runs scheduler.cycle() every CYCLE_INTERVAL seconds
+        - wait-cache thread : background WaitTimeCache refresh (60 s cadence)
     """
 
     def __init__(
         self,
         core_v1:             client.CoreV1Api,
-        registry:            CourseRegistry,
+        registry:            SchedGroupRegistry,
         sched_config:        SchedulerConfig,
         residency_profiles:  dict[str, ResidencyProfile],
         prior_weight:        float = PRIOR_WEIGHT,
         ewma_alpha:          float = EWMA_ALPHA,
-        course_csv:          Optional[Path] = None,
         cycle_interval:      float = CYCLE_INTERVAL,
-        reload_interval:     float = RELOAD_INTERVAL,
         wait_cache_interval: float = WAIT_CACHE_INTERVAL,
-        residency_store:     Optional[ResidencyStore] = None,
-        db_persist_interval: float = DB_PERSIST_INTERVAL,
-        web_port:                     int   = 0,
-        dry_run:                      bool  = False,
-        no_unknown_gpu_class_events:  bool  = False,
-        default_active_deadline:      int   = DEFAULT_ACTIVE_DEADLINE,
+        web_port:            int   = 0,
+        dry_run:             bool  = False,
+        no_unknown_gpu_class_events: bool = False,
+        default_active_deadline:     int  = DEFAULT_ACTIVE_DEADLINE,
     ):
-        self.core_v1            = core_v1
-        self.registry           = registry
-        self.sched_config       = sched_config
-        self.course_csv         = course_csv
-        self.cycle_interval     = cycle_interval
-        self.reload_interval    = reload_interval
-        self.web_port           = web_port
-        self.dry_run            = dry_run
+        self.core_v1        = core_v1
+        self.registry       = registry
+        self.sched_config   = sched_config
+        self.cycle_interval = cycle_interval
+        self.web_port       = web_port
+        self.dry_run        = dry_run
         self.no_unknown_gpu_class_events = no_unknown_gpu_class_events
         self._default_active_deadline    = default_active_deadline
 
@@ -213,57 +200,58 @@ class LaneSchedulerController:
             config=sched_config,
         )
 
-        # Pods currently in our queue: uid → pod dict snapshot
+        # Pods waiting in Lane Scheduler queue: uid → pod dict
         self._pending: dict[str, dict] = {}
         self._pending_lock = threading.Lock()
 
         # Pods with an unrecognised gpu-class that we are ignoring
         self._ignored_gpu_class: set[str] = set()
 
-        # Pods we have already patched (avoid double-patching)
+        # Pods we have already patched (gate removed), not yet k8s-Pending
         self._admitted: set[str] = set()
         self._admitted_lock = threading.Lock()
 
-        # Admitted pods not yet Running: uid → (lane, resource_units).
-        # Used by the capacity gate so we don't over-commit a lane.
+        # Admitted pods not yet k8s-Pending: uid → (lane, resource_units).
+        # Cleared when the pod transitions to Pending phase.
         self._admitted_resources: dict[str, tuple[object, float]] = {}
         self._admitted_resources_lock = threading.Lock()
 
+        # Timestamp of admission for staleness detection:
+        # uid → (namespace, name, lane, resource_units, admitted_at_monotonic)
+        self._admitted_with_timestamp: dict[str, tuple[str, str, object, float, float]] = {}
+        self._admitted_timestamp_lock = threading.Lock()
+
+        # k8s-Pending pods (gate removed, waiting for default scheduler to place):
+        # {lane: {uid: RunningPod}}  — RunningPod.start_time is approximate here
+        self._kubernetes_pending: dict[object, dict[str, RunningPod]] = {}
+        self._kubernetes_pending_lock = threading.Lock()
+        # User attribution for k8s-pending pods
+        self._kubernetes_pending_user: dict[str, str] = {}
+
         # Running pods per lane: {lane: {uid: RunningPod}}
-        self._running: dict[object, dict[str, RunningPod]] = {}
-        # uid → student_id (namespace) for running pods; kept in sync with _running
-        self._running_student: dict[str, str] = {}
+        self._kubernetes_running: dict[object, dict[str, RunningPod]] = {}
+        # username attribution for running pods
+        self._kubernetes_running_user: dict[str, str] = {}
         self._running_lock = threading.Lock()
 
-        # Last observed mtime of the course CSV; None means not yet loaded by the loop.
-        self._csv_mtime: Optional[float] = None
-
-        # Completion context: uid → (course_id, lane_name, batch, deadline, ctx_created_monotonic)
-        # Needed to record residency when a running pod reaches a terminal phase.
-        # ctx_created_monotonic is used by _sweep_running_ctx to evict stale
-        # entries when a completion event is missed (e.g. watch gap).
+        # Completion context: uid → (sched_group_id, lane_name, batch, deadline, ctx_created_monotonic)
         self._running_ctx: dict[str, tuple[str, str, bool, float, float]] = {}
         self._running_ctx_lock = threading.Lock()
 
-        # Per-pod admission retry state for non-404 apiserver errors.
-        # uid → (attempt_count, next_retry_monotonic).  Cleared on success or 404.
+        # Per-pod admission retry state: uid → (attempt_count, next_retry_monotonic)
         self._admit_attempts: dict[str, tuple[int, float]] = {}
         self._admit_attempts_lock = threading.Lock()
 
-        # Last-seen resourceVersion for each watch, used to resume after
-        # disconnect without losing events.  Reset to None on a 410 ("Gone")
-        # to force a fresh list.
+        # Last-seen resourceVersion for each watch
         self._pod_resource_version:  Optional[str] = None
         self._node_resource_version: Optional[str] = None
 
-        # Watch handles stored so stop() can interrupt blocking streams.
+        # Watch handles for clean shutdown
         self._pod_watch:  Optional["watch.Watch"] = None
         self._node_watch: Optional["watch.Watch"] = None
 
-        # Background threads (populated in run()) so shutdown can join them.
         self._threads: list[threading.Thread] = []
 
-        # Per-course residency statistics (Bayesian, updated on completions)
         self.residency_stats = ResidencyStats(
             interactive_prior = residency_profiles["interactive"],
             batch_prior       = residency_profiles["batch"],
@@ -271,23 +259,11 @@ class LaneSchedulerController:
             ewma_alpha        = ewma_alpha,
         )
 
-        self.residency_store     = residency_store
-        self._db_persist_interval = db_persist_interval
-        if residency_store is not None:
-            rows = residency_store.load()
-            for course_id, lane_name, batch, mean, var, n in rows:
-                self.residency_stats.seed(course_id, lane_name, batch, mean, var, n)
-            logger.info(
-                "Seeded %d residency strata from DB at %s", len(rows), residency_store.path
-            )
-
-        # Background wait-time cache
         self.wait_cache = WaitTimeCache(
             snapshot_fn = self._build_wait_snapshot,
             interval    = wait_cache_interval,
         )
 
-        # Kubernetes Event publisher (best-effort, non-blocking on errors)
         self.event_publisher = EventPublisher(
             core_v1,
             dry_run=dry_run,
@@ -296,8 +272,6 @@ class LaneSchedulerController:
 
         self._stop = threading.Event()
         self._nodes_bootstrapped = threading.Event()
-        # Populated by _bootstrap_pods; consumed (and cleared) by
-        # _rescan_unlaned_running_pods after node bootstrap completes.
         self._bootstrap_pod_cache: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
@@ -310,15 +284,10 @@ class LaneSchedulerController:
         self.wait_cache.start()
 
         self._threads = [
-            threading.Thread(target=self._pod_watch_loop,    name="pod-watch",    daemon=True),
-            threading.Thread(target=self._node_watch_loop,   name="node-watch",   daemon=True),
-            threading.Thread(target=self._cycle_loop,        name="cycle",        daemon=True),
-            threading.Thread(target=self._csv_reload_loop,   name="csv-reload",   daemon=True),
+            threading.Thread(target=self._pod_watch_loop,  name="pod-watch",  daemon=True),
+            threading.Thread(target=self._node_watch_loop, name="node-watch", daemon=True),
+            threading.Thread(target=self._cycle_loop,      name="cycle",      daemon=True),
         ]
-        if self.residency_store is not None:
-            self._threads.append(
-                threading.Thread(target=self._db_persist_loop, name="db-persist", daemon=True)
-            )
         for t in self._threads:
             t.start()
 
@@ -342,8 +311,6 @@ class LaneSchedulerController:
 
     def stop(self) -> None:
         self._stop.set()
-        # Interrupt any in-progress watch.stream() calls so the loops can
-        # observe _stop without waiting up to 60s for the next timeout.
         for w in (self._pod_watch, self._node_watch):
             if w is not None:
                 try:
@@ -402,13 +369,13 @@ class LaneSchedulerController:
     def _bootstrap_pods(self) -> None:
         """List all pods and seed our state + resourceVersion."""
         self._nodes_bootstrapped.wait(timeout=10.0)
-        resp = self.core_v1.list_pod_for_all_namespaces()
+        resp  = self.core_v1.list_pod_for_all_namespaces()
         items = getattr(resp, "items", None) or []
-        rv = None
-        meta = getattr(resp, "metadata", None)
+        rv    = None
+        meta  = getattr(resp, "metadata", None)
         if meta is not None:
             rv = getattr(meta, "resource_version", None)
-        _ser = self.core_v1.api_client.sanitize_for_serialization
+        _ser  = self.core_v1.api_client.sanitize_for_serialization
         cache: dict[str, dict] = {}
         for item in items:
             pod = _ser(item) if hasattr(item, "to_dict") else item
@@ -418,9 +385,6 @@ class LaneSchedulerController:
             self._handle_pod_event({"type": "ADDED", "object": item})
         self._bootstrap_pod_cache = cache
         self._pod_resource_version = rv
-        # Node bootstrap may have already completed (and fired rescan with an
-        # empty cache). Now that the cache is populated, rescan again so pods
-        # that were skipped due to missing node data are attributed correctly.
         if self._nodes_bootstrapped.is_set():
             self._rescan_unlaned_running_pods()
 
@@ -457,57 +421,110 @@ class LaneSchedulerController:
                 self._dequeue(uid)
                 phase = (pod.get("status") or {}).get("phase", "")
                 if phase == "Running":
-                    # Running pool now accounts for these resources.
-                    with self._admitted_resources_lock:
-                        self._admitted_resources.pop(uid, None)
-                    self._upsert_running(uid, pod)
+                    self._transition_to_running(uid, pod)
                 elif phase in ("Succeeded", "Failed"):
-                    with self._admitted_resources_lock:
-                        self._admitted_resources.pop(uid, None)
                     self._record_completion(uid, pod)
                     self._remove_running(uid)
+                    self._remove_kubernetes_pending(uid)
+                    with self._admitted_resources_lock:
+                        self._admitted_resources.pop(uid, None)
+                    with self._admitted_timestamp_lock:
+                        self._admitted_with_timestamp.pop(uid, None)
                 else:
-                    # Pod is admitted-but-pending (gate removed, no nodeName yet).
-                    # _admitted_resources stays populated so the capacity gate
-                    # counts these resources until Running or terminal.
-                    self._remove_running(uid)
+                    # Admitted and now k8s-Pending (gate removed, no nodeName yet)
+                    self._transition_to_kubernetes_pending(uid, pod)
 
         elif etype == "DELETED":
             self._dequeue(uid)
             self._remove_running(uid)
+            self._remove_kubernetes_pending(uid)
             with self._admitted_resources_lock:
                 self._admitted_resources.pop(uid, None)
+            with self._admitted_timestamp_lock:
+                self._admitted_with_timestamp.pop(uid, None)
+
+    def _transition_to_kubernetes_pending(self, uid: str, pod: dict) -> None:
+        """
+        Pod has been admitted by us (gate removed) and is now Pending in k8s.
+        Move it from _admitted_resources to _kubernetes_pending.
+        """
+        with self._admitted_lock:
+            if uid not in self._admitted:
+                # Pod was Pending before we knew about it (bypassed our gate)
+                # — still count it against capacity.
+                pass
+
+        # Build a RunningPod-like entry for capacity accounting.
+        # Use a sentinel start_time; resource_units is what matters here.
+        rp = self._running_pod_from_pod(uid, pod)
+        if rp is None:
+            # Can't parse — use admitted_resources as fallback
+            with self._admitted_resources_lock:
+                entry = self._admitted_resources.get(uid)
+            if entry is not None:
+                lane, units = entry
+                rp = RunningPod(
+                    pod_uid                 = uid,
+                    start_time              = time.monotonic(),
+                    active_deadline_seconds = float(self._default_active_deadline),
+                    batch                   = False,
+                    resource_units          = units,
+                )
+            if rp is None:
+                return
+
+        gpu_lane = self._lane_for_pod(pod)
+        if gpu_lane is None:
+            return
+
+        username = self._username_from_pod(pod)
+
+        with self._kubernetes_pending_lock:
+            if gpu_lane not in self._kubernetes_pending:
+                self._kubernetes_pending[gpu_lane] = {}
+            self._kubernetes_pending[gpu_lane][uid] = rp
+            self._kubernetes_pending_user[uid] = username
+
+        # Release the speculative reservation from _admitted_resources
+        with self._admitted_resources_lock:
+            self._admitted_resources.pop(uid, None)
+        with self._admitted_timestamp_lock:
+            self._admitted_with_timestamp.pop(uid, None)
+
+    def _transition_to_running(self, uid: str, pod: dict) -> None:
+        """Pod has transitioned to Running. Remove from k8s-pending, add to running."""
+        with self._admitted_resources_lock:
+            self._admitted_resources.pop(uid, None)
+        with self._admitted_timestamp_lock:
+            self._admitted_with_timestamp.pop(uid, None)
+        self._remove_kubernetes_pending(uid)
+        self._upsert_running(uid, pod)
 
     def _running_pod_from_pod(self, uid: str, pod: dict) -> Optional[RunningPod]:
-        """
-        Build a RunningPod from a Kubernetes pod dict.
-        Returns None if required fields (start time, lane) are missing.
-        Pods without activeDeadlineSeconds are assumed to have a lifetime of
-        self._default_active_deadline seconds.
-        """
+        """Build a RunningPod from a Kubernetes pod dict."""
         from lane_scheduler.k8s.pod_translator import _is_batch, _resource_units, _gpu_lane
         spec   = pod.get("spec")   or {}
         status = pod.get("status") or {}
 
         deadline = spec.get("activeDeadlineSeconds") or self._default_active_deadline
 
-        # start_time from status.startTime (ISO8601); convert to monotonic offset
         start_str = status.get("startTime")
-        if not start_str:
-            return None
-        try:
-            import datetime
-            dt      = datetime.datetime.fromisoformat(start_str.replace("Z", "+00:00"))
-            wall_age = (datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds()
-            start_time = time.monotonic() - max(0.0, wall_age)
-        except Exception:
-            return None
+        if start_str:
+            try:
+                import datetime
+                dt      = datetime.datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+                wall_age = (datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds()
+                start_time = time.monotonic() - max(0.0, wall_age)
+            except Exception:
+                start_time = time.monotonic()
+        else:
+            start_time = time.monotonic()
 
         gpu_lane = _gpu_lane(pod)
         if gpu_lane is None:
             _nname = spec.get("nodeName", "") or ""
             gpu_lane = self.node_tracker.lane_for_node(_nname) if _nname else None
-        batch    = _is_batch(pod)
+        batch = _is_batch(pod)
 
         from lane_scheduler.k8s.pod_translator import _resource_units as _ru
         units = _ru(pod, gpu_lane)
@@ -520,85 +537,88 @@ class LaneSchedulerController:
             resource_units          = units,
         )
 
+    def _lane_for_pod(self, pod: dict) -> Optional[str]:
+        """Return the GPU lane for a pod, trying label then node lookup."""
+        from lane_scheduler.k8s.pod_translator import _gpu_lane
+        gpu_lane = _gpu_lane(pod)
+        if gpu_lane is None:
+            nname = ((pod.get("spec") or {}).get("nodeName", "") or "")
+            if nname:
+                gpu_lane = self.node_tracker.lane_for_node(nname)
+        return gpu_lane
+
+    def _username_from_pod(self, pod: dict) -> str:
+        """Extract the username from dsmlp/user label, fall back to namespace."""
+        meta      = pod.get("metadata") or {}
+        labels    = meta.get("labels") or {}
+        namespace = meta.get("namespace", "")
+        return labels.get(LABEL_USER, "").strip() or namespace
+
     def _upsert_running(self, uid: str, pod: dict) -> None:
         rp = self._running_pod_from_pod(uid, pod)
         if rp is None:
             return
         from lane_scheduler.k8s.pod_translator import _gpu_lane, _is_batch
-        gpu_lane = _gpu_lane(pod)
+        gpu_lane = self._lane_for_pod(pod)
         if gpu_lane is None:
             if _gpu_request_count(pod) == 0.0:
-                # No label and no GPU resources — not relevant to utilization tracking.
                 return
-            _nname = ((pod.get("spec") or {}).get("nodeName", "") or "")
-            gpu_lane = self.node_tracker.lane_for_node(_nname) if _nname else None
-            if gpu_lane is not None:
-                logger.info(
-                    "Running pod %s: no gpu-class pod label; attributed to lane %s via node %r",
-                    uid, gpu_lane, _nname,
-                )
-            else:
-                logger.info(
-                    "Running pod %s: no gpu-class pod label and node %r not in managed pool; "
-                    "skipping utilization tracking",
-                    uid, _nname,
-                )
-        if gpu_lane is None:
+            logger.info(
+                "Running pod %s: no gpu-class label and node not in managed pool; "
+                "skipping utilization tracking", uid,
+            )
             return
-        lane      = gpu_lane
-        lane_name = lane
-        course_id = (
+        lane          = gpu_lane
+        lane_name     = lane
+        sched_group_id = (
             (pod.get("metadata") or {}).get("labels") or {}
-        ).get(LABEL_COURSE, NO_COURSE_LABEL) or NO_COURSE_LABEL
-        student_id = (pod.get("metadata") or {}).get("namespace", "")
-        batch     = _is_batch(pod)
-        deadline  = float((pod.get("spec") or {}).get("activeDeadlineSeconds") or self._default_active_deadline)
+        ).get(LABEL_SCHED_GROUP, NO_SCHED_GROUP_LABEL) or NO_SCHED_GROUP_LABEL
+        username      = self._username_from_pod(pod)
+        batch         = _is_batch(pod)
+        deadline      = float(
+            (pod.get("spec") or {}).get("activeDeadlineSeconds") or self._default_active_deadline
+        )
 
         with self._running_lock:
-            if lane not in self._running:
-                self._running[lane] = {}
-            self._running[lane][uid] = rp
-            self._running_student[uid] = student_id
+            if lane not in self._kubernetes_running:
+                self._kubernetes_running[lane] = {}
+            self._kubernetes_running[lane][uid] = rp
+            self._kubernetes_running_user[uid] = username
 
         with self._running_ctx_lock:
             self._running_ctx[uid] = (
-                course_id, lane_name, batch, deadline, time.monotonic(),
+                sched_group_id, lane_name, batch, deadline, time.monotonic(),
             )
 
     def _remove_running(self, uid: str) -> None:
         with self._running_lock:
-            for lane_dict in self._running.values():
+            for lane_dict in self._kubernetes_running.values():
                 lane_dict.pop(uid, None)
-            self._running_student.pop(uid, None)
+            self._kubernetes_running_user.pop(uid, None)
         with self._running_ctx_lock:
             self._running_ctx.pop(uid, None)
 
-    def _record_completion(self, uid: str, pod: dict) -> None:
-        """
-        Record a pod completion into ResidencyStats.
+    def _remove_kubernetes_pending(self, uid: str) -> None:
+        with self._kubernetes_pending_lock:
+            for lane_dict in self._kubernetes_pending.values():
+                lane_dict.pop(uid, None)
+            self._kubernetes_pending_user.pop(uid, None)
 
-        Residency is computed from pod status.startTime and
-        status.containerStatuses[*].state.terminated.finishedAt.
-        If the pod ran to its deadline (or finish time is unavailable),
-        residency is treated as 1.0.
-        """
+    def _record_completion(self, uid: str, pod: dict) -> None:
         with self._running_ctx_lock:
             ctx = self._running_ctx.get(uid)
         if ctx is None:
-            return   # pod wasn't tracked (no deadline, or never seen as Running)
+            return
 
-        course_id, lane_name, batch, deadline, _ctx_created = ctx
+        sched_group_id, lane_name, batch, deadline, _ctx_created = ctx
         if deadline <= 0:
             return
 
-        residency_pct = 1.0   # default: assume full deadline consumed
-
+        residency_pct = 1.0
         try:
             import datetime as _dt
             status     = pod.get("status") or {}
             start_str  = status.get("startTime")
-
-            # Find the latest finishedAt across all container statuses
             finish_str = None
             for cs in (status.get("containerStatuses") or []):
                 term = (cs.get("state") or {}).get("terminated") or {}
@@ -609,43 +629,36 @@ class LaneSchedulerController:
 
             if start_str and finish_str:
                 def _parse(s: str) -> _dt.datetime:
-                    return _dt.datetime.fromisoformat(
-                        s.replace("Z", "+00:00")
-                    )
+                    return _dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
                 elapsed = (_parse(finish_str) - _parse(start_str)).total_seconds()
                 if elapsed > 0:
-                    raw = elapsed / deadline
-                    # Cap at 1.0 — slight clock skew can push it marginally over
-                    residency_pct = min(1.0, raw)
+                    residency_pct = min(1.0, elapsed / deadline)
         except Exception as exc:
             logger.debug("Could not compute residency for pod %s: %s", uid, exc)
-            # Fall through with residency_pct = 1.0
 
         self.residency_stats.record(
-            course_id     = course_id,
-            lane_name     = lane_name,
-            batch         = batch,
-            residency_pct = residency_pct,
+            sched_group_id = sched_group_id,
+            lane_name      = lane_name,
+            batch          = batch,
+            residency_pct  = residency_pct,
         )
         logger.info(
-            "Completion recorded [course=%s lane=%s batch=%s residency=%.3f n=%d]",
-            course_id, lane_name, batch, residency_pct,
-            self.residency_stats.observation_count(course_id, lane_name, batch),
+            "Completion recorded [group=%s lane=%s batch=%s residency=%.3f n=%d]",
+            sched_group_id, lane_name, batch, residency_pct,
+            self.residency_stats.observation_count(sched_group_id, lane_name, batch),
         )
 
     def running_pods_for_lane(self, lane: object) -> list[RunningPod]:
         """Return a snapshot of RunningPod objects for a given lane."""
         with self._running_lock:
-            return list((self._running.get(lane) or {}).values())
+            return list((self._kubernetes_running.get(lane) or {}).values())
 
     def _enqueue(self, uid: str, pod: dict) -> None:
-        # Reject pods whose gpu-class label is absent or not managed by this controller.
         gpu_class = ((pod.get("metadata") or {}).get("labels") or {}).get(
             LABEL_GPU_CLASS, ""
         ).strip()
         if not gpu_class:
             if _gpu_request_count(pod) == 0.0:
-                # No label and no GPU resources — not relevant to lane scheduling.
                 return
             if uid not in self._ignored_gpu_class:
                 self._ignored_gpu_class.add(uid)
@@ -671,20 +684,21 @@ class LaneSchedulerController:
 
         with self._admitted_lock:
             if uid in self._admitted:
-                return   # already handled
+                return
 
         with self._pending_lock:
             if uid in self._pending:
-                return   # already queued
+                return
 
-            course_id  = (pod.get("metadata", {}).get("labels") or {}).get(
-                LABEL_COURSE, NO_COURSE_LABEL
-            ).strip() or NO_COURSE_LABEL
-            course     = self.registry.get(course_id)
+            sched_group_id = (
+                (pod.get("metadata", {}).get("labels") or {}).get(
+                    LABEL_SCHED_GROUP, NO_SCHED_GROUP_LABEL
+                ).strip() or NO_SCHED_GROUP_LABEL
+            )
+            group = self.registry.get(sched_group_id)
 
-            # Register course with scheduler if not yet known
-            if not self.scheduler.has_class(course_id):
-                self.scheduler.register_class(course)
+            if not self.scheduler.has_group(sched_group_id):
+                self.scheduler.register_group(group)
 
             submit_time = time.monotonic()
             job = pod_to_job(pod, submit_time=submit_time)
@@ -693,10 +707,10 @@ class LaneSchedulerController:
             self.event_publisher.register(uid, pod)
 
             logger.info(
-                "Enqueued pod %s/%s [course=%s lane=%s]",
+                "Enqueued pod %s/%s [group=%s lane=%s user=%s]",
                 (pod.get("metadata") or {}).get("namespace", "?"),
                 (pod.get("metadata") or {}).get("name", "?"),
-                course_id, job.lane,
+                sched_group_id, job.lane, job.username,
             )
 
     def _dequeue(self, uid: str) -> None:
@@ -705,17 +719,14 @@ class LaneSchedulerController:
         with self._admitted_lock:
             was_admitted = uid in self._admitted
             self._admitted.discard(uid)
-        # Admitted pods keep their _admitted_resources entry until they reach
-        # Running or a terminal state so the capacity gate accounts for them
-        # during the Pending-without-gate limbo between gate removal and Running.
         if not was_admitted:
             with self._admitted_resources_lock:
                 self._admitted_resources.pop(uid, None)
+            with self._admitted_timestamp_lock:
+                self._admitted_with_timestamp.pop(uid, None)
         self._ignored_gpu_class.discard(uid)
         with self._admit_attempts_lock:
             self._admit_attempts.pop(uid, None)
-        # If the pod was still queued, also remove its Job from the scheduler
-        # queue so it doesn't get dispatched against a no-longer-pending pod.
         if was_pending:
             self.scheduler.remove_job(uid)
         self.event_publisher.deregister(uid)
@@ -771,11 +782,10 @@ class LaneSchedulerController:
                 self._node_watch = None
 
     def _bootstrap_nodes(self) -> None:
-        """List all nodes and seed NodeCapacityTracker + resourceVersion."""
-        resp = self.core_v1.list_node()
+        resp  = self.core_v1.list_node()
         items = getattr(resp, "items", None) or []
-        rv = None
-        meta = getattr(resp, "metadata", None)
+        rv    = None
+        meta  = getattr(resp, "metadata", None)
         if meta is not None:
             rv = getattr(meta, "resource_version", None)
         for item in items:
@@ -786,52 +796,33 @@ class LaneSchedulerController:
         self._rescan_unlaned_running_pods()
 
     def _rescan_unlaned_running_pods(self) -> None:
-        """
-        Re-try _upsert_running for any pods that were skipped at bootstrap
-        because node data was not yet available.
-
-        Called once after _bootstrap_nodes completes so that Running pods
-        on managed nodes are counted even when pod bootstrap raced ahead of
-        node bootstrap and the 10 s barrier timed out.
-        """
         with self._pending_lock:
             pending_uids = set(self._pending)
         with self._running_lock:
-            already_tracked = set()
-            for pods in self._running.values():
-                already_tracked.update(pods)
+            already_tracked: set[str] = set()
+            for lane_dict in self._kubernetes_running.values():
+                already_tracked.update(lane_dict.keys())
 
-        requeued = 0
-        for uid, pod in list(getattr(self, "_bootstrap_pod_cache", {}).items()):
-            if uid in already_tracked or uid in pending_uids:
+        cache = self._bootstrap_pod_cache
+        for uid, pod in cache.items():
+            if uid in pending_uids or uid in already_tracked:
                 continue
             phase = (pod.get("status") or {}).get("phase", "")
             if phase == "Running":
                 self._upsert_running(uid, pod)
-                requeued += 1
-
-        if requeued:
-            logger.info(
-                "Post-node-bootstrap rescan attributed %d previously-unlaned Running pod(s)",
-                requeued,
-            )
-        self._bootstrap_pod_cache.clear()
 
     def _handle_node_event(self, event: dict) -> None:
         etype = event.get("type", "")
         node  = event.get("object", {})
         if hasattr(node, "to_dict"):
             node = self.core_v1.api_client.sanitize_for_serialization(node)
-
-        name = (node.get("metadata") or {}).get("name", "<unknown>")
-
+        name = (node.get("metadata", {}) or {}).get("name", "")
         if etype in ("ADDED", "MODIFIED"):
             self.node_tracker.upsert(node)
         elif etype == "DELETED":
             self.node_tracker.remove(name)
 
     def _sync_lane_capacity(self) -> None:
-        """Push current node capacity into the scheduler's utilization tracker."""
         caps = self.node_tracker.lane_capacity()
         self.scheduler.set_lane_capacity(caps)
 
@@ -840,27 +831,23 @@ class LaneSchedulerController:
     # ------------------------------------------------------------------
 
     def _cycle_loop(self) -> None:
-        # Wait briefly for the watches to populate initial state
         self._stop.wait(max(self.cycle_interval, 5.0))
 
         while not self._stop.is_set():
             try:
                 self._sweep_running_ctx()
+                self._sweep_stale_admitted()
                 self._run_cycle()
             except Exception as exc:
                 logger.error("Cycle error: %s", exc, exc_info=True)
             self._stop.wait(self.cycle_interval)
 
     def _sweep_running_ctx(self) -> None:
-        """
-        Evict completion-context entries that are older than _RUNNING_CTX_TTL
-        AND whose uid is not currently in self._running.  Catches leaks from
-        missed completion events (e.g. watch reconnection gaps).
-        """
+        """Evict completion-context entries older than TTL that are no longer running."""
         now = time.monotonic()
         with self._running_lock:
             running_uids: set[str] = set()
-            for lane_dict in self._running.values():
+            for lane_dict in self._kubernetes_running.values():
                 running_uids.update(lane_dict.keys())
         stale: list[str] = []
         with self._running_ctx_lock:
@@ -871,10 +858,48 @@ class LaneSchedulerController:
             for uid in stale:
                 self._running_ctx.pop(uid, None)
         if stale:
-            logger.info(
-                "Evicted %d stale completion-context entries (TTL exceeded)",
-                len(stale),
-            )
+            logger.info("Evicted %d stale completion-context entries (TTL exceeded)", len(stale))
+
+    def _sweep_stale_admitted(self) -> None:
+        """
+        Validate admitted entries older than _ADMITTED_STALE_TTL against the cluster.
+        If the pod no longer exists or is no longer in a gated/pending state,
+        remove the reserved capacity to prevent permanent over-commitment.
+        """
+        now = time.monotonic()
+        with self._admitted_timestamp_lock:
+            stale = {
+                uid: entry
+                for uid, entry in self._admitted_with_timestamp.items()
+                if now - entry[4] > _ADMITTED_STALE_TTL
+            }
+
+        for uid, (namespace, name, lane, units, _ts) in stale.items():
+            pod_exists = True
+            still_admitted = True
+            try:
+                pod = self.core_v1.read_namespaced_pod(name=name, namespace=namespace)
+                pod_dict = self.core_v1.api_client.sanitize_for_serialization(pod)
+                phase = (pod_dict.get("status") or {}).get("phase", "")
+                if phase not in ("Pending", ""):
+                    still_admitted = False
+            except client.exceptions.ApiException as exc:
+                if exc.status == 404:
+                    pod_exists = False
+                    still_admitted = False
+
+            if not still_admitted:
+                logger.warning(
+                    "Stale admitted entry for pod %s/%s (age>%.0fs, exists=%s) — "
+                    "releasing %.1f units from lane %s",
+                    namespace, name, _ADMITTED_STALE_TTL, pod_exists, units, lane,
+                )
+                with self._admitted_lock:
+                    self._admitted.discard(uid)
+                with self._admitted_resources_lock:
+                    self._admitted_resources.pop(uid, None)
+                with self._admitted_timestamp_lock:
+                    self._admitted_with_timestamp.pop(uid, None)
 
     def _run_cycle(self) -> None:
         caps = self.node_tracker.lane_capacity()
@@ -882,29 +907,29 @@ class LaneSchedulerController:
             logger.debug("No node capacity known yet — skipping cycle")
             return
 
-        now       = time.monotonic()
+        now = time.monotonic()
 
-        # Snapshot running units and student counts in one lock acquisition so
-        # both views are consistent and unaffected by concurrent pod-watch events.
         with self._running_lock:
             running_units: dict = {
                 lane: sum(rp.resource_units for rp in pods.values())
-                for lane, pods in self._running.items()
+                for lane, pods in self._kubernetes_running.items()
             }
             running_counts: dict = {}
-            for lane, pods in self._running.items():
+            for lane, pods in self._kubernetes_running.items():
                 counts: dict = {}
                 for uid in pods:
-                    sid = self._running_student.get(uid, "")
-                    counts[sid] = counts.get(sid, 0) + 1
+                    uname = self._kubernetes_running_user.get(uid, "")
+                    counts[uname] = counts.get(uname, 0) + 1
                 running_counts[lane] = counts
 
-        # Push student running counts so the scheduler can apply the
-        # minimum-running-then-oldest-job prioritization rule.
         self.scheduler.update_running_counts(running_counts)
 
-        # Snapshot admitted-but-not-running units; augmented in the loop below
-        # so jobs committed earlier in the same cycle are visible to later ones.
+        with self._kubernetes_pending_lock:
+            pending_units: dict = {
+                lane: sum(rp.resource_units for rp in pods.values())
+                for lane, pods in self._kubernetes_pending.items()
+            }
+
         with self._admitted_resources_lock:
             admitted_units: dict = {}
             for _uid, (lane, units) in self._admitted_resources.items():
@@ -919,28 +944,24 @@ class LaneSchedulerController:
         logger.info("Cycle dispatching %d jobs", len(dispatched))
 
         for job in dispatched:
-            # Honour retry backoff: if this pod recently failed admission,
-            # do not try again until next_retry_monotonic has passed.
             with self._admit_attempts_lock:
                 attempts_entry = self._admit_attempts.get(job.job_id)
             if attempts_entry is not None and attempts_entry[1] > now:
-                # Re-queue the Job so it'll be considered again in a later cycle.
                 with self._pending_lock:
                     pod = self._pending.get(job.job_id)
                 if pod is not None:
-                    # Job stays in _pending; re-submit so the scheduler still
-                    # has it in its queue (cycle just popped it).
                     try:
                         self.scheduler.submit(job)
                     except ValueError:
                         pass
                 continue
 
-            # Capacity gate: only admit if genuine free capacity exists.
-            lane_cap = caps.get(job.lane, 0.0)
-            running  = running_units.get(job.lane, 0.0)
-            admitted = admitted_units.get(job.lane, 0.0)
-            free     = lane_cap - running - admitted
+            # Capacity gate: free = capacity - running - k8s_pending - admitted
+            lane_cap  = caps.get(job.lane, 0.0)
+            running   = running_units.get(job.lane, 0.0)
+            k8s_pend  = pending_units.get(job.lane, 0.0)
+            admitted  = admitted_units.get(job.lane, 0.0)
+            free      = lane_cap - running - k8s_pend - admitted
             if free < job.resource_units:
                 with self._pending_lock:
                     pod = self._pending.get(job.job_id)
@@ -955,10 +976,16 @@ class LaneSchedulerController:
                 )
                 continue
 
-            # Speculatively record before the patch so later jobs in this cycle
-            # see the reservation; rolled back below if _pop_pending fails.
+            # Speculatively reserve capacity before the patch
+            meta = self._get_pod_meta(job.job_id)
             with self._admitted_resources_lock:
                 self._admitted_resources[job.job_id] = (job.lane, job.resource_units)
+            with self._admitted_timestamp_lock:
+                ns   = meta[0] if meta else ""
+                name = meta[1] if meta else ""
+                self._admitted_with_timestamp[job.job_id] = (
+                    ns, name, job.lane, job.resource_units, now,
+                )
             admitted_units[job.lane] = admitted + job.resource_units
 
             pod = self._pop_pending(job.job_id)
@@ -966,11 +993,21 @@ class LaneSchedulerController:
                 logger.warning("Dispatched job %s has no matching pending pod", job.job_id)
                 with self._admitted_resources_lock:
                     self._admitted_resources.pop(job.job_id, None)
+                with self._admitted_timestamp_lock:
+                    self._admitted_with_timestamp.pop(job.job_id, None)
                 admitted_units[job.lane] -= job.resource_units
                 continue
             self._admit_pod(pod, job)
 
         logger.info("Capacity: %s", self.node_tracker.summary())
+
+    def _get_pod_meta(self, uid: str) -> Optional[tuple[str, str]]:
+        with self._pending_lock:
+            pod = self._pending.get(uid)
+        if pod is None:
+            return None
+        meta = pod.get("metadata") or {}
+        return meta.get("namespace", ""), meta.get("name", "")
 
     def _pop_pending(self, uid: str) -> Optional[dict]:
         with self._pending_lock:
@@ -984,7 +1021,7 @@ class LaneSchedulerController:
 
         patch = admission_patch(pod)
         if not patch:
-            logger.debug("Pod %s/%s already has toleration — skipping patch", namespace, name)
+            logger.debug("Pod %s/%s already admitted — skipping patch", namespace, name)
             with self._admitted_lock:
                 self._admitted.add(uid)
             with self._admit_attempts_lock:
@@ -993,9 +1030,8 @@ class LaneSchedulerController:
 
         if self.dry_run:
             logger.info(
-                "DRY RUN: would patch pod %s/%s to add gpu-class toleration "
-                "and remove scheduling gate [course=%s lane=%s wait=%.1fs]",
-                namespace, name, job.class_id, job.lane,
+                "DRY RUN: would patch pod %s/%s [group=%s lane=%s wait=%.1fs]",
+                namespace, name, job.sched_group_id, job.lane,
                 job.wait_seconds(now=time.monotonic()),
             )
             with self._admitted_lock:
@@ -1015,15 +1051,15 @@ class LaneSchedulerController:
             with self._admit_attempts_lock:
                 self._admit_attempts.pop(uid, None)
             logger.info(
-                "Admitted pod %s/%s — gpu-class toleration added, scheduling gate removed "
-                "[course=%s lane=%s wait=%.1fs]",
-                namespace, name, job.class_id, job.lane,
+                "Admitted pod %s/%s — gate removed [group=%s lane=%s wait=%.1fs]",
+                namespace, name, job.sched_group_id, job.lane,
                 job.wait_seconds(now=time.monotonic()),
             )
         except client.exceptions.ApiException as exc:
-            # Patch failed — release the speculative capacity reservation.
             with self._admitted_resources_lock:
                 self._admitted_resources.pop(uid, None)
+            with self._admitted_timestamp_lock:
+                self._admitted_with_timestamp.pop(uid, None)
             if exc.status == 404:
                 logger.info("Pod %s/%s vanished before admission — skipping", namespace, name)
                 with self._admit_attempts_lock:
@@ -1054,10 +1090,6 @@ class LaneSchedulerController:
                 "Giving up on pod %s/%s after %d admit failures: %s",
                 namespace, name, _MAX_ADMIT_ATTEMPTS, exc,
             )
-            # Best-effort cleanup: drop any copies left in the scheduler queue
-            # (a Job may have been re-submitted on each failed attempt),
-            # remove controller state, and surface a Warning Event so the
-            # student/operator sees it.
             while self.scheduler.remove_job(uid) is not None:
                 pass
             with self._pending_lock:
@@ -1072,35 +1104,22 @@ class LaneSchedulerController:
             "Failed to patch pod %s/%s (attempt %d/%d): %s — backing off",
             namespace, name, attempts, _MAX_ADMIT_ATTEMPTS, exc,
         )
-        # Put the pod back in _pending and re-submit the Job into the
-        # scheduler queue so a later cycle can retry once backoff elapses.
         with self._pending_lock:
             self._pending[uid] = pod
         try:
             self.scheduler.submit(job)
         except ValueError:
-            # Class was unregistered between cycles — nothing we can do.
             pass
 
     def get_wait_estimate(self, pod_uid: str) -> Optional[WaitEstimate]:
-        """
-        Return the most recent cached WaitEstimate for a queued pod, or None.
-
-        Results are at most wait_cache_interval seconds stale.
-        Returns None if the pod is unknown or the cache has not yet populated.
-        """
         return self.wait_cache.get(pod_uid)
 
     def _build_wait_snapshot(self) -> dict[str, WaitEstimate]:
         """
         Compute WaitEstimates for every currently queued pod, then publish
         Kubernetes Events for pods whose emission schedule is due.
-
-        Each pod's wait estimate uses a per-course ResidencyProfile blended
-        from the cluster-wide prior and course-specific completion observations.
         """
         from lane_scheduler.core.scheduler import Lane as _Lane
-        from lane_scheduler.k8s.pod_translator import _is_batch
 
         now  = time.monotonic()
         caps = self.node_tracker.lane_capacity()
@@ -1110,7 +1129,12 @@ class LaneSchedulerController:
         with self._running_lock:
             running_snapshot = {
                 lane: dict(pods)
-                for lane, pods in self._running.items()
+                for lane, pods in self._kubernetes_running.items()
+            }
+        with self._kubernetes_pending_lock:
+            kpending_snapshot = {
+                lane: dict(pods)
+                for lane, pods in self._kubernetes_pending.items()
             }
         with self._admitted_resources_lock:
             admitted_by_lane: dict = {}
@@ -1124,18 +1148,20 @@ class LaneSchedulerController:
             lane_name    = lane
             running      = list((running_snapshot.get(lane) or {}).values())
             running_u    = sum(rp.resource_units for rp in running)
+            k8s_pend_u   = sum(
+                rp.resource_units for rp in (kpending_snapshot.get(lane) or {}).values()
+            )
             admitted_u   = admitted_by_lane.get(lane, 0.0)
-            free_units   = max(0.0, caps.get(lane, 0.0) - running_u - admitted_u)
+            free_units   = max(0.0, caps.get(lane, 0.0) - running_u - k8s_pend_u - admitted_u)
             candidates   = self.scheduler._scored_candidates(lane, now)
             lane_candidates[lane] = candidates
 
             for rank, (_, job) in enumerate(candidates, start=1):
-                # Build a per-job profiles dict using the course-specific posterior
                 profiles = {
                     "interactive": self.residency_stats.profile_for(
-                        job.class_id, lane_name, batch=False),
+                        job.sched_group_id, lane_name, batch=False),
                     "batch":       self.residency_stats.profile_for(
-                        job.class_id, lane_name, batch=True),
+                        job.sched_group_id, lane_name, batch=True),
                 }
                 est = estimate_wait(
                     queue_rank     = rank,
@@ -1162,50 +1188,6 @@ class LaneSchedulerController:
 
         return estimates
 
-    # ------------------------------------------------------------------
-    # CSV reload
-    # ------------------------------------------------------------------
-
-    def _csv_reload_loop(self) -> None:
-        while not self._stop.is_set():
-            if self.course_csv and self.course_csv.exists():
-                try:
-                    mtime = self.course_csv.stat().st_mtime
-                except OSError:
-                    mtime = None
-                if mtime is not None and mtime != self._csv_mtime:
-                    try:
-                        n = self.registry.load_csv(self.course_csv)
-                        # Re-register all courses so weight edits propagate to existing entries.
-                        for course in self.registry.all_courses():
-                            self.scheduler.register_class(course)
-                        self._csv_mtime = mtime
-                        logger.info("CSV reloaded (%d courses); mtime changed", n)
-                    except Exception as exc:
-                        logger.warning("CSV reload failed: %s", exc)
-            self._stop.wait(self.reload_interval)
-
-    # ------------------------------------------------------------------
-    # Residency DB persistence
-    # ------------------------------------------------------------------
-
-    def _db_persist_loop(self) -> None:
-        # _stop.wait() returns True when the event fires, False on timeout.
-        # Loop until stop is signalled, then do a final flush before exiting.
-        while not self._stop.wait(self._db_persist_interval):
-            self._persist_residency_to_db()
-        self._persist_residency_to_db()
-
-    def _persist_residency_to_db(self) -> None:
-        if self.residency_store is None:
-            return
-        try:
-            rows = self.residency_stats.dump()
-            self.residency_store.save(rows)
-            logger.info("Persisted %d residency strata to DB", len(rows))
-        except Exception as exc:
-            logger.warning("Residency DB persist failed: %s", exc)
-
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -1214,23 +1196,12 @@ class LaneSchedulerController:
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Lane-based Priority Scheduler")
 
-    # --- Kubernetes connection ---
     p.add_argument("--kubeconfig", default=KUBECONFIG,
                    help="Path to kubeconfig (default: $KUBECONFIG; omit for in-cluster config)")
-
-    # --- Course registry ---
-    p.add_argument("--course-csv", default=COURSE_CSV,
-                   help="Path to registrar CSV (default: %(default)s)")
-    p.add_argument("--reload-interval", type=float, default=RELOAD_INTERVAL,
-                   help="How often to check the course CSV for changes, in seconds (default: %(default)s)")
-
-    # --- Scheduling cycle ---
     p.add_argument("--cycle-interval", type=float, default=CYCLE_INTERVAL,
                    help="Scheduling cycle interval in seconds (default: %(default)s)")
     p.add_argument("--dispatch-k", type=int, default=DISPATCH_K,
                    help="Max jobs admitted per lane per cycle (default: %(default)s)")
-
-    # --- Priority scoring formula ---
     p.add_argument("--alpha", type=float, default=ALPHA,
                    help="Aging boost scale α in P=W×Mode×Age/U (default: %(default)s)")
     p.add_argument("--t-half-interactive", type=float, default=T_HALF_INTERACTIVE,
@@ -1239,8 +1210,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Batch aging half-life in seconds (default: %(default)s)")
     p.add_argument("--util-window", type=float, default=UTIL_WINDOW,
                    help="Utilization rolling window in seconds (default: %(default)s)")
-
-    # --- Residency priors ---
     p.add_argument("--interactive-mean-pct", type=float, default=INTERACTIVE_MEAN_PCT,
                    help="Interactive residency mean as fraction of deadline (default: %(default)s)")
     p.add_argument("--interactive-std-pct", type=float, default=INTERACTIVE_STD_PCT,
@@ -1250,56 +1219,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-std-pct", type=float, default=BATCH_STD_PCT,
                    help="Batch residency std as fraction of deadline (default: %(default)s)")
     p.add_argument("--prior-weight", type=float, default=PRIOR_WEIGHT,
-                   help="Bayesian prior pseudo-count for per-course residency (default: %(default)s)")
+                   help="Bayesian prior pseudo-count for per-group residency (default: %(default)s)")
     p.add_argument("--ewma-alpha", type=float, default=EWMA_ALPHA,
-                   help="EWMA smoothing factor for per-course residency (0,1); higher = faster adaptation (default: %(default)s)")
-
-    # --- Wait-time cache ---
+                   help="EWMA smoothing factor for per-group residency (default: %(default)s)")
     p.add_argument("--wait-cache-interval", type=float, default=WAIT_CACHE_INTERVAL,
                    help="Wait-time cache refresh interval in seconds (default: %(default)s)")
-
-    # --- Residency DB ---
-    p.add_argument("--residency-db", default=RESIDENCY_DB,
-                   help="Path to SQLite DB for persisting learned residency parameters "
-                        "(omit or empty to disable; also set via LANE_RESIDENCY_DB)")
-    p.add_argument("--db-persist-interval", type=float, default=DB_PERSIST_INTERVAL,
-                   help="How often to flush residency state to the DB, in seconds "
-                        "(default: %(default)s; also set via LANE_DB_PERSIST_INTERVAL)")
     p.add_argument("--default-active-deadline-seconds", type=int, default=DEFAULT_ACTIVE_DEADLINE,
-                   help="Default activeDeadlineSeconds applied to pods that have none set "
-                        "(default: %(default)s; also set via LANE_DEFAULT_ACTIVE_DEADLINE_SECONDS)")
-
-    # --- Kubernetes label/taint wiring ---
-    p.add_argument("--course-label", default=LABEL_COURSE,
-                   help="Pod label key for course identifier (default: %(default)s)")
+                   help="Default activeDeadlineSeconds for pods that have none set (default: %(default)s)")
+    p.add_argument("--course-label", default=LABEL_SCHED_GROUP,
+                   help="Pod label key for scheduling group identifier (default: %(default)s)")
+    p.add_argument("--user-label", default=LABEL_USER,
+                   help="Pod label key for username / per-user fairness (default: %(default)s)")
     p.add_argument("--batch-label", default=LABEL_BATCH,
                    help="Pod label key for batch mode flag (default: %(default)s)")
     p.add_argument("--gpu-class-label", default=LABEL_GPU_CLASS,
                    help="Label key on both pods and nodes identifying the GPU class (default: %(default)s)")
     p.add_argument("--scheduling-gate-name", default=SCHEDULING_GATE_NAME,
                    help="Name of the scheduling gate injected by the mutating webhook (default: %(default)s)")
-    p.add_argument("--inhibit-taint-key", default=INHIBIT_TAINT_KEY,
-                   help="Inhibitory scheduling-gate taint key (default: %(default)s)")
-    p.add_argument("--inhibit-taint-value", default=INHIBIT_TAINT_VALUE,
-                   help="Inhibitory scheduling-gate taint value (default: %(default)s)")
-
-    # --- Operational ---
     p.add_argument("--web-port", type=int, default=WEB_PORT,
                    help="Port for the queue-snapshot dashboard (0 = disabled, default: %(default)s)")
     p.add_argument("--dry-run", action="store_true", default=DRY_RUN,
-                   help="Log what would be done without patching pods or creating events "
-                        "(also set via LANE_DRY_RUN=true)")
+                   help="Log what would be done without patching pods or creating events")
     p.add_argument("--no-unknown-gpu-class-events", action="store_true",
                    default=NO_UNKNOWN_GPU_CLASS_EVENTS,
-                   help=(
-                       "Suppress Warning events for pods whose gpu-class label is not "
-                       "managed by this controller (useful when multiple schedulers or "
-                       "ungated GPU classes coexist in the same cluster). "
-                       "Also set via LANE_NO_UNKNOWN_GPU_CLASS_EVENTS=true."
-                   ))
+                   help="Suppress Warning events for pods with unmanaged gpu-class labels")
     p.add_argument("--log-level", default=LOG_LEVEL,
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-                   help="Logging verbosity (also set via LANE_LOG_LEVEL, default: %(default)s)")
+                   help="Logging verbosity (default: %(default)s)")
     return p
 
 
@@ -1311,27 +1257,22 @@ def main() -> None:
         datefmt = "%Y-%m-%dT%H:%M:%S",
     )
 
-    # Propagate CLI overrides for Kubernetes wiring to every module that reads them.
-    # These modules capture env vars as module-level constants at import time; updating
-    # the attributes here ensures CLI flags take precedence regardless of import order.
+    # Propagate CLI overrides to modules that capture env vars at import time
     import lane_scheduler.core.node_capacity as _nc
     import lane_scheduler.k8s.pod_translator as _pt
-    _nc.INHIBIT_TAINT_KEY   = args.inhibit_taint_key
-    _nc.INHIBIT_TAINT_VALUE = args.inhibit_taint_value
+    _nc.INHIBIT_TAINT_KEY   = args.scheduling_gate_name  # kept for node tracker compat
     _nc.GPU_CLASS_LABEL_KEY = args.gpu_class_label
-    _pt.LABEL_COURSE        = args.course_label
+    _pt.LABEL_SCHED_GROUP   = args.course_label
+    _pt.LABEL_USER          = args.user_label
     _pt.LABEL_BATCH         = args.batch_label
     _pt.LABEL_GPU_CLASS     = args.gpu_class_label
     _pt._GPU_TAINT_KEY      = args.gpu_class_label
     _pt.SCHEDULING_GATE_NAME = args.scheduling_gate_name
-    # Also update the names imported into this module's own namespace, which are
-    # referenced by _enqueue() and _upsert_running() as module globals.
     _g = globals()
-    _g['LABEL_COURSE']         = args.course_label
+    _g['LABEL_SCHED_GROUP']    = args.course_label
     _g['LABEL_GPU_CLASS']      = args.gpu_class_label
     _g['SCHEDULING_GATE_NAME'] = args.scheduling_gate_name
 
-    # Load Kubernetes config
     if args.kubeconfig:
         k8s_config.load_kube_config(config_file=args.kubeconfig)
     else:
@@ -1343,21 +1284,10 @@ def main() -> None:
 
     core_v1 = client.CoreV1Api()
 
-    # ----------------------------------------------------------------
-    # GPU class discovery — MUST happen before any Lane reference
-    # ----------------------------------------------------------------
     gpu_classes = discover_gpu_classes(core_v1)
     initialise_lanes(gpu_classes)
 
-    # Load course registry
-    registry = CourseRegistry()
-    csv_path = Path(args.course_csv)
-    if csv_path.exists():
-        registry.load_csv(csv_path)
-        logger.info("Loaded %d courses from %s", len(registry), csv_path)
-    else:
-        logger.warning("Course CSV not found at %s — all courses will use fallback inference",
-                       csv_path)
+    registry = SchedGroupRegistry()
 
     sched_config = SchedulerConfig(
         alpha               = args.alpha,
@@ -1377,45 +1307,22 @@ def main() -> None:
             std_pct  = args.batch_std_pct,
         ),
     }
-    logger.info(
-        "Residency profiles — interactive: mean=%.0f%% std=%.0f%%  "
-        "batch: mean=%.0f%% std=%.0f%%",
-        args.interactive_mean_pct * 100, args.interactive_std_pct * 100,
-        args.batch_mean_pct * 100,       args.batch_std_pct * 100,
-    )
-
-    residency_store: Optional[ResidencyStore] = None
-    if args.residency_db:
-        db_path = Path(args.residency_db)
-        try:
-            residency_store = ResidencyStore(db_path)
-            logger.info("Residency store opened at %s", db_path)
-        except Exception as exc:
-            logger.warning(
-                "Failed to open residency DB at %s: %s — continuing without persistence",
-                db_path, exc,
-            )
 
     controller = LaneSchedulerController(
-        core_v1                      = core_v1,
-        registry                     = registry,
-        sched_config                 = sched_config,
-        residency_profiles           = residency_profiles,
-        prior_weight                 = args.prior_weight,
-        ewma_alpha                   = args.ewma_alpha,
-        course_csv                   = csv_path,
-        cycle_interval               = args.cycle_interval,
-        reload_interval              = args.reload_interval,
-        wait_cache_interval          = args.wait_cache_interval,
-        residency_store              = residency_store,
-        db_persist_interval          = args.db_persist_interval,
-        web_port                     = args.web_port,
-        dry_run                      = args.dry_run,
-        no_unknown_gpu_class_events  = args.no_unknown_gpu_class_events,
-        default_active_deadline      = args.default_active_deadline_seconds,
+        core_v1                     = core_v1,
+        registry                    = registry,
+        sched_config                = sched_config,
+        residency_profiles          = residency_profiles,
+        prior_weight                = args.prior_weight,
+        ewma_alpha                  = args.ewma_alpha,
+        cycle_interval              = args.cycle_interval,
+        wait_cache_interval         = args.wait_cache_interval,
+        web_port                    = args.web_port,
+        dry_run                     = args.dry_run,
+        no_unknown_gpu_class_events = args.no_unknown_gpu_class_events,
+        default_active_deadline     = args.default_active_deadline_seconds,
     )
 
-    # Graceful shutdown on SIGTERM (Kubernetes) and SIGINT (local Ctrl-C)
     signal.signal(signal.SIGTERM, lambda *_: controller.stop())
     signal.signal(signal.SIGINT,  lambda *_: controller.stop())
 

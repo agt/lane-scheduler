@@ -1,20 +1,18 @@
 """
 Integration-layer unit tests.
-Tests course_registry, pod_translator, and node_capacity
+Tests sched_group_registry, pod_translator, and node_capacity
 without requiring a live Kubernetes cluster.
 """
 
-import csv
-import tempfile
 import unittest
-from pathlib import Path
 
 from lane_scheduler.core.scheduler import (
-    Lane, initialise_lanes, lane_for_gpu_class,
+    Lane, SchedGroup, Job, PriorityScorer, SchedulerConfig,
+    initialise_lanes, lane_for_gpu_class,
 )
-from lane_scheduler.core.course_registry import CourseRegistry
+from lane_scheduler.core.sched_group_registry import SchedGroupRegistry
 from lane_scheduler.k8s.pod_translator import (
-    admission_patch, needs_scheduling, pod_to_job, NO_COURSE_LABEL,
+    admission_patch, needs_scheduling, pod_to_job, NO_SCHED_GROUP_LABEL,
 )
 from lane_scheduler.core.node_capacity import (
     NodeCapacityTracker, GPU_CLASS_LABEL_KEY,
@@ -39,15 +37,6 @@ def _gpu(cls):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _write_csv(rows):
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False)
-    writer = csv.DictWriter(tmp, fieldnames=["course_id", "weight"])
-    writer.writeheader()
-    writer.writerows(rows)
-    tmp.close()
-    return Path(tmp.name)
-
-
 def _make_pod(
     name="test-pod", namespace="jsmith", uid="uid-001",
     phase="Pending", node_name=None,
@@ -56,7 +45,6 @@ def _make_pod(
 ):
     if containers is None:
         containers = [{"name": "c", "resources": {"requests": {"cpu": "2"}}}]
-    # Default: Pending pods without a nodeName carry the lane-scheduler gate.
     if scheduling_gates is None and phase == "Pending" and node_name is None:
         scheduling_gates = [{"name": SCHEDULING_GATE_NAME}]
     return {
@@ -76,8 +64,6 @@ def _gpu_class_taint(gpu_class):
 def _make_node(
     name="node-1", ready=True, unschedulable=False,
     cpu="32", gpu=None, gpu_class=None,
-    # has_inhibit_taint kept for backward compatibility but no longer affects
-    # NodeCapacityTracker (nodes are now identified by gpu-class label).
     has_inhibit_taint=True,
 ):
     taints = []
@@ -97,11 +83,15 @@ def _make_node(
     }
 
 
-def _gpu_pod(gpu_class, batch=False, gpu_count="1"):
+def _gpu_pod(gpu_class, batch=False, gpu_count="1",
+             user=None, namespace="jsmith"):
     labels = {"dsmlp/course": "CSE234_SP26_A00", "gpu-class": gpu_class}
     if batch:
         labels["dsmlp/batch"] = "true"
+    if user is not None:
+        labels["dsmlp/user"] = user
     return _make_pod(
+        namespace=namespace,
         labels=labels,
         containers=[{"name": "c", "resources": {"requests": {
             "cpu": "4", "nvidia.com/gpu": gpu_count,
@@ -110,101 +100,33 @@ def _gpu_pod(gpu_class, batch=False, gpu_count="1"):
 
 
 # ---------------------------------------------------------------------------
-# CourseRegistry
+# SchedGroupRegistry
 # ---------------------------------------------------------------------------
 
-class TestCourseRegistry(unittest.TestCase):
+class TestSchedGroupRegistry(unittest.TestCase):
 
-    def test_csv_load(self):
-        path = _write_csv([
-            {"course_id": "CSE101_SP26_A00", "weight": 0.270},
-            {"course_id": "CSE234_SP26_A00", "weight": 0.775},
-        ])
-        reg = CourseRegistry()
-        self.assertEqual(reg.load_csv(path), 2)
-        c = reg.get("CSE101_SP26_A00")
-        self.assertAlmostEqual(c.class_weight, 0.270)
+    def test_always_returns_weight_one(self):
+        reg = SchedGroupRegistry()
+        g = reg.get("CSE234_SP26_A00")
+        self.assertAlmostEqual(g.weight, 1.0)
 
-    def test_weight_values(self):
-        path = _write_csv([
-            {"course_id": "A", "weight": 0.07},
-            {"course_id": "B", "weight": 0.27},
-            {"course_id": "C", "weight": 0.77},
-        ])
-        reg = CourseRegistry()
-        reg.load_csv(path)
-        self.assertAlmostEqual(reg.get("A").class_weight, 0.07)
-        self.assertAlmostEqual(reg.get("B").class_weight, 0.27)
-        self.assertAlmostEqual(reg.get("C").class_weight, 0.77)
+    def test_returns_scoped_sched_group(self):
+        reg = SchedGroupRegistry()
+        g = reg.get("CSE101_SP26_A00")
+        self.assertIsInstance(g, SchedGroup)
+        self.assertEqual(g.sched_group_id, "CSE101_SP26_A00")
 
-    def test_fallback_on_unknown_course(self):
-        reg = CourseRegistry()
-        c   = reg.get("UNKNOWN_SP26_A00")
-        self.assertAlmostEqual(c.class_weight, 1.0)
+    def test_unknown_id_returns_weight_one(self):
+        reg = SchedGroupRegistry()
+        g = reg.get("NONEXISTENT_GROUP")
+        self.assertAlmostEqual(g.weight, 1.0)
 
-    def test_fallback_cached(self):
-        reg = CourseRegistry()
-        self.assertIs(reg.get("CSE101_SP26_A00"), reg.get("CSE101_SP26_A00"))
-
-    def test_missing_column_raises(self):
-        tmp = _write_csv([{"course_id": "X", "weight": 1.0}])
-        tmp.write_text("course_id\nX\n")
-        with self.assertRaises(ValueError):
-            CourseRegistry().load_csv(tmp)
-
-    def test_bad_weight_skipped(self):
-        path = _write_csv([
-            {"course_id": "CSE101_SP26_A00", "weight": "bad"},
-            {"course_id": "CSE234_SP26_A00", "weight": 0.77},
-        ])
-        self.assertEqual(CourseRegistry().load_csv(path), 1)
-
-    def test_nonpositive_weight_skipped(self):
-        path = _write_csv([
-            {"course_id": "CSE101_SP26_A00", "weight": -1.0},
-            {"course_id": "CSE234_SP26_A00", "weight": 0.77},
-        ])
-        self.assertEqual(CourseRegistry().load_csv(path), 1)
-
-    def test_glob_star_matches(self):
-        path = _write_csv([{"course_id": "RITS_*", "weight": 0.5}])
-        reg = CourseRegistry()
-        self.assertEqual(reg.load_csv(path), 1)
-        c = reg.get("RITS_CS101_SP26_A00")
-        self.assertAlmostEqual(c.class_weight, 0.5)
-        self.assertEqual(c.class_id, "RITS_CS101_SP26_A00")
-
-    def test_exact_beats_glob(self):
-        path = _write_csv([
-            {"course_id": "RITS_CS101_SP26_A00", "weight": 0.9},
-            {"course_id": "RITS_*", "weight": 0.5},
-        ])
-        reg = CourseRegistry()
-        reg.load_csv(path)
-        self.assertAlmostEqual(reg.get("RITS_CS101_SP26_A00").class_weight, 0.9)
-
-    def test_first_glob_wins(self):
-        path = _write_csv([
-            {"course_id": "RITS_CS*", "weight": 0.3},
-            {"course_id": "RITS_*",   "weight": 0.7},
-        ])
-        reg = CourseRegistry()
-        reg.load_csv(path)
-        self.assertAlmostEqual(reg.get("RITS_CS101_SP26_A00").class_weight, 0.3)
-
-    def test_glob_no_match_falls_back(self):
-        path = _write_csv([{"course_id": "RITS_*", "weight": 0.5}])
-        reg = CourseRegistry()
-        reg.load_csv(path)
-        self.assertAlmostEqual(reg.get("OTHER_101_SP26_A00").class_weight, 1.0)
-
-    def test_glob_cached(self):
-        path = _write_csv([{"course_id": "RITS_*", "weight": 0.5}])
-        reg = CourseRegistry()
-        reg.load_csv(path)
-        first  = reg.get("RITS_CS101_SP26_A00")
-        second = reg.get("RITS_CS101_SP26_A00")
-        self.assertIs(first, second)
+    def test_different_ids_each_get_weight_one(self):
+        reg = SchedGroupRegistry()
+        ids = ["CSE101", "CSE234", "GRAD-501", "__unlabelled__"]
+        for gid in ids:
+            g = reg.get(gid)
+            self.assertAlmostEqual(g.weight, 1.0, msg=f"failed for {gid!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +141,6 @@ class TestNeedsScheduling(unittest.TestCase):
         self.assertTrue(needs_scheduling(pod))
 
     def test_pending_without_gate_does_not(self):
-        # Gate already removed (admitted) — should not be re-enqueued.
         pod = _make_pod(phase="Pending", scheduling_gates=[])
         self.assertFalse(needs_scheduling(pod))
 
@@ -265,7 +186,7 @@ class TestPodToJob(unittest.TestCase):
     def test_no_course_label(self):
         pod = _gpu_pod("small")
         del pod["metadata"]["labels"]["dsmlp/course"]
-        self.assertEqual(pod_to_job(pod).class_id, NO_COURSE_LABEL)
+        self.assertEqual(pod_to_job(pod).sched_group_id, NO_SCHED_GROUP_LABEL)
 
     def test_batch_label_case_insensitive(self):
         for val in ("true", "True", "TRUE"):
@@ -273,10 +194,18 @@ class TestPodToJob(unittest.TestCase):
             pod["metadata"]["labels"]["dsmlp/batch"] = val
             self.assertTrue(pod_to_job(pod).batch)
 
-    def test_student_id_is_namespace(self):
-        pod = _gpu_pod("small")
-        pod["metadata"]["namespace"] = "alice"
-        self.assertEqual(pod_to_job(pod).student_id, "alice")
+    def test_username_from_dsmlp_user_label(self):
+        pod = _gpu_pod("small", user="alice")
+        self.assertEqual(pod_to_job(pod).username, "alice")
+
+    def test_username_falls_back_to_namespace(self):
+        """When dsmlp/user label is absent, username falls back to namespace."""
+        pod = _gpu_pod("small", namespace="jsmith-ns")
+        self.assertEqual(pod_to_job(pod).username, "jsmith-ns")
+
+    def test_username_label_overrides_namespace(self):
+        pod = _gpu_pod("small", user="rgarcia", namespace="some-other-ns")
+        self.assertEqual(pod_to_job(pod).username, "rgarcia")
 
     def test_unrecognised_gpu_class_raises(self):
         with self.assertRaises(ValueError):
@@ -344,7 +273,7 @@ class TestNodeCapacityTracker(unittest.TestCase):
 
     def test_node_without_gpu_class_label_ignored(self):
         t = NodeCapacityTracker()
-        t.upsert(_make_node(cpu="64"))  # no gpu_class → not tracked
+        t.upsert(_make_node(cpu="64"))
         for v in t.lane_capacity().values():
             self.assertAlmostEqual(v, 0.0)
 
@@ -368,7 +297,6 @@ class TestNodeCapacityTracker(unittest.TestCase):
         self.assertAlmostEqual(t.lane_capacity()[_gpu("medium")], 0.0)
 
     def test_node_identified_by_gpu_class_label(self):
-        # Nodes are now identified by gpu-class label, not inhibitory taint.
         t = NodeCapacityTracker()
         t.upsert(_make_node(name="gn", gpu="4", gpu_class="medium",
                             has_inhibit_taint=False))
@@ -386,8 +314,6 @@ class TestNodeCapacityTracker(unittest.TestCase):
         self.assertAlmostEqual(t.lane_capacity()[_gpu("medium")], 4.0)
 
     def test_node_with_unmanaged_gpu_class_excluded(self):
-        """A node labelled with a gpu-class the controller doesn't manage
-        must be excluded from the pool entirely."""
         t = NodeCapacityTracker()
         t.upsert(_make_node(name="unknown-gpu", cpu="32", gpu="4",
                             gpu_class="h200"))
@@ -407,7 +333,7 @@ class TestNodeCapacityTracker(unittest.TestCase):
 
     def test_lane_for_node_cpu_only_node_not_tracked(self):
         t = NodeCapacityTracker()
-        t.upsert(_make_node(cpu="64"))  # no gpu_class
+        t.upsert(_make_node(cpu="64"))
         self.assertIsNone(t.lane_for_node("default-node"))
 
     def test_lane_for_node_after_remove(self):
@@ -422,23 +348,17 @@ class TestNodeCapacityTracker(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestDeleteClearsSchedulerQueue(unittest.TestCase):
-    """A DELETED pod event must clear the Job from scheduler._queues too,
-    not just from controller _pending."""
 
     def _build_controller(self):
-        # Build a minimal controller without K8s API.  We exercise only
-        # _enqueue / _handle_pod_event / _dequeue paths.
         from lane_scheduler.k8s.controller import LaneSchedulerController
         from lane_scheduler.core.scheduler import SchedulerConfig
         from lane_scheduler.estimation.wait_estimator import ResidencyProfile
-        from lane_scheduler.core.course_registry import CourseRegistry
 
-        # Stub core_v1 — never called by these tests
         class _StubCore:
             def create_namespaced_event(self, **kw): pass
             def patch_namespaced_pod(self, **kw):    pass
 
-        registry = CourseRegistry()
+        registry = SchedGroupRegistry()
         return LaneSchedulerController(
             core_v1            = _StubCore(),
             registry           = registry,
@@ -458,13 +378,11 @@ class TestDeleteClearsSchedulerQueue(unittest.TestCase):
             phase="Pending",
         )
         ctrl._handle_pod_event({"type": "ADDED", "object": pod})
-        # Pod is enqueued in scheduler
         self.assertGreater(
             sum(sum(cm.values())
                 for cm in ctrl.scheduler.queue_depths().values()),
             0,
         )
-        # DELETED should clear both controller _pending AND scheduler queue
         ctrl._handle_pod_event({"type": "DELETED", "object": pod})
         self.assertNotIn("uid-DEL", ctrl._pending)
         self.assertEqual(ctrl.scheduler.queue_depths(), {})
@@ -477,22 +395,19 @@ class TestDeleteClearsSchedulerQueue(unittest.TestCase):
 class TestBatchModePenalty(unittest.TestCase):
 
     def _job(self, batch, submit_time=0.0):
-        from lane_scheduler.core.scheduler import Job
-        j = Job(job_id="J", class_id="C", student_id="S",
+        j = Job(job_id="J", sched_group_id="C", username="S",
                 lane=_gpu("medium"), batch=batch)
         j.submit_time = submit_time
         return j
 
     def setUp(self):
-        from lane_scheduler.core.scheduler import PriorityScorer, SchedulerConfig
         self.cfg    = SchedulerConfig()
         self.scorer = PriorityScorer(self.cfg)
-        from lane_scheduler.core.scheduler import CourseClass
-        self.course = CourseClass("C", class_weight=0.75)
+        self.group  = SchedGroup(sched_group_id="C", weight=0.75)
 
     def test_interactive_beats_batch(self):
-        si = self.scorer.score(self._job(False), self.course, 0.1, 100.0)
-        sb = self.scorer.score(self._job(True),  self.course, 0.1, 100.0)
+        si = self.scorer.score(self._job(False), self.group, 0.1, 100.0)
+        sb = self.scorer.score(self._job(True),  self.group, 0.1, 100.0)
         self.assertGreater(si, sb)
 
     def test_batch_ages_slower(self):
@@ -502,12 +417,11 @@ class TestBatchModePenalty(unittest.TestCase):
         self.assertGreater(bi, bb)
 
     def test_batch_eventually_drains(self):
-        """Long-waiting batch job should outscore a brand-new interactive job."""
         fresh_interactive = self._job(False, submit_time=1_000_000.0)
         old_batch         = self._job(True,  submit_time=0.0)
         now               = 1_000_000.0
-        si = self.scorer.score(fresh_interactive, self.course, 0.1, now)
-        sb = self.scorer.score(old_batch,         self.course, 0.1, now)
+        si = self.scorer.score(fresh_interactive, self.group, 0.1, now)
+        sb = self.scorer.score(old_batch,         self.group, 0.1, now)
         self.assertGreater(sb, si)
 
 

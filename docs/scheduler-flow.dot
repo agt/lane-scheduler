@@ -33,8 +33,8 @@ digraph lane_scheduler {
     // ═════════════════════════════════════════════════════════════
     // 1 · KUBERNETES — SCHEDULINGGATED PODS
     //     An external mutating admission controller has injected
-    //     schedulingGates: [{name: "lane-scheduler"}] and the
-    //     gpu-class label onto every pod before it reaches us.
+    //     schedulingGates: [{name: "lane-scheduler"}], the
+    //     gpu-class label, and the dsmlp/user label onto every pod.
     // ═════════════════════════════════════════════════════════════
 
     subgraph cluster_pending {
@@ -46,13 +46,13 @@ digraph lane_scheduler {
 
         node [shape=note]
 
-        p_cse250  [label="CSE250\nkwong · gpu-small"
+        p_cse250  [label="CSE250\nkwong · gpu-small\ndsmlp/user=kwong"
                    style=filled fillcolor="#fffde7"]
 
-        p_cse310  [label="★ CSE310\nrgarcia · gpu-medium"
+        p_cse310  [label="★ CSE310\nrgarcia · gpu-medium\ndsmlp/user=rgarcia"
                    style=filled fillcolor="#ffe0b2" penwidth=2.5 color="#bf360c"]
 
-        p_cse234  [label="CSE234\npatel · gpu-large"
+        p_cse234  [label="CSE234\npatel · gpu-large\ndsmlp/user=patel"
                    style=filled fillcolor="#fffde7"]
 
         // invisible rank-enforcing spine
@@ -64,7 +64,7 @@ digraph lane_scheduler {
     // 2 · POD WATCH THREAD
     // ═════════════════════════════════════════════════════════════
 
-    watch [label="Pod Watch Thread\ndetects pods whose schedulingGate = lane-scheduler\ntranslates pod → Job domain object\nsubmits to per-lane queue"
+    watch [label="Pod Watch Thread\ndetects pods whose schedulingGate = lane-scheduler\ntranslates pod → Job domain object (username from dsmlp/user)\nsubmits to per-lane queue"
            shape=rectangle style="filled,rounded"
            fillcolor="#f5f5f5" penwidth=1.5
            width=3.8]
@@ -92,8 +92,8 @@ digraph lane_scheduler {
             fillcolor = white
 
             q_gs [shape=record style=filled fillcolor="#fffde7"
-                  label="{ CSE250 | 3 pending | W = 0.27 }\
-                       |{ CSE310 | 1 pending | W = 0.77 }"]
+                  label="{ CSE250 | 3 pending | W = 1.0 }\
+                       |{ CSE310 | 1 pending | W = 1.0 }"]
         }
 
         subgraph cluster_q_gm {
@@ -103,8 +103,8 @@ digraph lane_scheduler {
 
             q_gm [shape=record style=filled fillcolor="#ffe0b2"
                   penwidth=2.5 color="#bf360c"
-                  label="{ ★ CSE310 · rgarcia | rank \#1 | W = 0.77 }\
-                       |{   CSE250           | rank \#2 | W = 0.27 }"]
+                  label="{ ★ CSE310 · rgarcia | rank \#1 | W = 1.0 }\
+                       |{   CSE250  · kwong  | rank \#2 | W = 1.0 }"]
         }
 
         subgraph cluster_q_gl {
@@ -113,7 +113,7 @@ digraph lane_scheduler {
             fillcolor = white
 
             q_gl [shape=record style=filled fillcolor="#fffde7"
-                  label="{ CSE234 | 2 pending | W = 0.77 }"]
+                  label="{ CSE234 | 2 pending | W = 1.0 }"]
         }
     }
 
@@ -136,15 +136,15 @@ digraph lane_scheduler {
 
         scorer [label="Priority Scorer\nP = W × Mode × Age / U\n\
 ─────────────────────────────\n\
-CSE310: 0.77 × 1.0 × 1.4 / 0.10 ≈ 10.8  ← top\n\
-CSE250: 0.27 × 1.0 × 1.1 / 0.60 ≈  0.5\n\
+CSE310: 1.0 × 1.0 × 1.4 / 0.10 ≈ 14.0  ← top\n\
+CSE250: 1.0 × 1.0 × 1.1 / 0.60 ≈  1.8\n\
 (scores all jobs across all lanes)"
                 shape=box style="filled,rounded" fillcolor=white
                 width=4]
 
         capgate [label="Capacity Gate\n\
-free = lane_cap − running_units − admitted_units\n\
-gpu-medium: 6 − 5 − 0 = 1 unit free  ✓\n\
+free = lane_cap − running_units − k8s_pending_units − admitted_units\n\
+gpu-medium: 6 − 5 − 0 − 0 = 1 unit free  ✓\n\
 (pod requires 1 GPU unit → admitted)"
                  shape=diamond style=filled fillcolor=white
                  width=4.5]

@@ -42,7 +42,6 @@ class TestEWMA(unittest.TestCase):
         self.assertAlmostEqual(e.variance, 0.0)
 
     def test_mean_tracks_recent_shift(self):
-        # Seed with 0.0, then switch to 1.0 — EWMA mean should rise.
         e = _EWMA(alpha=0.3)
         for _ in range(20):
             e.update(0.0)
@@ -66,8 +65,6 @@ class TestEWMA(unittest.TestCase):
 
     def test_variance_reference_value(self):
         # Pinned against manual West-EWVar step-through (α=0.2, inputs [0.2,0.8,0.2,0.8]).
-        # step2: var=0.8*(0+0.2*0.6²)=0.0576  step3: 0.8*(0.0576+0.2*0.12²)=0.048384
-        # step4: 0.8*(0.048384+0.2*0.504²)=0.07934976
         e = _EWMA(alpha=0.2)
         for v in (0.2, 0.8, 0.2, 0.8):
             e.update(v)
@@ -87,7 +84,6 @@ class TestEWMA(unittest.TestCase):
             self.assertEqual(e.n, i + 1)
 
     def test_higher_alpha_adapts_faster(self):
-        # Both start at 0.0, then see only 1.0 observations.
         e_slow = _EWMA(alpha=0.05)
         e_fast = _EWMA(alpha=0.5)
         for _ in range(5):
@@ -117,10 +113,10 @@ class TestPriorOnly(unittest.TestCase):
         self.assertAlmostEqual(profile.mean_pct, BATCH.mean_pct)
         self.assertAlmostEqual(profile.std_pct,  BATCH.std_pct)
 
-    def test_unknown_course_returns_prior(self):
+    def test_unknown_sched_group_returns_prior(self):
         stats = _stats()
         stats.record("CSE101", "cpu", batch=False, residency_pct=0.6)
-        # Different course — should still get pure prior
+        # Different scheduling group — should still get pure prior
         profile = stats.profile_for("CSE999", "cpu", batch=False)
         self.assertAlmostEqual(profile.mean_pct, INTERACTIVE.mean_pct)
 
@@ -137,25 +133,21 @@ class TestShrinkage(unittest.TestCase):
 
     def test_single_observation_stays_near_prior(self):
         stats = _stats(prior_weight=10.0)
-        # One observation far from prior (1.0 vs prior mean 0.4)
         stats.record("CSE101", "cpu", batch=False, residency_pct=1.0)
         profile = stats.profile_for("CSE101", "cpu", batch=False)
-        # Posterior mean should be between prior and observation, closer to prior
         self.assertGreater(profile.mean_pct, INTERACTIVE.mean_pct)
         self.assertLess(profile.mean_pct, 1.0)
-        # With weight=10, n=1: posterior = (10*0.4 + 1*1.0)/11 ≈ 0.454
         expected = (10 * 0.4 + 1 * 1.0) / 11
         self.assertAlmostEqual(profile.mean_pct, expected, places=4)
 
-    def test_many_observations_converge_to_course_mean(self):
+    def test_many_observations_converge_to_group_mean(self):
         stats = _stats(prior_weight=10.0)
-        course_mean = 0.9
+        group_mean = 0.9
         for _ in range(1000):
             stats.record("CSE234", "gpu-medium", batch=False,
-                         residency_pct=course_mean)
+                         residency_pct=group_mean)
         profile = stats.profile_for("CSE234", "gpu-medium", batch=False)
-        # With 1000 obs vs weight=10, should be very close to course_mean
-        self.assertAlmostEqual(profile.mean_pct, course_mean, places=2)
+        self.assertAlmostEqual(profile.mean_pct, group_mean, places=2)
 
     def test_higher_prior_weight_slower_convergence(self):
         stats_low  = _stats(prior_weight=1.0)
@@ -165,17 +157,14 @@ class TestShrinkage(unittest.TestCase):
                 s.record("CSE101", "cpu", batch=False, residency_pct=0.9)
         p_low  = stats_low.profile_for("CSE101",  "cpu", batch=False)
         p_high = stats_high.profile_for("CSE101", "cpu", batch=False)
-        # Low prior weight → posterior mean closer to 0.9
-        # High prior weight → posterior mean stays closer to 0.4
         self.assertGreater(p_low.mean_pct, p_high.mean_pct)
 
     def test_posterior_mean_always_between_prior_and_ewma(self):
         stats = _stats(prior_weight=5.0)
         for pct in (0.1, 0.3, 0.8, 1.0):
             stats.record("CSE150", "cpu", batch=False, residency_pct=pct)
-        profile   = stats.profile_for("CSE150", "cpu", batch=False)
-        acc       = stats._strata[list(stats._strata.keys())[0]]
-        # Posterior is a weighted blend of prior_mean and EWMA mean.
+        profile = stats.profile_for("CSE150", "cpu", batch=False)
+        acc     = stats._strata[list(stats._strata.keys())[0]]
         lo = min(INTERACTIVE.mean_pct, acc.mean)
         hi = max(INTERACTIVE.mean_pct, acc.mean)
         self.assertGreaterEqual(profile.mean_pct, lo - 1e-9)
@@ -188,7 +177,6 @@ class TestShrinkage(unittest.TestCase):
             stats.record("CSE234", "gpu-large", batch=True,  residency_pct=0.95)
         p_int   = stats.profile_for("CSE234", "gpu-large", batch=False)
         p_batch = stats.profile_for("CSE234", "gpu-large", batch=True)
-        # Interactive should have lower mean than batch for this course
         self.assertLess(p_int.mean_pct, p_batch.mean_pct)
 
     def test_different_lanes_tracked_independently(self):
@@ -209,9 +197,8 @@ class TestEdgeCases(unittest.TestCase):
 
     def test_residency_clamped_to_zero_one(self):
         stats = _stats()
-        stats.record("C", "cpu", batch=False, residency_pct=1.5)   # over 1
-        stats.record("C", "cpu", batch=False, residency_pct=-0.1)  # under 0
-        # Both should be clamped; mean should be between 0 and 1
+        stats.record("C", "cpu", batch=False, residency_pct=1.5)
+        stats.record("C", "cpu", batch=False, residency_pct=-0.1)
         profile = stats.profile_for("C", "cpu", batch=False)
         self.assertGreaterEqual(profile.mean_pct, 0.0)
         self.assertLessEqual(profile.mean_pct,    1.0)
@@ -226,8 +213,6 @@ class TestEdgeCases(unittest.TestCase):
 
     def test_posterior_std_positive(self):
         stats = _stats()
-        # All identical observations → sample variance = 0, but prior variance
-        # contributes, so posterior std should still be positive
         for _ in range(50):
             stats.record("C", "cpu", batch=False, residency_pct=0.5)
         p = stats.profile_for("C", "cpu", batch=False)
@@ -251,7 +236,6 @@ class TestEdgeCases(unittest.TestCase):
             )
 
     def test_thread_safety_concurrent_updates(self):
-        """Multiple threads recording should not corrupt the accumulator."""
         import threading
         stats = _stats()
         errors = []

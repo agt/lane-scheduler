@@ -1,8 +1,8 @@
 """
 Cluster Priority Scheduler
 Weighted fair-share scheduling across heterogeneous resource lanes,
-with per-class weight-based priority, wait-time aging,
-and within-class fair scheduling via minimum-running-then-oldest-job ordering.
+with per-group weight-based priority, wait-time aging,
+and within-group per-user fairness via minimum-running-then-oldest-job ordering.
 
 Lane model
 ~~~~~~~~~~
@@ -71,9 +71,6 @@ def lane_for_gpu_class(gpu_class: str, strict: bool = False) -> Optional[str]:
     If the class is unrecognised:
       - strict=True  → return None silently
       - strict=False → return None with a warning logged
-
-    Callers that need a runtime fallback (e.g. based on current capacity)
-    should call best_fallback_gpu_lane(lane_capacity) separately.
     """
     if Lane is None:
         raise RuntimeError("initialise_lanes() has not been called")
@@ -92,11 +89,7 @@ def lane_for_gpu_class(gpu_class: str, strict: bool = False) -> Optional[str]:
 
 
 def best_fallback_gpu_lane(lane_capacity: dict) -> Optional[str]:
-    """
-    Return the GPU lane with the most allocatable capacity.
-    Lexically earliest lane name breaks ties.
-    Returns None if no GPU lanes are known.
-    """
+    """Return the GPU lane with the most allocatable capacity."""
     gpu_lanes = sorted(lane_capacity)
     if not gpu_lanes:
         return None
@@ -115,12 +108,12 @@ def is_known_gpu_class(gpu_class: str) -> bool:
 EPSILON = 0.01  # utilization floor to prevent div-by-zero; not operator-tunable
 
 DEFAULTS = dict(
-    alpha              = 1.0,    # urgency scaling factor
-    t_half_interactive = 600.0,  # 10 min — interactive job aging half-life (s)
-    t_half_batch       = 7200.0, # 2 hr  — batch job aging half-life (s)
-    batch_mode_penalty = 0.3,    # batch jobs score at 30% of interactive baseline
-    utilization_window = 300.0,  # rolling utilization window (s)
-    dispatch_k         = 8,      # max jobs dispatched per lane per cycle
+    alpha              = 1.0,
+    t_half_interactive = 600.0,
+    t_half_batch       = 7200.0,
+    batch_mode_penalty = 0.3,
+    utilization_window = 300.0,
+    dispatch_k         = 8,
 )
 
 
@@ -163,23 +156,23 @@ class SchedulerConfig:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class CourseClass:
-    """A class section registered with the scheduler."""
-    class_id:     str
-    class_weight: float  # scheduling weight supplied directly from the course CSV
+class SchedGroup:
+    """A scheduling group registered with the scheduler."""
+    sched_group_id: str
+    weight:         float  # scheduling weight (default 1.0 from SchedGroupRegistry)
 
 
 @dataclass
 class Job:
-    """A single schedulable unit submitted by a student."""
-    job_id:        str
-    class_id:      str
-    student_id:    str
-    lane:          str
-    batch:         bool  = False
-    submit_time:   float = field(default_factory=time.monotonic)
-    dispatch_time: Optional[float] = field(default=None, repr=False)
-    complete_time: Optional[float] = field(default=None, repr=False)
+    """A single schedulable unit submitted by a user."""
+    job_id:         str
+    sched_group_id: str
+    username:       str
+    lane:           str
+    batch:          bool  = False
+    submit_time:    float = field(default_factory=time.monotonic)
+    dispatch_time:  Optional[float] = field(default=None, repr=False)
+    complete_time:  Optional[float] = field(default=None, repr=False)
     resource_units: float = 1.0
 
     def wait_seconds(self, now: Optional[float] = None) -> float:
@@ -193,7 +186,7 @@ class Job:
 
 class UtilizationTracker:
     """
-    Tracks resource consumption per (class_id, lane) over a rolling window.
+    Tracks resource consumption per (sched_group_id, lane) over a rolling window.
     Usage events are timestamped; expired events are purged on read.
     """
 
@@ -202,30 +195,27 @@ class UtilizationTracker:
         self._lane_capacity = lane_capacity
         self._events: dict[tuple, list] = defaultdict(list)
 
-    def record(self, class_id: str, lane: str, units: float,
+    def record(self, sched_group_id: str, lane: str, units: float,
                now: Optional[float] = None) -> None:
         ts = now if now is not None else time.monotonic()
-        self._events[(class_id, lane)].append((ts, units))
+        self._events[(sched_group_id, lane)].append((ts, units))
 
-    def utilization(self, class_id: str, lane: str,
+    def utilization(self, sched_group_id: str, lane: str,
                     now: Optional[float] = None) -> float:
         ts     = now if now is not None else time.monotonic()
         cutoff = ts - self._window
-        key    = (class_id, lane)
+        key    = (sched_group_id, lane)
         filtered = [(t, u) for t, u in self._events[key] if t >= cutoff]
         if filtered:
             self._events[key] = filtered
         else:
-            # Drop the key entirely to bound long-term memory growth
             self._events.pop(key, None)
         total    = sum(u for _, u in filtered)
         capacity = self._lane_capacity.get(lane, 1.0)
         return total / (capacity * self._window) if capacity > 0 else 0.0
 
-    def reset(self, class_id: str, lane: str) -> None:
-        self._events.pop((class_id, lane), None)
-
-
+    def reset(self, sched_group_id: str, lane: str) -> None:
+        self._events.pop((sched_group_id, lane), None)
 
 
 # ---------------------------------------------------------------------------
@@ -243,14 +233,14 @@ class PriorityScorer:
         t_half = self.config.t_half(job.batch)
         return 1.0 + self.config.alpha * math.log1p(wait / t_half)
 
-    def score(self, job: Job, course: CourseClass,
+    def score(self, job: Job, group: SchedGroup,
               utilization: float, now: float) -> float:
         """
-        P(j, l) = W(c) × Mode(j) × Age(j) / U(c, l)
+        P(j, l) = W(g) × Mode(j) × Age(j) / U(g, l)
         Higher score → higher priority.
         """
         u = max(utilization, EPSILON)
-        return (course.class_weight
+        return (group.weight
                 * self.config.mode_weight(job.batch)
                 * self.age_boost(job, now)
                 / u)
@@ -264,11 +254,13 @@ class Scheduler:
     """
     Priority scheduler with:
     - Per-lane independent queues (one per GPU class)
-    - Per-class scheduling weights supplied externally (from course CSV)
+    - Per-group scheduling weights (supplied by SchedGroupRegistry; default 1.0)
     - Log-aging wait boost with batch/interactive half-lives
     - Batch mode penalty keeps interactive jobs preferred
-    - Fewest-running-then-oldest-submit student ordering within each class
-    - Rolling-window utilization tracking
+    - Fewest-running-then-oldest-submit user ordering within each group
+    - Rolling-window utilization tracking per (sched_group, lane)
+
+    Queue structure: {lane: {sched_group_id: {username: [Job, ...]}}}
     """
 
     def __init__(
@@ -281,21 +273,19 @@ class Scheduler:
         self.lane_capacity = lane_capacity
         self.config  = config or SchedulerConfig()
         self.scorer  = PriorityScorer(self.config)
-        self._classes: dict[str, CourseClass] = {}
+        self._groups: dict[str, SchedGroup] = {}
         self.util    = UtilizationTracker(self.config.utilization_window, lane_capacity)
 
-        # Per-lane per-student count of currently running pods, set each cycle
-        # by the controller before calling cycle().  Used by _top_student().
-        self._running_counts: dict = {}  # {lane: {student_id: count}}
+        # Per-lane per-user count of currently running pods, set each cycle
+        # by the controller before calling cycle().  Used by _top_user().
+        self._running_counts: dict = {}  # {lane: {username: count}}
 
-        # Single re-entrant lock protects _classes, _queues, _running_counts,
-        # and the internal state of self.util (which is not accessed from outside
-        # Scheduler).  Acquisition order: any controller lock (_pending_lock,
-        # _admitted_lock, _running_lock, _running_ctx_lock) is acquired BEFORE
-        # Scheduler._lock, never after.
+        # Single re-entrant lock protects _groups, _queues, _running_counts,
+        # and self.util.  Acquisition order: any controller lock is acquired
+        # BEFORE Scheduler._lock, never after.
         self._lock = threading.RLock()
 
-        # {lane: {class_id: {student_id: [Job, ...]}}}
+        # {lane: {sched_group_id: {username: [Job, ...]}}}
         self._queues: dict = {
             lane: defaultdict(lambda: defaultdict(list))
             for lane in Lane
@@ -303,98 +293,89 @@ class Scheduler:
 
     def set_lane_capacity(self, lane_capacity: dict) -> None:
         """Atomically replace the lane-capacity view used for scoring."""
-        # TODO: add a set_lane_capacity() setter to UtilizationTracker so this
-        # doesn't reach into a private attribute.  Also consider defaulting the
-        # unknown-lane divisor to a small epsilon rather than 1.0 to bound the
-        # priority boost for lanes that haven't yet appeared in the capacity map.
         with self._lock:
             self.lane_capacity = lane_capacity
             self.util._lane_capacity = lane_capacity
 
     def update_running_counts(self, counts: dict) -> None:
         """
-        Replace the per-lane per-student running-pod count snapshot.
-
+        Replace the per-lane per-user running-pod count snapshot.
+        counts: {lane_str: {username: int}}
         Called by the controller at the start of each cycle, before cycle().
-        counts: {lane_str: {student_id: int}}
         """
         with self._lock:
             self._running_counts = counts
 
-    def _top_student(self, active_students: set[str], lane: str,
-                     student_map: dict) -> str:
+    def _top_user(self, active_users: set[str], lane: str,
+                  user_map: dict) -> str:
         """
-        Return the highest-priority student among *active_students* for *lane*.
+        Return the highest-priority user among *active_users* for *lane*.
 
         Priority rules (applied in order):
           1. Fewest currently running pods in this lane.
-          2. Oldest pending job submit_time (FIFO among equally-loaded students).
+          2. Oldest pending job submit_time (FIFO among equally-loaded users).
         """
         running_in_lane = self._running_counts.get(lane, {})
-        min_running = min(running_in_lane.get(s, 0) for s in active_students)
-        candidates = [s for s in active_students
-                      if running_in_lane.get(s, 0) == min_running]
-        return min(candidates, key=lambda s: student_map[s][0].submit_time)
+        min_running = min(running_in_lane.get(u, 0) for u in active_users)
+        candidates = [u for u in active_users
+                      if running_in_lane.get(u, 0) == min_running]
+        return min(candidates, key=lambda u: user_map[u][0].submit_time)
 
     def _iter_top_candidates(
         self, lane: str, now: float
-    ) -> Iterator[tuple[str, float, Job, CourseClass]]:
-        """Yield (class_id, score, job, course) for the top student of each active
-        class in *lane*.  Must be called while holding self._lock."""
-        for class_id, student_map in self._queues[lane].items():
-            course          = self._classes[class_id]
-            active_students = {s for s, jobs in student_map.items() if jobs}
-            if not active_students:
+    ) -> Iterator[tuple[str, float, Job, SchedGroup]]:
+        """Yield (sched_group_id, score, job, group) for the top user of each
+        active group in *lane*.  Must be called while holding self._lock."""
+        for sched_group_id, user_map in self._queues[lane].items():
+            group        = self._groups[sched_group_id]
+            active_users = {u for u, jobs in user_map.items() if jobs}
+            if not active_users:
                 continue
-            student_id = self._top_student(active_students, lane, student_map)
-            job        = student_map[student_id][0]
-            util       = self.util.utilization(class_id, lane, now)
-            score      = self.scorer.score(job, course, util, now)
-            yield class_id, score, job, course
+            username = self._top_user(active_users, lane, user_map)
+            job      = user_map[username][0]
+            util     = self.util.utilization(sched_group_id, lane, now)
+            score    = self.scorer.score(job, group, util, now)
+            yield sched_group_id, score, job, group
 
-    def register_class(self, course: CourseClass) -> None:
+    def register_group(self, group: SchedGroup) -> None:
         with self._lock:
-            self._classes[course.class_id] = course
+            self._groups[group.sched_group_id] = group
         logger.info(
-            "Registered class %s (weight=%.4f)",
-            course.class_id, course.class_weight,
+            "Registered scheduling group %s (weight=%.4f)",
+            group.sched_group_id, group.weight,
         )
 
-    def has_class(self, class_id: str) -> bool:
+    def has_group(self, sched_group_id: str) -> bool:
         with self._lock:
-            return class_id in self._classes
+            return sched_group_id in self._groups
 
     def submit(self, job: Job) -> None:
         with self._lock:
-            if job.class_id not in self._classes:
-                raise ValueError(f"Unknown class_id: {job.class_id!r}")
-            self._queues[job.lane][job.class_id][job.student_id].append(job)
+            if job.sched_group_id not in self._groups:
+                raise ValueError(f"Unknown sched_group_id: {job.sched_group_id!r}")
+            self._queues[job.lane][job.sched_group_id][job.username].append(job)
         logger.debug(
-            "Queued job %s [lane=%s student=%s class=%s]",
-            job.job_id, job.lane,
-            job.student_id, job.class_id,
+            "Queued job %s [lane=%s user=%s group=%s]",
+            job.job_id, job.lane, job.username, job.sched_group_id,
         )
 
     def remove_job(self, job_id: str) -> Optional[Job]:
         """
         Remove the queued job whose job_id matches and return it, or None.
-
-        Walks all lanes; intended for handling pod DELETED events so an
-        orphan Job doesn't sit in the scheduler queue after the pod is gone.
-        Does not touch utilization tracking (the job never ran).
+        Walks all lanes; used for pod DELETED events.
         """
         with self._lock:
             for lane in Lane:
                 lane_queue = self._queues[lane]
-                for class_id, student_map in list(lane_queue.items()):
-                    for student_id, jobs in list(student_map.items()):
+                for sched_group_id, user_map in list(lane_queue.items()):
+                    for username, jobs in list(user_map.items()):
                         for idx, job in enumerate(jobs):
                             if job.job_id == job_id:
                                 del jobs[idx]
                                 if not jobs:
-                                    del student_map[student_id]
-                                if not student_map:
-                                    del lane_queue[class_id]
+                                    del user_map[username]
+                                if not user_map:
+                                    del lane_queue[sched_group_id]
                                 return job
         return None
 
@@ -402,7 +383,7 @@ class Scheduler:
         """
         Run one scheduling cycle.  Returns dispatched jobs.
 
-        1. Per lane: select one candidate per class via _top_student().
+        1. Per lane: select one candidate per group via _top_user().
         2. Score candidates; dispatch top-K.
         3. Update utilization tracker.
         """
@@ -416,52 +397,43 @@ class Scheduler:
                 if not lane_queue:
                     continue
 
-                # Step 1 — one candidate per class
-                candidates: list[tuple[float, Job, CourseClass]] = [
-                    (score, job, course)
-                    for _, score, job, course in self._iter_top_candidates(lane, now)
+                candidates: list[tuple[float, Job, SchedGroup]] = [
+                    (score, job, group)
+                    for _, score, job, group in self._iter_top_candidates(lane, now)
                 ]
 
                 if not candidates:
                     continue
 
-                # Step 2 — dispatch top-K
                 candidates.sort(key=lambda x: x[0], reverse=True)
-                for score, job, course in candidates[: self.config.dispatch_k]:
+                for score, job, group in candidates[: self.config.dispatch_k]:
                     job.dispatch_time = now
-                    student_jobs = self._queues[lane][job.class_id][job.student_id]
-                    student_jobs.pop(0)
-                    if not student_jobs:
-                        del self._queues[lane][job.class_id][job.student_id]
-                    if not self._queues[lane][job.class_id]:
-                        del self._queues[lane][job.class_id]
+                    user_jobs = self._queues[lane][job.sched_group_id][job.username]
+                    user_jobs.pop(0)
+                    if not user_jobs:
+                        del self._queues[lane][job.sched_group_id][job.username]
+                    if not self._queues[lane][job.sched_group_id]:
+                        del self._queues[lane][job.sched_group_id]
 
-                    self.util.record(job.class_id, lane, job.resource_units, now)
+                    self.util.record(job.sched_group_id, lane, job.resource_units, now)
                     dispatched.append(job)
                     log_entries.append((job, lane, score))
 
-        # Logging outside the lock — formatting is non-trivial and the
-        # dispatched job objects we hold are safe to read after release.
         for job, lane, score in log_entries:
             mode = "batch" if job.batch else "interactive"
             logger.info(
                 "Dispatched job %s [lane=%s mode=%s score=%.4f "
-                "class=%s student=%s wait=%.1fs]",
+                "group=%s user=%s wait=%.1fs]",
                 job.job_id, lane, mode, score,
-                job.class_id, job.student_id, job.wait_seconds(now),
+                job.sched_group_id, job.username, job.wait_seconds(now),
             )
         return dispatched
 
     def _scored_candidates(self, lane: str,
                            now: Optional[float] = None) -> list[tuple[float, Job]]:
         """
-        Return all per-class top candidates for *lane*, scored and sorted
-        descending.  Used by the wait-time snapshot to compute ranks in one
-        pass rather than calling queue_rank() per pod (O(Q) vs O(Q²)).
-
-        Acquires self._lock for the full scoring pass; callers on other threads
-        (e.g. the wait-cache background thread) will contend with cycle() at
-        the per-lane granularity.
+        Return all per-group top candidates for *lane*, scored and sorted
+        descending.  Used by the wait-time snapshot builder.
         """
         now = now if now is not None else time.monotonic()
         with self._lock:
@@ -476,11 +448,7 @@ class Scheduler:
                    now: Optional[float] = None) -> Optional[int]:
         """
         Return the 1-based position of job_uid in the scored lane queue,
-        or None if the job is not found.
-
-        Rank 1 means the job is next to be dispatched from its lane.
-        This re-scores all candidates, so it should be called sparingly
-        (e.g. on-demand per student request, not every cycle).
+        or None if not found.
         """
         now = now if now is not None else time.monotonic()
         with self._lock:
@@ -495,24 +463,24 @@ class Scheduler:
             return None
 
     def queue_depths(self) -> dict[str, dict[str, int]]:
-        """Returns {lane_name: {class_id: job_count}} for monitoring."""
+        """Returns {lane_name: {sched_group_id: job_count}} for monitoring."""
         result: dict[str, dict[str, int]] = {}
         with self._lock:
             for lane in Lane:
                 counts = {
-                    class_id: sum(len(jobs) for jobs in student_map.values())
-                    for class_id, student_map in self._queues[lane].items()
+                    sched_group_id: sum(len(jobs) for jobs in user_map.values())
+                    for sched_group_id, user_map in self._queues[lane].items()
                 }
                 if counts:
                     result[lane] = counts
         return result
 
-    def class_scores(self, lane: str,
+    def group_scores(self, lane: str,
                      now: Optional[float] = None) -> dict[str, float]:
-        """Current top-candidate score per class in a lane.  For dashboards."""
+        """Current top-candidate score per group in a lane.  For dashboards."""
         now = now if now is not None else time.monotonic()
         with self._lock:
             return {
-                class_id: score
-                for class_id, score, _, _ in self._iter_top_candidates(lane, now)
+                sched_group_id: score
+                for sched_group_id, score, _, _ in self._iter_top_candidates(lane, now)
             }

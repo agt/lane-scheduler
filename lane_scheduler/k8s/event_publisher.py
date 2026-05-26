@@ -15,18 +15,11 @@ Batch pods (dsmlp/batch=true):
     - Immediately at the next snapshot (emit_count 0)
     - At 25%, 50%, 75% of the first median wait estimate (emit_count 1–3)
     - No further emissions after emit_count 3
-    Milestone times are anchored to enqueued_at + fraction × first_median,
-    computed once at emit_count 0 so they stay stable as the queue evolves.
 
 Each Event is a fresh create (not a patch/update) so that kubectl and
 the Kubernetes event stream show distinct timestamped entries.
 Errors on individual creates are logged and skipped — event publication
 is best-effort and must never block or crash the scheduling loop.
-
-RBAC requirement (add to ClusterRole):
-    - apiGroups: [""]
-      resources: ["events"]
-      verbs: ["create"]
 """
 
 from __future__ import annotations
@@ -40,16 +33,13 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ---- Interactive emission schedule constants --------------------------------
-_EARLY_INTERVAL  =  60.0   # seconds between events for the first 5 minutes
-_EARLY_COUNT     =   5     # number of early-interval events
-_LATE_INTERVAL   = 300.0   # seconds between events after early phase
+_EARLY_INTERVAL  =  60.0
+_EARLY_COUNT     =   5
+_LATE_INTERVAL   = 300.0
 
-# ---- Batch emission schedule constants -------------------------------------
-_BATCH_FRACTIONS = (0.25, 0.50, 0.75)   # milestones as fractions of median wait
-_BATCH_MAX_EMITS = 1 + len(_BATCH_FRACTIONS)   # emit 0 (immediate) + 3 milestones
+_BATCH_FRACTIONS = (0.25, 0.50, 0.75)
+_BATCH_MAX_EMITS = 1 + len(_BATCH_FRACTIONS)
 
-# ---- Event field constants -------------------------------------------------
 _EVENT_REASON         = "SchedulingQueued"
 _EVENT_REASON_IGNORED = "UnknownGpuClass"
 _EVENT_TYPE           = "Normal"
@@ -65,20 +55,6 @@ _POD_KIND        = "Pod"
 
 @dataclass
 class PodEventSchedule:
-    """
-    Tracks emission state for a single queued pod.
-
-    pod_uid          : Kubernetes pod UID (used as Event name suffix)
-    pod_name         : pod name
-    namespace        : pod namespace
-    resource_version : pod resourceVersion (for involvedObject)
-    batch            : True if this is a batch pod
-    enqueued_at      : time.monotonic() when first seen in queue
-    emit_count       : number of events published so far (0 = none yet)
-    next_emit_at     : time.monotonic() of next scheduled emission (0 → immediate)
-    _anchor_wait     : median wait (s) recorded at first emission; used to pin
-                       batch milestone times so they don't drift as queue changes
-    """
     pod_uid:          str
     pod_name:         str
     namespace:        str
@@ -86,47 +62,27 @@ class PodEventSchedule:
     batch:            bool  = False
     enqueued_at:      float = field(default_factory=time.monotonic)
     emit_count:       int   = 0
-    next_emit_at:     float = 0.0   # 0 → emit at first opportunity
-    _anchor_wait:     float = 0.0   # set on first batch emission
+    next_emit_at:     float = 0.0
+    _anchor_wait:     float = 0.0
 
     def due(self, now: float) -> bool:
         return now >= self.next_emit_at
 
     def advance(self, now: float, median_wait: float = 0.0) -> None:
-        """
-        Increment emit_count and compute next_emit_at.
-
-        For batch pods:
-            emit_count 0 → anchor on median_wait; schedule milestone 1 (25%)
-            emit_count 1 → schedule milestone 2 (50%)
-            emit_count 2 → schedule milestone 3 (75%)
-            emit_count 3 → no further emissions (next_emit_at = +inf)
-
-        For interactive pods:
-            emit_count 1–5 → every _EARLY_INTERVAL seconds
-            emit_count 6+  → every _LATE_INTERVAL seconds
-        """
         self.emit_count += 1
 
         if self.batch:
             if self.emit_count == 1:
-                # Anchor the milestone clock on the first observed median wait
                 self._anchor_wait = max(median_wait, 0.0)
             elif (self._anchor_wait > 0
                   and median_wait > 2.0 * self._anchor_wait):
-                # Re-anchor on >=2x growth so milestones track reality when
-                # the queue grew much longer than first estimated.  We never
-                # shrink the anchor (a transient dip should not pull
-                # milestones forward).
                 self._anchor_wait = median_wait
             if self.emit_count < _BATCH_MAX_EMITS:
                 fraction = _BATCH_FRACTIONS[self.emit_count - 1]
                 self.next_emit_at = self.enqueued_at + fraction * self._anchor_wait
-                # Guard: if the milestone is already in the past, fire immediately
                 if self.next_emit_at <= now:
                     self.next_emit_at = now
             else:
-                # All batch milestones consumed — never emit again
                 self.next_emit_at = float("inf")
         else:
             if self.emit_count <= _EARLY_COUNT:
@@ -136,29 +92,28 @@ class PodEventSchedule:
 
     @property
     def exhausted(self) -> bool:
-        """True if no further events will be emitted for this pod."""
         return self.next_emit_at == float("inf")
 
 
 # ---------------------------------------------------------------------------
-# Class-scoped queue position tracker
+# Group-scoped queue position tracker
 # ---------------------------------------------------------------------------
 
-def class_rank(
-    pod_uid:    str,
-    class_id:   str,
-    candidates: "list[tuple[float, object]]",   # [(score, job), ...] sorted desc
+def group_rank(
+    pod_uid:         str,
+    sched_group_id:  str,
+    candidates:      "list[tuple[float, object]]",
 ) -> Optional[int]:
     """
     Return 1-based position of pod_uid within candidates that belong to
-    class_id.  Returns None if not found.
+    sched_group_id.  Returns None if not found.
     """
-    class_rank_val = 0
+    group_rank_val = 0
     for _, job in candidates:
-        if job.class_id == class_id:
-            class_rank_val += 1
+        if job.sched_group_id == sched_group_id:
+            group_rank_val += 1
             if job.job_id == pod_uid:
-                return class_rank_val
+                return group_rank_val
     return None
 
 
@@ -171,18 +126,6 @@ class EventPublisher:
     Maintains per-pod emission schedules and publishes Kubernetes Events.
 
     Thread safety: all public methods are safe to call from any thread.
-    The actual API call (_create_event) is blocking but short; it is called
-    from the WaitTimeCache background thread via publish_due(), so it does
-    not block the scheduling cycle.
-
-    Usage
-    -----
-        publisher = EventPublisher(core_v1)
-        publisher.register(uid, pod)     # called from _enqueue
-        publisher.deregister(uid)        # called from _dequeue
-        publisher.publish_due(           # called from _build_wait_snapshot
-            estimates, lane_candidates, pending_snapshot, now
-        )
     """
 
     def __init__(
@@ -199,7 +142,7 @@ class EventPublisher:
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
-    # Registration (called from controller enqueue/dequeue)
+    # Registration
     # ------------------------------------------------------------------
 
     def register(self, uid: str, pod: dict) -> None:
@@ -217,12 +160,12 @@ class EventPublisher:
                 )
 
     def deregister(self, uid: str) -> None:
-        """Remove a pod from the emission schedule (dispatched or deleted)."""
+        """Remove a pod from the emission schedule."""
         with self._lock:
             self._schedules.pop(uid, None)
 
     # ------------------------------------------------------------------
-    # Publication (called from snapshot background thread)
+    # Publication
     # ------------------------------------------------------------------
 
     def publish_due(
@@ -234,14 +177,6 @@ class EventPublisher:
     ) -> int:
         """
         Publish events for all pods whose next_emit_at <= now.
-
-        Parameters
-        ----------
-        estimates        : {uid: WaitEstimate} from the current snapshot
-        lane_candidates  : {lane: [(score, job), ...]} for class-rank lookup
-        pending_snapshot : {uid: pod_dict} copy of pending pods
-        now              : current time.monotonic()
-
         Returns the number of events successfully created.
         """
         with self._lock:
@@ -253,23 +188,21 @@ class EventPublisher:
             uid = sched.pod_uid
             est = estimates.get(uid)
             if est is None:
-                # Pod left the queue between snapshot and now — deregister
                 self.deregister(uid)
                 continue
 
-            # Compute class-scoped queue rank
             pod = pending_snapshot.get(uid)
-            c_rank = None
+            g_rank = None
             if pod is not None:
                 for lane, candidates in lane_candidates.items():
                     for _, job in candidates:
                         if job.job_id == uid:
-                            c_rank = class_rank(uid, job.class_id, candidates)
+                            g_rank = group_rank(uid, job.sched_group_id, candidates)
                             break
-                    if c_rank is not None:
+                    if g_rank is not None:
                         break
 
-            message = _format_message(est, c_rank)
+            message = _format_message(est, g_rank)
             ok = self._create_event(sched, message, now)
             if ok:
                 with self._lock:
@@ -288,8 +221,7 @@ class EventPublisher:
     def warn_unknown_gpu_class(self, uid: str, pod: dict) -> None:
         """
         Emit a single Warning event for a pod whose gpu-class label is not
-        managed by this controller.  Idempotent: only one event per pod UID.
-        Does nothing when no_unknown_gpu_class_events=True.
+        managed by this controller.  Idempotent.
         """
         if self._no_unknown_gpu_class_events:
             return
@@ -354,9 +286,6 @@ class EventPublisher:
 
         try:
             self._core_v1.create_namespaced_event(namespace=namespace, body=body)
-            logger.debug(
-                "UnknownGpuClass event created for pod %s/%s", namespace, pod_name,
-            )
         except Exception as exc:
             logger.warning(
                 "Failed to create UnknownGpuClass event for pod %s/%s: %s",
@@ -364,7 +293,6 @@ class EventPublisher:
             )
 
     def clear_unknown_gpu_warning(self, uid: str) -> None:
-        """Remove uid from the warned set (called when pod is deleted)."""
         with self._lock:
             self._unknown_gpu_warned.discard(uid)
 
@@ -374,22 +302,15 @@ class EventPublisher:
 
     def _create_event(self, sched: PodEventSchedule, message: str,
                       now: float) -> bool:
-        """
-        POST a new Event to the Kubernetes API.
-        Returns True on success, False on error.
-        """
         import datetime as dt
         now_dt    = dt.datetime.now(dt.timezone.utc)
         microtime = now_dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         timestamp = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        # Use a name that is unique per emission to avoid K8s deduplication
-        # collapsing distinct events into one (which increments 'count' rather
-        # than creating new entries visible in 'kubectl describe pod').
         event_name = (
             f"{sched.pod_name}.queue.{sched.emit_count:04d}"
             .lower()
-            .replace("_", "-")[:253]   # K8s name length limit
+            .replace("_", "-")[:253]
         )
 
         body = {
@@ -459,7 +380,7 @@ def _fmt_seconds(s: float) -> str:
     return f"{s / 3600:.1f}h"
 
 
-def _format_message(est: "WaitEstimate", class_rank_val: Optional[int]) -> str:
+def _format_message(est: "WaitEstimate", group_rank_val: Optional[int]) -> str:
     """
     Build the Event message string shown in 'kubectl describe pod'.
 
@@ -468,8 +389,8 @@ def _format_message(est: "WaitEstimate", class_rank_val: Optional[int]) -> str:
         Estimated wait: 8.2m (optimistic 4.1m, pessimistic 14.7m).
     """
     rank_str = f"#{est.queue_rank} overall in {est.lane_name} lane"
-    if class_rank_val is not None:
-        rank_str += f", #{class_rank_val} within course"
+    if group_rank_val is not None:
+        rank_str += f", #{group_rank_val} within scheduling group"
 
     wait_str = (
         f"Estimated wait: {_fmt_seconds(est.median_seconds)} "

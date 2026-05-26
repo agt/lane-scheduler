@@ -104,9 +104,9 @@ class WaitEstimate:
     p80 is pessimistic (things clear slower).
     """
     median_seconds: float
-    p20_seconds:    float   # 20th percentile — optimistic
-    p80_seconds:    float   # 80th percentile — pessimistic
-    queue_rank:     int     # pod's position in the scored queue (1 = next up)
+    p20_seconds:    float
+    p80_seconds:    float
+    queue_rank:     int
     lane_name:      str
 
 
@@ -122,17 +122,13 @@ def _phi(x: float) -> float:
 def _finish_prob(t: float, mu: float, sigma: float, age: float) -> float:
     """
     P(pod finishes within next t seconds | it has survived `age` seconds).
-
-    If the pod has already exceeded its expected lifetime (age > mu + 4σ)
-    we treat finish as near-certain within any positive t.
-    If sigma is effectively zero, use a deterministic threshold.
     """
     if sigma < 1e-9:
         return 1.0 if age + t >= mu else 0.0
 
     surv_at_age = 1.0 - _phi((age - mu) / sigma)
     if surv_at_age < 1e-12:
-        return 1.0   # pod is almost certainly already done / at deadline
+        return 1.0
 
     prob_finish_by_age_plus_t = _phi((age + t - mu) / sigma)
     prob_finish_by_age        = _phi((age       - mu) / sigma)
@@ -148,10 +144,6 @@ def _expected_slots(
     """
     Returns (mean, variance) of the number of resource slots expected to
     free up within the next t seconds across all running pods.
-
-    Each pod contributes an independent Bernoulli(p) to the slot count,
-    weighted by resource_units.  (We approximate weighted slots as
-    independent; covariance terms are small and require joint distributions.)
     """
     mean = 0.0
     var  = 0.0
@@ -159,10 +151,8 @@ def _expected_slots(
         age      = pod.age(now)
         rem      = pod.remaining_max(now)
         if rem <= 0:
-            # Deadline already reached — slot is freed
             p = 1.0
         elif t >= rem:
-            # t extends to or past the hard deadline — pod must finish by then
             p = 1.0
         else:
             profile  = profiles["batch" if pod.batch else "interactive"]
@@ -178,13 +168,11 @@ def _expected_slots(
 # Core estimator
 # ---------------------------------------------------------------------------
 
-# Normal quantiles for p20 and p80
-_Z_P20 = -0.8416   # Φ⁻¹(0.20)
-_Z_P80 =  0.8416   # Φ⁻¹(0.80)
+_Z_P20 = -0.8416
+_Z_P80 =  0.8416
 
-# Search bounds and resolution
-_T_MAX_DEFAULT = 24 * 3600.0   # 24 hours — hard ceiling
-_BISECT_ITERS  = 48            # bisection iterations (~24h / 2^48 ≈ sub-millisecond)
+_T_MAX_DEFAULT = 24 * 3600.0
+_BISECT_ITERS  = 48
 
 
 def _bisect_wait(
@@ -197,22 +185,14 @@ def _bisect_wait(
 ) -> float:
     """
     Find t such that E[slots freed by t] + z_adjust × std(slots) ≈ target_slots.
-
-    z_adjust = 0   → median estimate
-    z_adjust = -0.8416 → p20 (optimistic: slots free sooner)
-    z_adjust = +0.8416 → p80 (pessimistic)
-
-    Uses bisection on a monotone function.
     """
     def f(t: float) -> float:
         mean, var = _expected_slots(t, running, profiles, now)
         std = math.sqrt(var) if var > 0 else 0.0
         return mean + z_adjust * std - target_slots
 
-    # Check if enough slots ever free up within t_max
     f_max = f(t_max)
     if f_max < 0:
-        # Even by the deadline ceiling we don't expect enough slots
         logger.debug(
             "_bisect_wait saturated at t_max=%.0fs "
             "(target_slots=%.2f z_adjust=%.4f)",
@@ -220,7 +200,6 @@ def _bisect_wait(
         )
         return t_max
 
-    # Check if target already met at t=0 (queue rank <= already-freeing pods)
     if f(0.0) >= 0:
         return 0.0
 
@@ -248,36 +227,19 @@ def estimate_wait(
     Estimate how long a pod at position `queue_rank` (1 = next to dispatch)
     will wait before enough slots free up to accommodate it.
 
-    Parameters
-    ----------
-    queue_rank      : 1-based position in the scored lane queue
-    lane_name       : human-readable lane name (for the returned struct)
-    running         : currently running pods in this lane
-    profiles        : {"interactive": ResidencyProfile, "batch": ResidencyProfile}
-    required_units  : resource_units the queued pod needs (default 1)
-    free_units      : resource units already free in the lane (capacity minus
-                      running minus admitted-but-not-yet-running); default 0
-    now             : current time (time.monotonic()); defaults to now
-    t_max           : search ceiling in seconds (default 24 h)
-
-    Returns
-    -------
-    WaitEstimate with median, p20, and p80 in seconds.
+    free_units covers already-free capacity (total minus running minus
+    k8s-pending minus admitted) so rank-1 jobs at the front of a lane
+    with available capacity return t=0 immediately.
     """
     if now is None:
         now = time.monotonic()
 
-    # Target: running-pod slots that must free up before this pod can start.
-    # A pod at rank N needs (N × required_units) total capacity, minus whatever
-    # is already free.  free_units covers capacity that running pods don't occupy,
-    # so we only need the remainder to come from running pods finishing.
     target = max(0.0, float(queue_rank) * required_units - free_units)
 
     median = _bisect_wait(target, running, profiles, now, z_adjust=0.0,     t_max=t_max)
     p20    = _bisect_wait(target, running, profiles, now, z_adjust=_Z_P20,  t_max=t_max)
     p80    = _bisect_wait(target, running, profiles, now, z_adjust=_Z_P80,  t_max=t_max)
 
-    # p20 should be ≤ median ≤ p80; clamp in case of numerical noise
     p20 = min(p20, median)
     p80 = max(p80, median)
 
@@ -297,39 +259,13 @@ def estimate_wait(
 @dataclass
 class CacheEntry:
     estimate:     WaitEstimate
-    computed_at:  float          # time.monotonic() when computed
+    computed_at:  float
 
 
 class WaitTimeCache:
     """
     Computes WaitEstimates for all queued pods on a background thread at a
     fixed cadence, and serves cached results to callers with no blocking.
-
-    Usage
-    -----
-        cache = WaitTimeCache(
-            snapshot_fn  = controller.build_snapshot,
-            interval     = 60.0,
-        )
-        cache.start()
-        ...
-        est = cache.get("pod-uid-abc")   # None until first snapshot completes
-        cache.stop()
-
-    snapshot_fn
-    -----------
-    A zero-argument callable that returns:
-        dict[str, WaitEstimate]   — {pod_uid: WaitEstimate}
-
-    The controller builds this by iterating its pending queues and calling
-    estimate_wait() for each pod.  The callable is invoked on the background
-    thread, so it must be thread-safe (read-only access to shared state is fine
-    if protected by locks).
-
-    Stale entries
-    -------------
-    Entries for pods that have left the queue are removed each snapshot cycle,
-    so the cache never serves estimates for already-dispatched pods.
     """
 
     def __init__(
@@ -348,11 +284,7 @@ class WaitTimeCache:
             name   = "wait-cache",
             daemon = True,
         )
-        self._last_duration: float = 0.0   # seconds the last snapshot took
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+        self._last_duration: float = 0.0
 
     def start(self) -> None:
         if self._thread.is_alive():
@@ -363,18 +295,12 @@ class WaitTimeCache:
     def stop(self) -> None:
         self._stop.set()
 
-    # ------------------------------------------------------------------
-    # Public read API — never blocks
-    # ------------------------------------------------------------------
-
     def get(self, pod_uid: str) -> Optional[WaitEstimate]:
-        """Return the most recent WaitEstimate for pod_uid, or None."""
         with self._lock:
             entry = self._cache.get(pod_uid)
         return entry.estimate if entry is not None else None
 
     def get_with_age(self, pod_uid: str) -> Optional[tuple[WaitEstimate, float]]:
-        """Return (estimate, age_seconds) or None."""
         now = time.monotonic()
         with self._lock:
             entry = self._cache.get(pod_uid)
@@ -383,7 +309,6 @@ class WaitTimeCache:
         return entry.estimate, now - entry.computed_at
 
     def snapshot_age(self) -> Optional[float]:
-        """Seconds since the last snapshot completed, or None if never run."""
         with self._lock:
             if not self._cache:
                 return None
@@ -392,11 +317,9 @@ class WaitTimeCache:
 
     @property
     def last_duration(self) -> float:
-        """Wall-clock seconds the most recent snapshot computation took."""
         return self._last_duration
 
     def all_estimates(self) -> dict[str, "WaitEstimate"]:
-        """Return a snapshot copy of all current estimates (pod_uid → WaitEstimate)."""
         with self._lock:
             return {uid: e.estimate for uid, e in self._cache.items()}
 
@@ -404,12 +327,7 @@ class WaitTimeCache:
         with self._lock:
             return len(self._cache)
 
-    # ------------------------------------------------------------------
-    # Background loop
-    # ------------------------------------------------------------------
-
     def _loop(self) -> None:
-        # Slight initial delay so the controller's watches can populate state
         self._stop.wait(min(self._interval, 15.0))
 
         while not self._stop.is_set():
@@ -447,7 +365,7 @@ class WaitTimeCache:
 # ---------------------------------------------------------------------------
 
 def format_wait(est: WaitEstimate) -> str:
-    """Human-readable one-liner for logs, kubectl describe annotations, etc."""
+    """Human-readable one-liner for logs and kubectl describe annotations."""
     def _fmt(s: float) -> str:
         if s < 60:
             return f"{s:.0f}s"

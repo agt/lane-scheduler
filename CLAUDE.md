@@ -42,14 +42,13 @@ This is a **multi-threaded Kubernetes controller** implementing weighted fair-sh
 
 ### Thread model
 
-`LaneSchedulerController` (k8s/controller.py) runs four independent threads:
+`LaneSchedulerController` (k8s/controller.py) runs three independent threads:
 
 | Thread | Role |
 |--------|------|
-| pod-watch | Enqueues Pending pods; tracks Running/Completed transitions |
+| pod-watch | Enqueues SchedulingGated pods; tracks Pending/Running/Completed transitions |
 | node-watch | Feeds `NodeCapacityTracker` with allocatable capacity per lane |
 | cycle (10 s) | `Scheduler.cycle()` scores jobs and dispatches top-K per lane by patching pod tolerations |
-| csv-reload (30 s poll) | Reloads registrar CSV into `CourseRegistry` when mtime changes |
 
 A background goroutine-style loop (60 s) refreshes `WaitTimeCache` and publishes Kubernetes Events for queued pods.
 
@@ -64,15 +63,26 @@ Pods arrive in `SchedulingGated` state with a `schedulingGates: [{name: "lane-sc
 ### Priority scoring formula
 
 ```
-P(job, lane) = W(course) × Mode(job) × Age(job) / U(course, lane)
+P(job, lane) = W(g) × Mode(job) × Age(job) / U(g, lane)
 ```
 
-- **W** = `class_weight` supplied directly from the course CSV (positive float)
+- **W** = 1.0 for all scheduling groups (`SchedGroupRegistry` is a stub; per-group weights are a future capability)
 - **Mode** = 1.0 (interactive) or 0.3 (batch)
 - **Age** = `1 + α × log(1 + wait / t_half)`  (logarithmic, prevents starvation)
-- **U** = 5-minute rolling utilization (idle courses score higher)
+- **U** = 5-minute rolling utilization (idle scheduling groups score higher)
 
-Within-class fairness is enforced by selecting the student with the **fewest running pods** in that lane; ties broken by oldest pending job submit time (FIFO).
+Within-group fairness is enforced by selecting the user with the **fewest running pods** in that lane; ties broken by oldest pending job submit time (FIFO).
+
+### Pod state machine
+
+Pods transition through four states tracked by the controller:
+
+1. `SchedulingGated` → added to `_pending`
+2. Admitted (after patch) → entry in `_admitted_resources` + `_admitted_with_timestamp`
+3. k8s-Pending (gate removed, not yet Running) → removed from `_admitted_resources`; added to `_kubernetes_pending`
+4. Running → removed from `_kubernetes_pending`; added to `_kubernetes_running`
+
+Capacity gate: `free = lane_cap − running_units − kubernetes_pending_units − admitted_units`
 
 ### Wait-time estimation
 
@@ -90,34 +100,34 @@ All defaults live in `controller.py` lines ~98–127. The most operationally rel
 | `LANE_T_HALF_INTERACTIVE` | 600 s | Interactive aging half-life |
 | `LANE_T_HALF_BATCH` | 7200 s | Batch aging half-life |
 | `LANE_PRIOR_WEIGHT` | 10.0 | Bayesian pseudo-count for residency convergence |
-| `LANE_EWMA_ALPHA` | 0.1 | EWMA smoothing factor for per-class residency; higher = faster adaptation to recent data |
-| `LANE_COURSE_CSV` | `/etc/lane-scheduler/courses.csv` | Registrar CSV path |
+| `LANE_EWMA_ALPHA` | 0.1 | EWMA smoothing factor for per-group residency; higher = faster adaptation to recent data |
 | `LANE_GPU_CLASS_LABEL` | `gpu-class` | Label key on both pods and nodes identifying the GPU class/lane |
 | `LANE_SCHEDULING_GATE_NAME` | `lane-scheduler` | Name of the scheduling gate injected by the mutating webhook |
-| `LANE_COURSE_LABEL` | `dsmlp/course` | Pod label key used to identify the course |
+| `LANE_COURSE_LABEL` | `dsmlp/course` | Pod label key used to identify the scheduling group |
+| `LANE_USER_LABEL` | `dsmlp/user` | Pod label key used to identify the user (falls back to namespace) |
 | `LANE_BATCH_LABEL` | `dsmlp/batch` | Pod label key used to identify batch-mode jobs |
-| `LANE_RESIDENCY_DB` | *(disabled)* | Path to SQLite DB for persisting learned per-(course, lane, batch) EWMA residency parameters across restarts; omit to disable |
-| `LANE_DB_PERSIST_INTERVAL` | 300 s | How often the controller flushes residency state to the DB |
 
 ### Package layout
 
 ```
 lane_scheduler/
   core/
-    scheduler.py        # Priority scoring, Lane strings, Scheduler
-    course_registry.py  # Loads/parses registrar CSV; course weight lookup
-    node_capacity.py    # Watches node labels; aggregates per-lane capacity
+    scheduler.py            # Priority scoring, Lane strings, Scheduler
+    sched_group_registry.py # Stub registry; all scheduling groups default to weight=1.0
+    node_capacity.py        # Watches node labels; aggregates per-lane capacity
   k8s/
-    controller.py       # Thread orchestration; Kubernetes API calls
-    pod_translator.py   # K8s pod dicts ↔ Job domain objects
-    event_publisher.py  # Kubernetes Events for queued pods (emission schedule)
+    controller.py           # Thread orchestration; Kubernetes API calls
+    pod_translator.py       # K8s pod dicts ↔ Job domain objects
+    event_publisher.py      # Kubernetes Events for queued pods (emission schedule)
   estimation/
-    wait_estimator.py   # Truncated-normal model; bisection; WaitTimeCache
-    residency_stats.py  # EWMA online stats; Bayesian shrinkage; seed()/dump() for persistence
-    residency_store.py  # SQLite-backed persistence for EWMA residency parameters
+    wait_estimator.py       # Truncated-normal model; bisection; WaitTimeCache
+    residency_stats.py      # EWMA online stats; Bayesian shrinkage toward cluster prior
+  web/
+    snapshot.py             # Build JSON snapshot of controller state for dashboard
+    server.py               # Stdlib HTTP server; / and /api/snapshot endpoints
 tools/
   simulate.py           # Offline fairness simulator
-tests/                  # 200+ tests; mirrors core/ + estimation/ + k8s/ structure
+tests/                  # 250+ tests; mirrors core/ + estimation/ + k8s/ structure
 deploy/
-  manifests.yaml        # RBAC, Deployment, ConfigMap, CronJob
+  manifests.yaml        # RBAC, Deployment
 ```

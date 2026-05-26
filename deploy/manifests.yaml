@@ -3,16 +3,11 @@
 # ============================================================
 #
 # Apply with:
-#   kubectl apply -f rbac.yaml
-#   kubectl apply -f controller-deployment.yaml
+#   kubectl create namespace lane-scheduler
+#   kubectl apply -f deploy/manifests.yaml
 #
 # Node setup:
-#   Taint ALL managed nodes before deploying:
-#     kubectl taint nodes <node> dsmlp/scheduling-gate=controller:NoSchedule
-#
-#   Label GPU nodes with their GPU class (xsmall|small|medium|large|xlarge),
-#   and taint them so only pods carrying the matching gpu-class toleration
-#   land there:
+#   Label and taint GPU nodes before deploying:
 #     kubectl label nodes <gpu-node> gpu-class=medium
 #     kubectl taint nodes <gpu-node> gpu-class=medium:NoSchedule
 
@@ -58,22 +53,6 @@ subjects:
 
 ---
 # ============================================================
-# Course CSV — mounted as a ConfigMap (replaced daily by a CronJob)
-# ============================================================
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: lane-courses
-  namespace: lane-scheduler
-data:
-  courses.csv: |
-    course_id,weight
-    CSE101_SP26_A00,0.071
-    CSE150_SP26_A00,0.270
-    CSE234_SP26_A00,0.775
-
----
-# ============================================================
 # Controller Deployment
 # ============================================================
 apiVersion: apps/v1
@@ -113,14 +92,8 @@ spec:
               value: "600"
             - name: LANE_T_HALF_BATCH
               value: "7200"
-            - name: LANE_COURSE_CSV
-              value: /etc/lane-scheduler/courses.csv
-            - name: LANE_RELOAD_INTERVAL
-              value: "86400"
-          volumeMounts:
-            - name: courses
-              mountPath: /etc/lane-scheduler
-              readOnly: true
+            - name: LANE_USER_LABEL
+              value: "dsmlp/user"
           resources:
             requests:
               cpu: 100m
@@ -128,46 +101,6 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
-      volumes:
-        - name: courses
-          configMap:
-            name: lane-courses
-
----
-# ============================================================
-# Daily CSV reload CronJob
-# Replaces the ConfigMap data from an external registrar export.
-# Adjust the command to pull from your actual source.
-# ============================================================
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: lane-course-reload
-  namespace: lane-scheduler
-spec:
-  schedule: "0 6 * * *"   # 06:00 daily
-  jobTemplate:
-    spec:
-      template:
-        spec:
-          serviceAccountName: lane-scheduler
-          restartPolicy: OnFailure
-          containers:
-            - name: reload
-              image: bitnami/kubectl:latest
-              command:
-                - /bin/sh
-                - -c
-                - |
-                  # Replace with your actual fetch command, e.g.:
-                  # curl -sf https://registrar.ucsd.edu/export/lane-courses.csv \
-                  #   -o /tmp/courses.csv
-                  #
-                  # Then update the ConfigMap:
-                  kubectl create configmap lane-courses \
-                    --from-file=courses.csv=/tmp/courses.csv \
-                    --dry-run=client -o yaml \
-                    | kubectl apply -f -
 
 ---
 # ============================================================
@@ -180,6 +113,7 @@ spec:
 #   namespace: jsmith         # student's namespace
 #   labels:
 #     dsmlp/course: CSE101_SP26_A00
+#     dsmlp/user: jsmith      # injected by mutating webhook
 # spec:
 #   containers:
 #     - name: notebook
@@ -200,6 +134,7 @@ spec:
 #   labels:
 #     dsmlp/course: CSE234_SP26_A00
 #     dsmlp/batch: "true"
+#     dsmlp/user: jsmith      # injected by mutating webhook
 # spec:
 #   containers:
 #     - name: trainer

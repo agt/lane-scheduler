@@ -53,11 +53,6 @@ tr:last-child td{border-bottom:none}
 .bar-fill{height:100%;border-radius:4px;background:#4caf50;transition:width .3s}
 .bar-fill.warn{background:#ff9800}
 .bar-fill.crit{background:#f44336}
-/* tier badges */
-.badge{display:inline-block;border-radius:3px;padding:1px 6px;font-size:.7rem;font-weight:600}
-.t-intro{background:#e3f2fd;color:#1565c0}
-.t-upper{background:#e8f5e9;color:#2e7d32}
-.t-grad{background:#fce4ec;color:#c62828}
 /* wait cells */
 .w-med{font-weight:600}
 .w-rng{color:#888;font-size:.8rem}
@@ -87,28 +82,28 @@ footer span{white-space:nowrap;display:flex;align-items:center;gap:5px}
           <th class="r">Capacity</th>
           <th>Utilization</th>
           <th class="r">Queued</th>
-          <th class="r">Est. drain (P80)</th>
+          <th class="r">Est. drain (P80)</th>
         </tr>
       </thead>
       <tbody id="lane-body"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
     </table>
   </div>
 
-  <div class="card" id="courses-card">
-    <div class="card-title">Course Queue</div>
+  <div class="card" id="groups-card">
+    <div class="card-title">Scheduling Group Queue</div>
     <table>
       <thead>
         <tr>
-          <th>Course</th>
+          <th>Scheduling Group</th>
           <th class="r">Weight</th>
           <th>Lane</th>
           <th class="r">Running</th>
           <th class="r">Queued</th>
-          <th>Top wait (P50)</th>
-          <th>Tail wait (P80)</th>
+          <th>Top wait (P50)</th>
+          <th>Tail wait (P80)</th>
         </tr>
       </thead>
-      <tbody id="course-body"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
+      <tbody id="group-body"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
     </table>
   </div>
 
@@ -121,9 +116,9 @@ footer span{white-space:nowrap;display:flex;align-items:center;gap:5px}
       <thead>
         <tr>
           <th>Lane</th>
-          <th>Namespace</th>
+          <th>User</th>
           <th class="r">GPUs</th>
-          <th>Course</th>
+          <th>Sched Group</th>
           <th class="r">Running</th>
           <th class="r">Deadline</th>
           <th>Batch</th>
@@ -170,9 +165,9 @@ function renderLanes(lanes) {
       ? Math.min(100, (ln.running_units / ln.capacity_units * 100)).toFixed(0)
       : 0;
     const cls = barCls(ln.running_units, ln.capacity_units);
-    const capLabel = ln.capacity_units + ' GPUs';
-    const runLabel = ln.running_units + ' / ' + ln.capacity_units
-                   + ' (' + pct + '%)';
+    const capLabel = ln.capacity_units + ' GPUs';
+    const runLabel = ln.running_units + ' / ' + ln.capacity_units
+                   + ' (' + pct + '%)';
     return '<tr>'
       + '<td><strong class="mono">' + ln.name + '</strong></td>'
       + '<td class="r">' + ln.node_count + '</td>'
@@ -186,24 +181,23 @@ function renderLanes(lanes) {
   }).join('');
 }
 
-
-function renderCourses(courses) {
-  const tb = document.getElementById('course-body');
-  if (!courses || !courses.length) {
-    tb.innerHTML = '<tr><td colspan="7" class="empty">No courses in queue</td></tr>';
+function renderSchedGroups(groups) {
+  const tb = document.getElementById('group-body');
+  if (!groups || !groups.length) {
+    tb.innerHTML = '<tr><td colspan="7" class="empty">No scheduling groups in queue</td></tr>';
     return;
   }
   const rows = [];
-  courses.forEach(function(c) {
-    const n = c.lanes.length;
-    c.lanes.forEach(function(l, i) {
+  groups.forEach(function(g) {
+    const n = g.lanes.length;
+    g.lanes.forEach(function(l, i) {
       const tailCell = l.queued_count > 1
         ? fmtWait(l.tail_wait)
         : '–';
       if (i === 0) {
         rows.push('<tr>'
-          + '<td rowspan="' + n + '"><strong class="mono">' + c.course_id + '</strong></td>'
-          + '<td class="r" rowspan="' + n + '">' + c.weight.toFixed(3) + '</td>'
+          + '<td rowspan="' + n + '"><strong class="mono">' + g.sched_group_id + '</strong></td>'
+          + '<td class="r" rowspan="' + n + '">' + g.weight.toFixed(3) + '</td>'
           + '<td class="mono">' + l.lane_name + '</td>'
           + '<td class="r">' + l.running_count + '</td>'
           + '<td class="r">' + l.queued_count + '</td>'
@@ -245,9 +239,9 @@ function renderRunningPods(pods) {
                + '<span>' + dur(p.running_s) + ' / ' + dur(p.deadline_s) + '</span></div>';
     return '<tr>'
       + '<td><span class="mono">' + p.lane + '</span></td>'
-      + '<td><span class="mono">' + (p.namespace || '—') + '</span></td>'
+      + '<td><span class="mono">' + (p.username || '—') + '</span></td>'
       + '<td class="r">' + p.resource_units + '</td>'
-      + '<td><span class="mono">' + (p.course_id || '<em style="color:#aaa">none</em>') + '</span></td>'
+      + '<td><span class="mono">' + (p.sched_group_id || '<em style="color:#aaa">none</em>') + '</span></td>'
       + '<td class="r">' + dur(p.running_s) + '</td>'
       + '<td>' + dbar + '</td>'
       + '<td>' + (p.batch ? 'batch' : '—') + '</td>'
@@ -263,7 +257,7 @@ function renderHealth(sys, generatedAt) {
       '<span><span class="dot ' + dotCls + '"></span>'
       + 'Wait cache: ' + ageStr + ' (computed in ' + sys.wait_cache_duration_s + 's)</span>'
     + '<span>Cycle: every ' + sys.cycle_interval_s + 's</span>'
-    + '<span>' + sys.course_count + ' courses registered</span>'
+    + '<span>' + sys.sched_group_count + ' scheduling groups active</span>'
     + '<span>Snapshot: ' + new Date(generatedAt).toLocaleTimeString() + '</span>';
 }
 
@@ -272,7 +266,7 @@ function updateHeaderStatus(ok) {
   if (!ok) { el.textContent = '⚠️ fetch error'; return; }
   if (!lastFetchAt) return;
   const age = ((Date.now() - lastFetchAt) / 1000).toFixed(0);
-  el.textContent = 'Updated ' + age + 's ago · auto-refresh every ' + (REFRESH_MS/1000) + 's';
+  el.textContent = 'Updated ' + age + 's ago \xb7 auto-refresh every ' + (REFRESH_MS/1000) + 's';
 }
 
 async function fetchAndRender() {
@@ -282,7 +276,7 @@ async function fetchAndRender() {
     const data = await resp.json();
     lastFetchAt = Date.now();
     renderLanes(data.lanes);
-    renderCourses(data.courses);
+    renderSchedGroups(data.sched_groups);
     renderRunningPods(data.running_pods);
     renderHealth(data.system, data.generated_at);
     updateHeaderStatus(true);
