@@ -408,9 +408,10 @@ class LaneSchedulerController:
         meta = getattr(resp, "metadata", None)
         if meta is not None:
             rv = getattr(meta, "resource_version", None)
+        _ser = self.core_v1.api_client.sanitize_for_serialization
         cache: dict[str, dict] = {}
         for item in items:
-            pod = item.to_dict() if hasattr(item, "to_dict") else item
+            pod = _ser(item) if hasattr(item, "to_dict") else item
             uid = (pod.get("metadata") or {}).get("uid")
             if uid:
                 cache[uid] = pod
@@ -443,7 +444,7 @@ class LaneSchedulerController:
         pod   = event.get("object", {})
 
         if hasattr(pod, "to_dict"):
-            pod = pod.to_dict()
+            pod = self.core_v1.api_client.sanitize_for_serialization(pod)
 
         uid = (pod.get("metadata") or {}).get("uid")
         if not uid:
@@ -807,7 +808,7 @@ class LaneSchedulerController:
         etype = event.get("type", "")
         node  = event.get("object", {})
         if hasattr(node, "to_dict"):
-            node = node.to_dict()
+            node = self.core_v1.api_client.sanitize_for_serialization(node)
 
         name = (node.get("metadata") or {}).get("name", "<unknown>")
 
